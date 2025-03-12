@@ -25,11 +25,13 @@ split2 = 6  # Match with client
 class AdaptiveLoraConfig:
     def __init__(self):
         self.lora_dropout = 0.1
-        self.lora_alpha = 32
-        self.adaptive_lora_start_rank = 8
+        self.adaptive_lora_start_rank = 8  # Initial rank (r')
+        self.adaptive_lora_final_rank = 4  # Final rank (r)
         self.adaptive_lora_eps = 1e-6
         self.adaptive_lora_sensitivity_beta = 0.9
-
+        self.total_steps = 2000  # Total training steps (T)
+        self.warmup_steps = 300  # Initial warmup steps (t_i)
+        self.final_steps = 500  # Final fixed steps (t_f)
 # Adapted version of AdaptiveLoraLinear for Conv1D layers
 class AdaptiveLoraConv1D(nn.Module):
     def __init__(self, config, conv_module):
@@ -71,52 +73,37 @@ class AdaptiveLoraConv1D(nn.Module):
         # Initialize LoRA parameters with proper dimensions
         rank = config.adaptive_lora_start_rank
         self.lora_dropout = nn.Dropout(config.lora_dropout)
-        self.lora_a = nn.Parameter(torch.zeros(rank, self.in_features))  # [rank, in_features]
-        self.lora_b = nn.Parameter(torch.zeros(self.out_features, rank))  # [out_features, rank]
-        self.lora_scaler = nn.Parameter(torch.ones(rank, dtype=torch.float32))
-        
+        self.lora_a = nn.Parameter(torch.zeros(rank, self.in_features))
+        self.lora_b = nn.Parameter(torch.zeros(self.out_features, rank))
+        self.lora_scaler = nn.Parameter(torch.zeros(rank))  # Initialize to zero
+
         # Initialize weights
         nn.init.kaiming_uniform_(self.lora_a)
         nn.init.zeros_(self.lora_b)
         
-        self.lora_scaling = config.lora_alpha / rank
+        #self.lora_scaling = config.lora_alpha / rank
         
         print(f"LoRA initialized for {self.layer_type} - in: {self.in_features}, out: {self.out_features}")
 
     def forward(self, x):
-        # Original output from Conv1D
         original_output = self.conv(x)
-        
-        # Skip LoRA for very large tensors to avoid OOM
         if x.numel() > 1_000_000:
             return original_output
         
         try:
-            # Get original shape for reference
-            orig_shape = x.shape
-            batch_size = orig_shape[0] if len(orig_shape) >= 1 else 1
-            seq_len = orig_shape[1] if len(orig_shape) >= 2 else 1
-            
-            # Apply dropout
+            # Reshape and apply LoRA
             lora_input = self.lora_dropout(x)
-            
-            # Reshape input to [batch*seq_len, in_features]
+            batch_size, seq_len, _ = lora_input.shape
             lora_input_reshaped = lora_input.reshape(-1, self.in_features)
             
-            # Apply LoRA transformations
+            # LoRA operations
             lora_output = lora_input_reshaped @ self.lora_a.t()  # [batch*seq, rank]
-            lora_output = lora_output * self.lora_scaler.unsqueeze(0)  # Scale each rank
-            lora_output = lora_output @ self.lora_b.t()  # [batch*seq, out_features]
+            lora_output = lora_output * self.lora_scaler.unsqueeze(0)  # Scale by c_i
+            lora_output = lora_output @ self.lora_b.t()  # [batch*seq, out]
             lora_output = lora_output.reshape(batch_size, seq_len, self.out_features)
-            lora_output = lora_output * self.lora_scaling  # Apply scaling factor
             
-            # Add LoRA contribution to original output
             return original_output + lora_output
-            
         except Exception as e:
-            print(f"Error in LoRA ({self.layer_type}): {e}")
-            print(f"Input shape: {x.shape}, LoRA A: {self.lora_a.shape}, LoRA B: {self.lora_b.shape}")
-            print(f"Layer info - in_features: {self.in_features}, out_features: {self.out_features}")
             return original_output
         
     def inspect_input_shape(self, x):
@@ -164,15 +151,14 @@ class AdaptiveLoraConv1D(nn.Module):
 class ServerModel(torch.nn.Module):
     def __init__(self, model, split1, split2):
         super().__init__()
-        self.config = model.config
         self.middle_layers = model.transformer.h[split1:split2]
-        
-        # Initialize importance tracking for pruning
         self.sensitivity_score_dict = {}
         self.finally_mask_dict = {}
         self.step_counter = 0
-        self.max_steps = 2000
         self.lora_config = AdaptiveLoraConfig()
+        
+        # Apply LoRA to layers
+        self.apply_adaptive_lora()
         
         # Debug GPT-2 structure first
         print("GPT-2 block structure example:")
@@ -277,91 +263,64 @@ class ServerModel(torch.nn.Module):
                 for name, module in block.named_modules():
                     if isinstance(module, AdaptiveLoraConv1D):
                         full_name = f"block_{block_idx}_{name}"
+                        scores = []
+                        for i in range(module.lora_a.size(0)):
+                            a_i = module.lora_a[i]
+                            b_i = module.lora_b[:, i]
+                            c_i = module.lora_scaler[i]
+                            contribution = c_i * torch.outer(b_i, a_i)
+                            norm = torch.norm(contribution, p='fro')
+                            scores.append(norm.unsqueeze(0))
                         
-                        try:
-                            # Calculate individual rank contributions
-                            scores = []
-                            for i in range(module.lora_a.size(0)):
-                                # For each rank, compute the contribution
-                                scale_i = module.lora_scaler[i].item()
-                                a_i = module.lora_a[i:i+1, :]
-                                b_i = module.lora_b[:, i:i+1]
-                                
-                                # Calculate rank contribution to weight matrix
-                                contribution = b_i @ a_i
-                                norm_i = contribution.norm(p='fro')
-                                scores.append(norm_i.unsqueeze(0))
-                                
-                            # Combine all scores
-                            if not scores:
-                                continue
-                                
-                            # Calculate total weight norm
-                            total_contrib = module.lora_b @ (module.lora_a * module.lora_scaler.unsqueeze(1))
-                            total_norm = total_contrib.norm(p='fro') + self.lora_config.adaptive_lora_eps
-                            
-                            # Normalize scores
-                            norm_i = torch.cat(scores)
-                            score_i = norm_i / total_norm
-                            
-                            # Initialize or update the score dictionary
-                            if full_name not in self.sensitivity_score_dict:
-                                self.sensitivity_score_dict[full_name] = torch.zeros_like(score_i)
-                                self.finally_mask_dict[full_name] = torch.zeros_like(score_i, dtype=torch.bool)
-                                
-                            # Update exponential moving average
-                            beta = self.lora_config.adaptive_lora_sensitivity_beta
-                            self.sensitivity_score_dict[full_name] = beta * self.sensitivity_score_dict[full_name] + (1 - beta) * score_i
-                        
-                        except Exception as e:
-                            print(f"Error calculating importance for {full_name}: {e}")
+                        if not scores:
                             continue
+                        total_norm = torch.sqrt(sum([s**2 for s in scores]))
+                        scores = [s / (total_norm + 1e-6) for s in scores]
+                        
+                        # Update exponential moving average
+                        if full_name not in self.sensitivity_score_dict:
+                            self.sensitivity_score_dict[full_name] = torch.zeros_like(torch.cat(scores))
+                        beta = self.lora_config.adaptive_lora_sensitivity_beta
+                        self.sensitivity_score_dict[full_name] = beta * self.sensitivity_score_dict[full_name] + (1 - beta) * torch.cat(scores)
 
     def prune_lora_scaler(self):
-        # Update importance scores
         self.update_importance_score()
+        all_scores = torch.cat(list(self.sensitivity_score_dict.values()))
         
-        # Print count of modules with scores
-        print(f"Found {len(self.sensitivity_score_dict)} modules with importance scores")
+        # Compute current budget using cubic schedule
+        t = self.step_counter
+        ti = self.lora_config.warmup_steps
+        T = self.lora_config.total_steps
+        tf = T - self.lora_config.final_steps
+        b0 = self.lora_config.adaptive_lora_start_rank * len(self.sensitivity_score_dict)
+        bT = self.lora_config.adaptive_lora_final_rank * len(self.sensitivity_score_dict)
         
-        # Determine pruning threshold
-        all_scores = []
-        for name, scores in self.sensitivity_score_dict.items():
-            all_scores.append(scores)
-            
-        if not all_scores:
-            print("No scores to prune, skipping")
+        if t < ti:
+            current_budget = b0
+        elif t >= tf:
+            current_budget = bT
+        else:
+            progress = (t - ti) / (tf - ti)
+            current_budget = b0 - (b0 - bT) * (progress ** 3)
+        current_budget = int(current_budget)
+        
+        # Determine threshold to keep top 'current_budget' components
+        if all_scores.numel() == 0 or current_budget >= all_scores.numel():
             return
-            
-        all_scores = torch.cat(all_scores)
-        print(f"Total scores: {all_scores.numel()}, Non-zero: {(all_scores > 0).sum().item()}")
-        
-        prune_percent = min(0.1, 0.3 * self.step_counter / self.max_steps)
-        k = max(1, int(all_scores.numel() * prune_percent))
-        
-        if k >= all_scores.numel():
-            print("Would prune all scores, skipping")
-            return
-        
-        print(f"Pruning {k} of {all_scores.numel()} ranks (bottom {prune_percent:.1%})")
+        k = all_scores.numel() - current_budget
         threshold = torch.kthvalue(all_scores, k).values
         
-        # Apply pruning
-        with torch.no_grad():
-            pruned_count = 0
-            for block_idx, block in enumerate(self.middle_layers):
-                for name, module in block.named_modules():
-                    if isinstance(module, AdaptiveLoraConv1D):
-                        # All layers handled uniformly
-                        full_name = f"block_{block_idx}_{name}"
-                        if full_name in self.sensitivity_score_dict:
-                            mask = self.sensitivity_score_dict[full_name] <= threshold
-                            pruned_this_module = mask.sum().item()
-                            module.lora_scaler[mask] = 0
-                            self.finally_mask_dict[full_name] = mask
-                            pruned_count += pruned_this_module
-            
-            print(f"Pruned {pruned_count} ranks in total")
+        # Prune components
+        pruned = 0
+        for block_idx, block in enumerate(self.middle_layers):
+            for name, module in block.named_modules():
+                if isinstance(module, AdaptiveLoraConv1D):
+                    full_name = f"block_{block_idx}_{name}"
+                    if full_name in self.sensitivity_score_dict:
+                        mask = self.sensitivity_score_dict[full_name] <= threshold
+                        module.lora_scaler[mask] = 0
+                        pruned += mask.sum().item()
+        print(f"Pruned {pruned} components. Current budget: {current_budget}")
 
     def debug_lora_layers(self):
         """Print debugging information about all LoRA layers"""
