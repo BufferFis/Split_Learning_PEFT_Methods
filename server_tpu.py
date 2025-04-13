@@ -11,8 +11,9 @@ import time
 import json
 import os
 from datetime import datetime
-
-from onlyDORA import Adaptive_Lora_Linear
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.parallel_loader as pl
+from onlyDORA_tpu import Adaptive_Lora_Linear
 
 # Load GPT-2 model and configuration
 config = GPT2Config.from_pretrained("gpt2")
@@ -87,24 +88,20 @@ class AdaptiveLoraConv1D(nn.Module):
 
     def forward(self, x):
         original_output = self.conv(x)
-        if x.numel() > 1_000_000:
-            return original_output
         
-        try:
-            # Reshape and apply LoRA
-            lora_input = self.lora_dropout(x)
-            batch_size, seq_len, _ = lora_input.shape
-            lora_input_reshaped = lora_input.reshape(-1, self.in_features)
-            
-            # LoRA operations
-            lora_output = lora_input_reshaped @ self.lora_a.t()  # [batch*seq, rank]
-            lora_output = lora_output * self.lora_scaler.unsqueeze(0)  # Scale by c_i
-            lora_output = lora_output @ self.lora_b.t()  # [batch*seq, out]
-            lora_output = lora_output.reshape(batch_size, seq_len, self.out_features)
-            
-            return original_output + lora_output
-        except Exception as e:
-            return original_output
+        # TPU prefers full tensor operations over conditionals on tensor sizes
+        lora_input = self.lora_dropout(x)
+        batch_size, seq_len, _ = lora_input.shape
+        lora_input_reshaped = lora_input.reshape(-1, self.in_features)
+        
+        # LoRA operations - ensure static shapes
+        lora_output = lora_input_reshaped @ self.lora_a.t()
+        lora_output = lora_output * self.lora_scaler.unsqueeze(0)
+        lora_output = lora_output @ self.lora_b.t()
+        lora_output = lora_output.reshape(batch_size, seq_len, self.out_features)
+        
+        # Add outputs directly without try/except which can break XLA compilation
+        return original_output + lora_output
         
     def inspect_input_shape(self, x):
         """Print the shape and size of the input tensor"""
@@ -336,7 +333,9 @@ class ServerModel(torch.nn.Module):
         print("=====================================\n")
 
 server_model = ServerModel(model, split1, split2)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = xm.xla_device()
+xm.set_rng_state(42)  # Set random seed for XLA operations
+
 server_model = ServerModel(model, split1, split2).to(device)
 
 app = FastAPI()
@@ -440,7 +439,9 @@ def backward_pass(data: dict):
             output_tensor.backward(gradient=grad_tensor)
             
             # Update parameters
-            opt_state.optimizer.step()
+            xm.optimizer_step(opt_state.optimizer)
+            xm.mark_step()
+
             
             # Reset the state
             server_state["last_hidden_output"] = None
@@ -527,4 +528,3 @@ def get_prune_stats():
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8000)
-    

@@ -12,7 +12,7 @@ import json
 import os
 from datetime import datetime
 
-from onlyDORA import Adaptive_Lora_Linear
+from grpc_onlyDORA import Adaptive_Lora_Linear
 
 # Load GPT-2 model and configuration
 config = GPT2Config.from_pretrained("gpt2")

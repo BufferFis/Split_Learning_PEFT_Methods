@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import math
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -22,6 +23,8 @@ from transformers import AutoTokenizer, AutoConfig, AutoModelForSequenceClassifi
 from sklearn.metrics import accuracy_score, f1_score
 from pathlib import Path
 import numpy as np
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.parallel_loader as pl
 
 
 ############################################
@@ -452,7 +455,8 @@ def train_and_benchmark(task_name, method, device):
             reg_loss = model_wrapper.regularization_loss(global_step)
             total_loss = loss + reg_loss
             total_loss.backward()
-            optimizer.step()
+            xm.optimizer_step(optimizer)
+            xm.mark_step()  # Add this line
 
             # For DORA (adaptive LoRA), check pruning
             if method == "DORA":
@@ -494,8 +498,9 @@ def main():
                         choices=["full_parameter", "fixed_lora", "DORA"],
                         help="Which method: 'full_parameter' (full finetuning), 'fixed_lora', or 'DORA' (adaptive LoRA)")
     args = parser.parse_args()
+    device = xm.xla_device()
+    xm.set_rng_state(42)  # Set random seed for XLA operations
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"Task: {args.task}, Method: {args.method}, Device: {device}")
     train_and_benchmark(args.task, args.method, device)

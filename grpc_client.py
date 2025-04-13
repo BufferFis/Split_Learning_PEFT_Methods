@@ -13,10 +13,6 @@ import random
 import numpy as np
 from tqdm import tqdm
 
-# Find all occurrences of "http://127.0.0.1:8000"
-# Replace with your ngrok URL (from step 3)
-SERVER_URL = "YOUR_NGROK_URL_HERE"  # e.g. "https://abc-123.ngrok.io"
-
 # Download NLTK data if needed
 try:
     nltk.data.find('tokenizers/punkt')
