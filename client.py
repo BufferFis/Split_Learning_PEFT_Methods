@@ -124,7 +124,7 @@ class SplitModelTrainer:
             dataset,
             batch_size=batch_size,
             collate_fn=collate_fn,
-            shuffle=shuffle if sampler is None else False,
+            shuffle=shuffle if sampler is None else False,  # <-- disables shuffle if sampler is used
             sampler=sampler,
             num_workers=8,  # Use more workers for faster loading
             pin_memory=True
@@ -371,9 +371,9 @@ def main():
         # Use DistributedSampler for DDP
         train_sampler = DistributedSampler(train_dataset)
         train_dataloader = trainer.create_dataloader(
-            train_dataset, batch_size=256, shuffle=False, sampler=train_sampler
+            train_dataset, batch_size=64, shuffle=False, sampler=train_sampler
         )
-        print(f"Starting training for {args.epochs} epochs with batch size 256")
+        print(f"Starting training for {args.epochs} epochs with batch size {args.batch_size}")
         trainer.train(train_dataloader, epochs=args.epochs)
     
     
