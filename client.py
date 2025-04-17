@@ -14,6 +14,22 @@ import json
 import os
 from datetime import datetime
 from util import split_gpt2
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+import os
+
+
+def setup_ddp():
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    return local_rank
+
+def cleanup_ddp():
+    dist.destroy_process_group()
+
+
 
 # Server URL configuration
 SERVER_URL = "http://127.0.0.1:8000"  # Change to your server URL
@@ -91,7 +107,7 @@ class SplitModelTrainer:
         
         return train_dataset, test_dataset
     
-    def create_dataloader(self, dataset, batch_size=128 , shuffle=True):
+    def create_dataloader(self, dataset, batch_size=2048 , shuffle=True, sampler=None):
         """Create dataloader from dataset"""
         def collate_fn(batch):
             return {
@@ -105,7 +121,10 @@ class SplitModelTrainer:
             dataset,
             batch_size=batch_size,
             collate_fn=collate_fn,
-            shuffle=shuffle
+            shuffle=shuffle if sampler is None else False,
+            sampler=sampler,
+            num_workers=8,  # Use more workers for faster loading
+            pin_memory=True
         )
     
     def train(self, train_dataloader, epochs=3):
@@ -324,27 +343,44 @@ def main():
     parser.add_argument("--server_url", type=str, default=SERVER_URL, help="URL of the server")
     
     args = parser.parse_args()
+    local_rank = setup_ddp()
+    device = torch.device(f"cuda:{local_rank}")
+    # Move models to correct device
+    head_model_ddp = head_model.to(device)
+    tail_model_ddp = tail_model.to(device)
+
+    # Wrap with DDP
+    head_model_ddp = DDP(head_model_ddp, device_ids=[local_rank])
+    tail_model_ddp = DDP(tail_model_ddp, device_ids=[local_rank])
+
     
     # Create trainer
-    trainer = SplitModelTrainer(head_model, tail_model, tokenizer, server_url=args.server_url)
+    trainer = SplitModelTrainer(
+        head_model_ddp, tail_model_ddp, tokenizer, server_url=args.server_url
+    )
+    trainer.device = device
     
     # Load dataset
     train_dataset, test_dataset = trainer.load_e2e_dataset()
     print(f"Loaded {len(train_dataset)} training examples and {len(test_dataset)} test examples")
     
     if not args.eval_only:
-        # Create dataloader
-        train_dataloader = trainer.create_dataloader(train_dataset, batch_size=args.batch_size)
-        
-        # Train
-        print(f"Starting training for {args.epochs} epochs with batch size {args.batch_size}")
+        # Use DistributedSampler for DDP
+        train_sampler = DistributedSampler(train_dataset)
+        train_dataloader = trainer.create_dataloader(
+            train_dataset, batch_size=256, shuffle=False, sampler=train_sampler
+        )
+        print(f"Starting training for {args.epochs} epochs with batch size 256")
         trainer.train(train_dataloader, epochs=args.epochs)
     
-    # Evaluate
-    print("Starting evaluation...")
-    results = trainer.evaluate(test_dataset)
     
-    print("Done!")
+    # Evaluate
+    if local_rank == 0:
+        print("Starting evaluation...")
+        results = trainer.evaluate(test_dataset)
+        print("Done!")
+
+    cleanup_ddp()
 
 if __name__ == "__main__":
     main()
