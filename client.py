@@ -138,7 +138,7 @@ class SplitModelTrainer:
                 self.tail_optimizer.zero_grad()
                 
                 # Forward through head model
-                head_outputs = self.head_model(input_ids=input_ids, attention_mask=attention_mask)
+                head_outputs = self.head_model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
                 head_hidden_states = head_outputs.hidden_states[-1]
                 
                 # Send to server for middle layers processing
