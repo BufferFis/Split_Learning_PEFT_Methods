@@ -91,7 +91,7 @@ class SplitModelTrainer:
         
         return train_dataset, test_dataset
     
-    def create_dataloader(self, dataset, batch_size=32, shuffle=True):
+    def create_dataloader(self, dataset, batch_size=128 , shuffle=True):
         """Create dataloader from dataset"""
         def collate_fn(batch):
             return {
@@ -139,7 +139,7 @@ class SplitModelTrainer:
                 
                 # Forward through head model
                 head_outputs = self.head_model(input_ids=input_ids, attention_mask=attention_mask)
-                head_hidden_states = head_outputs.logits
+                head_hidden_states = head_outputs.hidden_states[-1]
                 
                 # Send to server for middle layers processing
                 payload = {"activations": head_hidden_states.detach().cpu().tolist()}
