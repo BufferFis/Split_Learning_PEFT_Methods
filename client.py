@@ -371,7 +371,7 @@ def main():
         # Use DistributedSampler for DDP
         train_sampler = DistributedSampler(train_dataset)
         train_dataloader = trainer.create_dataloader(
-            train_dataset, batch_size=64, shuffle=False, sampler=train_sampler
+            train_dataset, batch_size=32, shuffle=False, sampler=train_sampler
         )
         print(f"Starting training for {args.epochs} epochs with batch size {args.batch_size}")
         trainer.train(train_dataloader, epochs=args.epochs)
