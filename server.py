@@ -56,10 +56,11 @@ async def forward(request: Request):
     
     body_model.eval()
     with torch.no_grad():
-        output = body_model(inputs_embeds=activations)
+        output = body_model(inputs_embeds=activations, output_hidden_states=True)
+        last_hidden = output.hidden_states[-1]
     
     # Send activations to client
-    return {"body_activations": output.last_hidden_state.cpu().tolist()}
+    return {"body_activations": last_hidden.cpu().tolist()}
 
 @app.post("/forward_train")
 async def forward_train(request: Request):
@@ -74,14 +75,15 @@ async def forward_train(request: Request):
     body_model.train()
     
     # Forward pass with gradient tracking
-    output = body_model(inputs_embeds=activations)
+    output = body_model(inputs_embeds=activations, output_hidden_states=True)
+    last_hidden = output.hidden_states[-1]
     
     # Store for backward pass
-    server_state["last_hidden_states"] = (activations, output.last_hidden_state)
+    server_state["last_hidden_states"] = (activations, last_hidden)
     server_state["requires_backward"] = True
     
     # Send activations to client
-    return {"body_activations": output.last_hidden_state.detach().cpu().tolist()}
+    return {"body_activations": last_hidden.detach().cpu().tolist()}
 
 @app.post("/backward")
 async def backward(request: Request):
