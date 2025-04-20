@@ -8,6 +8,20 @@ import json
 from datetime import datetime
 import os
 from util import split_gpt2
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+import os
+import torch.nn as nn
+
+def setup_ddp():
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    return local_rank
+
+def cleanup_ddp():
+    dist.destroy_process_group()
 
 app = FastAPI()
 
@@ -30,6 +44,7 @@ lora_config = LoraConfig(
     target_modules=["c_attn", "c_proj"]
 )
 body_model = get_peft_model(body_model, lora_config)
+body_model = nn.DataParallel(body_model)
 
 # Move model to device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -127,6 +142,9 @@ async def backward(request: Request):
     # Reset state
     server_state["last_hidden_states"] = None
     server_state["requires_backward"] = False
+
+    if server_state["step_count"] % 100 == 0:
+        torch.cuda.empty_cache()
     
     return {
         "grad_input": input_grad.cpu().tolist(),
@@ -148,7 +166,7 @@ async def start_training(request: Request):
     # Initialize optimizer with learning rate from client
     lr = data.get("learning_rate", 2e-4)
     server_state["optimizer"] = optim.AdamW(
-        [p for p in body_model.parameters() if p.requires_grad], 
+        [p for p in body_model.module.parameters() if p.requires_grad], 
         lr=lr
     )
     
@@ -220,11 +238,8 @@ async def load_model(request: Request):
     if not os.path.exists(load_path):
         return {"status": "error", "message": f"Path {load_path} does not exist"}
     
-    body_model = AutoModelForCausalLM.from_pretrained(model_name)
-    _, body_model, _ = split_gpt2(body_model, head_layers=2, tail_layers=2)
-    body_model = get_peft_model(body_model, lora_config)
+    # Load weights into the existing body_model
     body_model.load_adapter(load_path)
-    body_model = body_model.to(device)
     
     return {"status": "Model loaded", "path": load_path}
 
