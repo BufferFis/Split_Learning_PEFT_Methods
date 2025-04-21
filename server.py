@@ -61,8 +61,8 @@ server_state = {
     "metrics": {"loss": [], "pruning_stats": []},
     "training_active": False
 }
-
-@app.post("/forward")
+`
+@app.post("/forward")`
 async def forward(request: Request):
     """Process forward pass during inference (no gradient tracking)"""
     data = await request.json()
