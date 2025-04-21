@@ -145,6 +145,12 @@ class SplitModelTrainer:
             print(f"Epoch {epoch+1} avg loss: {total_loss/len(dataloader):.4f}")
             is_final = (epoch == epochs-1)
             requests.post(f"{self.server_url}/end_epoch", json={"is_final": is_final})
+        
+        save_resp = requests.post(
+            f"{self.server_url}/save_model",
+            json={"path": "./server_model"}
+        )
+        print("Server save_model:", save_resp.json())
 
     def generate(self, input_ids, attn_mask, max_length=128):
         with torch.no_grad():
