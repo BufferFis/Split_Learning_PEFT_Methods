@@ -224,8 +224,7 @@ async def save_model(request: Request):
     save_path = data.get("path", "./server_model")
     
     os.makedirs(save_path, exist_ok=True)
-    body_model.save_pretrained(save_path)
-    
+    body_model.module.save_pretrained(save_path)  # Use .module
     return {"status": "Model saved", "path": save_path}
 
 @app.post("/load_model")
@@ -238,9 +237,7 @@ async def load_model(request: Request):
     if not os.path.exists(load_path):
         return {"status": "error", "message": f"Path {load_path} does not exist"}
     
-    # Load weights into the existing body_model
-    body_model.load_adapter(load_path)
-    
+    body_model.module.load_adapter(load_path)  # Use .module
     return {"status": "Model loaded", "path": load_path}
 
 @app.get("/model_info")
