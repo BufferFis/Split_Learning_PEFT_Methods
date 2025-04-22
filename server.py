@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Request
 import torch
 import torch.optim as optim
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, PeftModel
 from transformers import AutoModelForCausalLM
 import uvicorn
 import json
@@ -237,7 +237,10 @@ async def load_model(request: Request):
     if not os.path.exists(load_path):
         return {"status": "error", "message": f"Path {load_path} does not exist"}
     
-    body_model.module.load_adapter(load_path)  # Use .module
+    if hasattr(body_model, "module"):
+        body_model.module = PeftModel.from_pretrained(body_model.module, load_path)
+    else:
+        body_model = PeftModel.from_pretrained(body_model, load_path)
     return {"status": "Model loaded", "path": load_path}
 
 @app.get("/model_info")
