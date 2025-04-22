@@ -154,7 +154,7 @@ class SplitModelTrainer:
 
     def generate(self, input_ids, attn_mask, max_length=128):
         with torch.no_grad():
-            head_out = self.head_model(input_ids=input_ids, attention_mask=attn_mask)
+            head_out = self.head_model(input_ids=input_ids, attention_mask=attn_mask, output_hidden_states=True)
             hid = head_out.hidden_states[-1]
             payload = {"activations": hid.cpu().tolist()}
             resp = requests.post(f"{self.server_url}/forward", json=payload)
@@ -169,7 +169,7 @@ class SplitModelTrainer:
                 if next_tok.item() == self.tokenizer.eos_token_id:
                     break
                 am = torch.ones_like(gen_ids)
-                head_out = self.head_model(input_ids=gen_ids, attention_mask=am)
+                head_out = self.head_model(input_ids=gen_ids, attention_mask=am,  output_hidden_states=True)
                 hid = head_out.hidden_states[-1]
                 payload = {"activations": hid.cpu().tolist()}
                 resp = requests.post(f"{self.server_url}/forward", json=payload)
