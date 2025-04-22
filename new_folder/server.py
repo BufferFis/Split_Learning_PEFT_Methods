@@ -13,7 +13,7 @@ from util import split_gpt2
 def run_server(rank, world_size, port):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
+    #os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
 
@@ -28,6 +28,7 @@ def run_server(rank, world_size, port):
     model_name = "gpt2"
     full_model = AutoModelForCausalLM.from_pretrained(model_name)
     _, body_model, _ = split_gpt2(full_model, head_layers=2, tail_layers=2)
+    body_model = body_model.to(local_rank)
     body_model.gradient_checkpointing_enable()
     # Apply DoRA (LoRA with magnitude update)
     lora_config = LoraConfig(
