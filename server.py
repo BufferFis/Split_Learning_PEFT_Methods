@@ -217,31 +217,34 @@ async def end_epoch(request: Request):
         "avg_loss": avg_loss
     }
 
+
 @app.post("/save_model")
 async def save_model(request: Request):
-    """Save the server model"""
     data = await request.json()
     save_path = data.get("path", "./server_model")
-    
     os.makedirs(save_path, exist_ok=True)
-    body_model.module.save_pretrained(save_path)  # Use .module
-    return {"status": "Model saved", "path": save_path}
+    # Save model
+    body_model.module.save_pretrained(save_path)
+    # Save optimizer
+    torch.save(server_state["optimizer"].state_dict(), os.path.join(save_path, "optimizer.pt"))
+    return {"status": "Model and optimizer saved", "path": save_path}
 
 @app.post("/load_model")
 async def load_model(request: Request):
-    """Load a saved server model"""
     global body_model
     data = await request.json()
     load_path = data.get("path")
-    
     if not os.path.exists(load_path):
         return {"status": "error", "message": f"Path {load_path} does not exist"}
-    
     if hasattr(body_model, "module"):
         body_model.module = PeftModel.from_pretrained(body_model.module, load_path)
     else:
         body_model = PeftModel.from_pretrained(body_model, load_path)
-    return {"status": "Model loaded", "path": load_path}
+    # Load optimizer state if exists
+    opt_path = os.path.join(load_path, "optimizer.pt")
+    if os.path.exists(opt_path) and server_state["optimizer"] is not None:
+        server_state["optimizer"].load_state_dict(torch.load(opt_path))
+    return {"status": "Model and optimizer loaded", "path": load_path}
 
 @app.get("/model_info")
 async def model_info():

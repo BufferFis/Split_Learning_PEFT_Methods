@@ -14,7 +14,8 @@ def run_client(rank, world_size, port, epochs, batch_size):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
     os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
-    torch.cuda.set_device(rank)
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
 
     # Initialize RPC
     rpc.init_rpc(
