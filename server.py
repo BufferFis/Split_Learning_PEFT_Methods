@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Request
 import torch
 import torch.optim as optim
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, PeftModel
 from transformers import AutoModelForCausalLM
 import uvicorn
 import json
