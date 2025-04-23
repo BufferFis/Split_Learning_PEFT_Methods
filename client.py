@@ -152,6 +152,9 @@ class SplitModelTrainer:
         )
         print("Server save_model:", save_resp.json())
 
+        client_save_info = self.save_models("./server_model")
+        print("Client models saved:", client_save_info)
+
     def generate(self, input_ids, attn_mask, max_length=128):
         with torch.no_grad():
             head_out = self.head_model(input_ids=input_ids, attention_mask=attn_mask, output_hidden_states=True)
@@ -196,6 +199,67 @@ class SplitModelTrainer:
         print("BLEU:", bleu.compute(predictions=preds, references=refs))
         print("METEOR:", meteor.compute(predictions=preds, references=refs))
         print("ROUGE:", rouge.compute(predictions=preds, references=[r[0] for r in refs]))
+
+
+    def save_models(self, path="./server_model"):
+        """Save head and tail models to disk"""
+        os.makedirs(path, exist_ok=True)
+        
+        # Save head model
+        head_save_path = os.path.join(path, "head_model.pt")
+        if hasattr(self.head_model, "module"):
+            torch.save(self.head_model.module.state_dict(), head_save_path)
+        else:
+            torch.save(self.head_model.state_dict(), head_save_path)
+        
+        # Save tail model
+        tail_save_path = os.path.join(path, "tail_model.pt")
+        if hasattr(self.tail_model, "module"):
+            torch.save(self.tail_model.module.state_dict(), tail_save_path)
+        else:
+            torch.save(self.tail_model.state_dict(), tail_save_path)
+        
+        # Save optimizers
+        torch.save(self.head_optimizer.state_dict(), os.path.join(path, "head_optimizer.pt"))
+        torch.save(self.tail_optimizer.state_dict(), os.path.join(path, "tail_optimizer.pt"))
+        
+        return {"head_path": head_save_path, "tail_path": tail_save_path}
+
+
+    def load_models(self, path="./server_model"):
+        """Load head and tail models from disk"""
+        head_path = os.path.join(path, "head_model.pt")
+        tail_path = os.path.join(path, "tail_model.pt")
+        
+        # Check if files exist
+        if not os.path.exists(head_path) or not os.path.exists(tail_path):
+            print(f"Warning: Could not find saved models at {path}")
+            return False
+        
+        # Load head model
+        if hasattr(self.head_model, "module"):
+            self.head_model.module.load_state_dict(torch.load(head_path))
+        else:
+            self.head_model.load_state_dict(torch.load(head_path))
+        
+        # Load tail model
+        if hasattr(self.tail_model, "module"):
+            self.tail_model.module.load_state_dict(torch.load(tail_path))
+        else:
+            self.tail_model.load_state_dict(torch.load(tail_path))
+        
+        # Load optimizers if they exist
+        head_opt_path = os.path.join(path, "head_optimizer.pt")
+        tail_opt_path = os.path.join(path, "tail_optimizer.pt")
+        
+        if os.path.exists(head_opt_path):
+            self.head_optimizer.load_state_dict(torch.load(head_opt_path))
+        
+        if os.path.exists(tail_opt_path):
+            self.tail_optimizer.load_state_dict(torch.load(tail_opt_path))
+        
+        return True
+
 
 # ----- MAIN -----
 def main():
