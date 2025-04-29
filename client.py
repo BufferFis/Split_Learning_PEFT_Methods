@@ -89,6 +89,7 @@ class SplitModelTrainer:
         )
 
     def train(self, dataloader, epochs):
+        # Initialize server-side training
         resp = requests.post(
             f"{self.server_url}/start_training",
             json={"learning_rate": 2e-4}
@@ -99,28 +100,31 @@ class SplitModelTrainer:
             self.head_model.train()
             self.tail_model.train()
             total_loss = 0.0
+
             for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")):
                 input_ids = batch["input_ids"].to(self.device)
                 attn_mask = batch["attention_mask"].to(self.device)
                 labels    = batch["labels"].to(self.device)
 
+                # Zero both optimizers
                 self.head_optimizer.zero_grad()
                 self.tail_optimizer.zero_grad()
 
-                # Head forward
+                # ----- Head forward (keep graph) -----
                 head_out = self.head_model(
-                    input_ids=input_ids, attention_mask=attn_mask,
+                    input_ids=input_ids,
+                    attention_mask=attn_mask,
                     output_hidden_states=True
                 )
                 head_hid = head_out.hidden_states[-1]
 
-                # Server forward_train
+                # Send detached activations to server for body forward
                 payload = {"activations": head_hid.detach().cpu().tolist()}
                 sr = requests.post(f"{self.server_url}/forward_train", json=payload)
                 body_act = torch.tensor(sr.json()["body_activations"], device=self.device)
                 body_act.requires_grad_()
 
-                # Tail forward & loss
+                # ----- Tail forward & compute loss -----
                 tail_out = self.tail_model(inputs_embeds=body_act, attention_mask=attn_mask)
                 logits   = tail_out.logits
                 shift_logits = logits[..., :-1, :].contiguous()
@@ -130,28 +134,33 @@ class SplitModelTrainer:
                     shift_labels.view(-1)
                 )
 
-                # Backward
-                loss.backward()
-                grad_output = body_act.grad.cpu().tolist()
+                # ----- Backprop through tail and body_act -----
+                loss.backward(retain_graph=True)
+                grad_output = body_act.grad.detach().cpu().tolist()
+
+                # Send gradient to server, update body parameters, receive head grad
                 br = requests.post(
                     f"{self.server_url}/backward",
                     json={"grad_output": grad_output, "loss": loss.item()}
                 )
+                grad_input = torch.tensor(br.json()["grad_input"], device=self.device)
 
+                # Backprop into head (LoRA) using server-provided grad
+                head_hid.backward(grad_input)
+
+                # ----- Optimizer steps -----
                 self.head_optimizer.step()
                 self.tail_optimizer.step()
+
                 total_loss += loss.item()
 
-            print(f"Epoch {epoch+1} avg loss: {total_loss/len(dataloader):.4f}")
+            avg = total_loss / len(dataloader)
+            print(f"Epoch {epoch+1} avg loss: {avg:.4f}")
             is_final = (epoch == epochs-1)
             requests.post(f"{self.server_url}/end_epoch", json={"is_final": is_final})
-        
-        save_resp = requests.post(
-            f"{self.server_url}/save_model",
-            json={"path": "./server_model"}
-        )
-        print("Server save_model:", save_resp.json())
 
+        # Save server and client models
+        requests.post(f"{self.server_url}/save_model", json={"path": "./server_model"})
         client_save_info = self.save_models("./server_model")
         print("Client models saved:", client_save_info)
 
