@@ -89,6 +89,7 @@ class SplitModelTrainer:
         )
 
     def train(self, dataloader, epochs):
+        # Initialize server-side training
         resp = requests.post(
             f"{self.server_url}/start_training",
             json={"learning_rate": 2e-4}
@@ -99,28 +100,31 @@ class SplitModelTrainer:
             self.head_model.train()
             self.tail_model.train()
             total_loss = 0.0
+
             for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")):
                 input_ids = batch["input_ids"].to(self.device)
                 attn_mask = batch["attention_mask"].to(self.device)
                 labels    = batch["labels"].to(self.device)
 
+                # Zero both optimizers
                 self.head_optimizer.zero_grad()
                 self.tail_optimizer.zero_grad()
 
-                # Head forward
+                # ----- Head forward (keep graph) -----
                 head_out = self.head_model(
-                    input_ids=input_ids, attention_mask=attn_mask,
+                    input_ids=input_ids,
+                    attention_mask=attn_mask,
                     output_hidden_states=True
                 )
                 head_hid = head_out.hidden_states[-1]
 
-                # Server forward_train
+                # Send detached activations to server for body forward
                 payload = {"activations": head_hid.detach().cpu().tolist()}
                 sr = requests.post(f"{self.server_url}/forward_train", json=payload)
                 body_act = torch.tensor(sr.json()["body_activations"], device=self.device)
                 body_act.requires_grad_()
 
-                # Tail forward & loss
+                # ----- Tail forward & compute loss -----
                 tail_out = self.tail_model(inputs_embeds=body_act, attention_mask=attn_mask)
                 logits   = tail_out.logits
                 shift_logits = logits[..., :-1, :].contiguous()
@@ -130,27 +134,35 @@ class SplitModelTrainer:
                     shift_labels.view(-1)
                 )
 
-                # Backward
-                loss.backward()
-                grad_output = body_act.grad.cpu().tolist()
+                # ----- Backprop through tail and body_act -----
+                loss.backward(retain_graph=True)
+                grad_output = body_act.grad.detach().cpu().tolist()
+
+                # Send gradient to server, update body parameters, receive head grad
                 br = requests.post(
                     f"{self.server_url}/backward",
                     json={"grad_output": grad_output, "loss": loss.item()}
                 )
+                grad_input = torch.tensor(br.json()["grad_input"], device=self.device)
 
+                # Backprop into head (LoRA) using server-provided grad
+                head_hid.backward(grad_input)
+
+                # ----- Optimizer steps -----
                 self.head_optimizer.step()
                 self.tail_optimizer.step()
+
                 total_loss += loss.item()
 
-            print(f"Epoch {epoch+1} avg loss: {total_loss/len(dataloader):.4f}")
+            avg = total_loss / len(dataloader)
+            print(f"Epoch {epoch+1} avg loss: {avg:.4f}")
             is_final = (epoch == epochs-1)
             requests.post(f"{self.server_url}/end_epoch", json={"is_final": is_final})
-        
-        save_resp = requests.post(
-            f"{self.server_url}/save_model",
-            json={"path": "./server_model"}
-        )
-        print("Server save_model:", save_resp.json())
+
+        # Save server and client models
+        requests.post(f"{self.server_url}/save_model", json={"path": "./server_model"})
+        client_save_info = self.save_models("./server_model")
+        print("Client models saved:", client_save_info)
 
     def generate(self, input_ids, attn_mask, max_length=128):
         with torch.no_grad():
@@ -196,6 +208,67 @@ class SplitModelTrainer:
         print("BLEU:", bleu.compute(predictions=preds, references=refs))
         print("METEOR:", meteor.compute(predictions=preds, references=refs))
         print("ROUGE:", rouge.compute(predictions=preds, references=[r[0] for r in refs]))
+
+
+    def save_models(self, path="./server_model"):
+        """Save head and tail models to disk"""
+        os.makedirs(path, exist_ok=True)
+        
+        # Save head model
+        head_save_path = os.path.join(path, "head_model.pt")
+        if hasattr(self.head_model, "module"):
+            torch.save(self.head_model.module.state_dict(), head_save_path)
+        else:
+            torch.save(self.head_model.state_dict(), head_save_path)
+        
+        # Save tail model
+        tail_save_path = os.path.join(path, "tail_model.pt")
+        if hasattr(self.tail_model, "module"):
+            torch.save(self.tail_model.module.state_dict(), tail_save_path)
+        else:
+            torch.save(self.tail_model.state_dict(), tail_save_path)
+        
+        # Save optimizers
+        torch.save(self.head_optimizer.state_dict(), os.path.join(path, "head_optimizer.pt"))
+        torch.save(self.tail_optimizer.state_dict(), os.path.join(path, "tail_optimizer.pt"))
+        
+        return {"head_path": head_save_path, "tail_path": tail_save_path}
+
+
+    def load_models(self, path="./server_model"):
+        """Load head and tail models from disk"""
+        head_path = os.path.join(path, "head_model.pt")
+        tail_path = os.path.join(path, "tail_model.pt")
+        
+        # Check if files exist
+        if not os.path.exists(head_path) or not os.path.exists(tail_path):
+            print(f"Warning: Could not find saved models at {path}")
+            return False
+        
+        # Load head model
+        if hasattr(self.head_model, "module"):
+            self.head_model.module.load_state_dict(torch.load(head_path))
+        else:
+            self.head_model.load_state_dict(torch.load(head_path))
+        
+        # Load tail model
+        if hasattr(self.tail_model, "module"):
+            self.tail_model.module.load_state_dict(torch.load(tail_path))
+        else:
+            self.tail_model.load_state_dict(torch.load(tail_path))
+        
+        # Load optimizers if they exist
+        head_opt_path = os.path.join(path, "head_optimizer.pt")
+        tail_opt_path = os.path.join(path, "tail_optimizer.pt")
+        
+        if os.path.exists(head_opt_path):
+            self.head_optimizer.load_state_dict(torch.load(head_opt_path))
+        
+        if os.path.exists(tail_opt_path):
+            self.tail_optimizer.load_state_dict(torch.load(tail_opt_path))
+        
+        return True
+
 
 # ----- MAIN -----
 def main():

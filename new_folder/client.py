@@ -13,8 +13,9 @@ from util import split_gpt2
 def run_client(rank, world_size, port, epochs, batch_size):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
-    torch.cuda.set_device(rank)
+    #os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
 
     # Initialize RPC
     rpc.init_rpc(
@@ -26,6 +27,8 @@ def run_client(rank, world_size, port, epochs, batch_size):
     # Get server's ServerRPC RRef
     # The server must expose a get_server_rref() function that returns its ServerRPC RRef
     server_rref = rpc.rpc_sync("server", get_server_rref, args=())
+    head_m = head_m.to(local_rank)
+    tail_m = tail_m.to(local_rank)
     head_m.gradient_checkpointing_enable()
     tail_m.gradient_checkpointing_enable()
     

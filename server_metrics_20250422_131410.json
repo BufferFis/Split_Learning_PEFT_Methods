@@ -1,0 +1,6 @@
+{
+  "epochs": 2,
+  "steps": 165,
+  "final_loss": 0.0,
+  "pruning_stats": []
+}
