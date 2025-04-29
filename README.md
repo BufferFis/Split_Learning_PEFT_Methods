@@ -1,1 +1,2 @@
-Testing out Peft Methods like DORA and LORA in split learning setups
+- Testing out Peft Methods like DORA and LORA in split learning setups
+- Currently no Directory structure, but the folder you are currently in uses http connections to send weights across the server and client, New folder is testing out with RPC methods to do the same
