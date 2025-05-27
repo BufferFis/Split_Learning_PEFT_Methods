@@ -113,6 +113,26 @@ def get_model():
         return body_model.module
     return body_model
 
+def ensure_no_generation_calls():
+    """Prevent any generation method calls on server"""
+    model = get_model()
+    
+    # Disable generation methods on server side
+    if hasattr(model, 'generate'):
+        original_generate = model.generate
+        def disabled_generate(*args, **kwargs):
+            raise RuntimeError("Generation should not be called on server side")
+        model.generate = disabled_generate
+    
+    if hasattr(model, 'prepare_inputs_for_generation'):
+        def disabled_prepare(*args, **kwargs):
+            raise RuntimeError("prepare_inputs_for_generation should not be called on server side")
+        model.prepare_inputs_for_generation = disabled_prepare
+
+ensure_no_generation_calls()
+
+
+
 # new function to prevent generation calls
 def safe_model_forward(model, *args, **kwargs):
     """Safely call forward without triggering generation methods"""
@@ -123,21 +143,27 @@ def safe_model_forward(model, *args, **kwargs):
         return model(*args, **kwargs)
 
 def run_body_layers(activations, attention_mask=None):
-    """Run hidden states through transformer blocks"""
+    """Run hidden states through transformer blocks - NEVER call generation methods"""
     model = get_model()
     hidden = activations
     
-    # Use safe forward calls only
-    for block in model.transformer.h:
-        if attention_mask is not None:
-            # Call forward directly, not generate
-            hidden = block.forward(hidden, attention_mask=attention_mask)[0]
-        else:
-            hidden = block.forward(hidden)[0]
-    
-    # Final layer norm
-    hidden = model.transformer.ln_f(hidden)
-    return hidden
+    # SAFE: Only use forward passes, never generation
+    try:
+        for block in model.transformer.h:
+            if attention_mask is not None:
+                # Direct forward call only
+                hidden = block(hidden, attention_mask=attention_mask)[0]
+            else:
+                hidden = block(hidden)[0]
+        
+        # Final layer norm
+        hidden = model.transformer.ln_f(hidden)
+        return hidden
+    except Exception as e:
+        print(f"Error in run_body_layers: {e}")
+        # Fallback: ensure we never call generation methods
+        raise e
+
 
 @app.post("/forward")
 async def forward(request: Request):

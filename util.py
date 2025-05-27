@@ -24,6 +24,9 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             self.h = nn.ModuleList(original_model.transformer.h[:num_layers])
             self.config = original_model.config
             
+            # Add generation attributes to prevent PEFT errors
+            self.generation_config = getattr(original_model, 'generation_config', None)
+            
         def forward(self, input_ids=None, attention_mask=None, output_hidden_states=False, **kwargs):
             # Token + position embeddings
             inputs_embeds = self.wte(input_ids)
@@ -51,7 +54,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             else:
                 return type('HeadOutput', (), {'last_hidden_state': hidden_states})()
     
-    # Create body model (middle layers only)
+    # Create body model (middle layers only) - FIXED FOR PEFT
     class BodyModel(nn.Module):
         def __init__(self, original_model, start_layer, num_layers):
             super().__init__()
@@ -62,7 +65,39 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             self.transformer.ln_f = original_model.transformer.ln_f
             self.config = original_model.config
             
-        def forward(self, hidden_states, attention_mask=None, **kwargs):
+            # CRITICAL FIX: Add missing generation attributes
+            self.generation_config = getattr(original_model, 'generation_config', None)
+            self.main_input_name = getattr(original_model, 'main_input_name', 'input_ids')
+            
+            # Copy essential methods from original model to prevent PEFT errors
+            if hasattr(original_model, 'prepare_inputs_for_generation'):
+                self.prepare_inputs_for_generation = original_model.prepare_inputs_for_generation
+            if hasattr(original_model, 'can_generate'):
+                self.can_generate = original_model.can_generate
+            if hasattr(original_model, '_reorder_cache'):
+                self._reorder_cache = original_model._reorder_cache
+            if hasattr(original_model, 'get_input_embeddings'):
+                self.get_input_embeddings = original_model.get_input_embeddings
+            if hasattr(original_model, 'get_output_embeddings'):
+                self.get_output_embeddings = original_model.get_output_embeddings
+                
+        def __getattr__(self, name: str):
+            """Forward missing attributes to prevent PEFT errors"""
+            # This is the key fix from search results
+            try:
+                return super().__getattr__(name)
+            except AttributeError:
+                # Return a dummy function for generation methods to prevent errors
+                if 'generation' in name or 'prepare_inputs' in name:
+                    return lambda *args, **kwargs: None
+                raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
+            
+        def forward(self, hidden_states=None, attention_mask=None, **kwargs):
+            # Handle both direct hidden_states and input_ids (for PEFT compatibility)
+            if hidden_states is None and 'input_ids' in kwargs:
+                # This shouldn't happen on server, but handle gracefully
+                raise ValueError("BodyModel received input_ids instead of hidden_states")
+                
             # Process through body layers
             for block in self.transformer.h:
                 if attention_mask is not None:
@@ -82,6 +117,9 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             self.transformer.h = nn.ModuleList(original_model.transformer.h[start_layer:])
             self.lm_head = original_model.lm_head
             self.config = original_model.config
+            
+            # Add generation attributes
+            self.generation_config = getattr(original_model, 'generation_config', None)
             
         def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
             hidden_states = inputs_embeds
