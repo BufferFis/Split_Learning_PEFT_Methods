@@ -113,17 +113,27 @@ def get_model():
         return body_model.module
     return body_model
 
+# new function to prevent generation calls
+def safe_model_forward(model, *args, **kwargs):
+    """Safely call forward without triggering generation methods"""
+    # Only call forward, never generate
+    if hasattr(model, 'forward'):
+        return model.forward(*args, **kwargs)
+    else:
+        return model(*args, **kwargs)
+
 def run_body_layers(activations, attention_mask=None):
     """Run hidden states through transformer blocks"""
     model = get_model()
     hidden = activations
     
-    # Iterate through each transformer block
+    # Use safe forward calls only
     for block in model.transformer.h:
         if attention_mask is not None:
-            hidden = block(hidden, attention_mask=attention_mask)[0]
+            # Call forward directly, not generate
+            hidden = block.forward(hidden, attention_mask=attention_mask)[0]
         else:
-            hidden = block(hidden)[0]
+            hidden = block.forward(hidden)[0]
     
     # Final layer norm
     hidden = model.transformer.ln_f(hidden)
@@ -138,6 +148,7 @@ async def forward(request: Request):
         if "attention_mask" in payload and payload["attention_mask"] is not None:
             attention_mask = torch.tensor(payload["attention_mask"], device=device)
         
+        # Explicitly set to eval mode and use forward only
         body_model.eval()
         with torch.no_grad():
             last_hidden = run_body_layers(activations, attention_mask)
@@ -145,7 +156,9 @@ async def forward(request: Request):
         return {"body_activations": last_hidden.cpu().tolist()}
     except Exception as e:
         print(f"Error in forward: {e}")
+        traceback.print_exc()  # Add this for better debugging
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/forward_train")
 async def forward_train(request: Request):
