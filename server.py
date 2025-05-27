@@ -173,7 +173,13 @@ async def forward(request: Request):
         attention_mask = None
         if "attention_mask" in payload and payload["attention_mask"] is not None:
             attention_mask = torch.tensor(payload["attention_mask"], device=device, dtype=torch.float32)
-        
+             # Validate attention mask shape and values
+            if attention_mask.dim() != 2:
+                raise ValueError(f"Expected 2D attention mask, got {attention_mask.dim()}D")
+            if not torch.all((attention_mask == 0) | (attention_mask == 1)):
+                print("Warning: Attention mask contains non-binary values")
+
+
         # Explicitly set to eval mode and use forward only
         body_model.eval()
         with torch.no_grad():

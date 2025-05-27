@@ -158,7 +158,8 @@ class LoadedSplitModelTrainer:
                 text,
                 padding="max_length",
                 truncation=True,
-                max_length=128
+                max_length=128,
+                return_attention_mask=True  # Explicitly request attention mask
             )
             return {
                 "input_ids": enc["input_ids"],
@@ -175,7 +176,7 @@ class LoadedSplitModelTrainer:
         def collate_fn(batch):
             return {
                 "input_ids": torch.tensor([b["input_ids"] for b in batch], dtype=torch.long),
-                "attention_mask": torch.tensor([b["attention_mask"] for b in batch], dtype=torch.long),
+                "attention_mask": torch.tensor([b["attention_mask"] for b in batch], dtype=torch.float32),
                 "labels": torch.tensor([b["labels"] for b in batch], dtype=torch.long),
                 "human_reference": [b["human_reference"] for b in batch]
             }
@@ -329,6 +330,15 @@ class LoadedSplitModelTrainer:
         """Generate text for evaluation using the split model"""
         with torch.no_grad():
             try:
+                self.head_model.eval()
+                self.tail_model.eval()
+                
+                generated_ids = input_ids.clone()
+                if input_ids.dtype != torch.long:
+                    input_ids = input_ids.long()
+                if attention_mask.dtype != torch.float32:
+                    attention_mask = attention_mask.float()
+                
                 generated_ids = input_ids.clone()
                 
                 for step in range(min(max_length - input_ids.size(1), 32)):

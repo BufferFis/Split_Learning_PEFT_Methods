@@ -60,6 +60,10 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             hidden_states = inputs_embeds + position_embeds
             hidden_states = self.drop(hidden_states)
             
+             # Ensure consistent dtype
+            if attention_mask is not None and attention_mask.dtype != hidden_states.dtype:
+                attention_mask = attention_mask.to(hidden_states.dtype)
+
             all_hidden_states = ()
             # Process through head layers
             for block in self.h:
