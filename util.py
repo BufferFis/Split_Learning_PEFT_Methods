@@ -180,3 +180,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             # Generate logits
             logits = self.lm_head(hidden_states)
             return type('TailOutput', (), {'logits': logits})()
+
+    head_model = HeadModel(model, head_layers)
+    body_model = BodyModel(model, head_layers, body_layers)
+    tail_model = TailModel(model, head_layers + body_layers)
