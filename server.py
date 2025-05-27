@@ -172,7 +172,7 @@ async def forward(request: Request):
         activations = torch.tensor(payload["activations"], device=device)
         attention_mask = None
         if "attention_mask" in payload and payload["attention_mask"] is not None:
-            attention_mask = torch.tensor(payload["attention_mask"], device=device)
+            attention_mask = torch.tensor(payload["attention_mask"], device=device, dtype=torch.float32)
         
         # Explicitly set to eval mode and use forward only
         body_model.eval()

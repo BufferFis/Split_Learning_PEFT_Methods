@@ -209,7 +209,7 @@ class LoadedSplitModelTrainer:
             for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}", disable=self.local_rank != 0)):
                 try:
                     input_ids = batch["input_ids"].to(self.device)
-                    attn_mask = batch["attention_mask"].to(self.device)
+                    attn_mask = batch["attention_mask"].to(self.device).float()
                     labels = batch["labels"].to(self.device)
                     
                     # Zero optimizers
@@ -335,7 +335,7 @@ class LoadedSplitModelTrainer:
                     # Head forward
                     head_out = self.head_model(
                         input_ids=generated_ids,
-                        attention_mask=torch.ones_like(generated_ids),
+                        attention_mask=torch.ones_like(generated_ids).float(),
                         output_hidden_states=True
                     )
                     head_hidden = head_out.hidden_states[-1]
@@ -343,7 +343,7 @@ class LoadedSplitModelTrainer:
                     # Server forward with load balancing
                     payload = {
                         "activations": head_hidden.cpu().tolist(),
-                        "attention_mask": torch.ones_like(generated_ids).cpu().tolist()
+                        "attention_mask": torch.ones_like(generated_ids).float().cpu().tolist()
                     }
                     server_url = self.get_server_url()  # Use load balancing
                     resp = requests.post(f"{server_url}/forward", json=payload, timeout=10)
@@ -352,7 +352,7 @@ class LoadedSplitModelTrainer:
                     # Tail forward
                     tail_out = self.tail_model(
                         inputs_embeds=body_act,
-                        attention_mask=torch.ones_like(generated_ids)
+                        attention_mask=torch.ones_like(generated_ids).float()
                     )
                     logits = tail_out.logits
                     
@@ -396,17 +396,34 @@ class LoadedSplitModelTrainer:
                 refs.append([sample["human_reference"]])  # BLEU expects list of references
             
             # Calculate metrics using built-in HF methods
-            bleu_score = bleu_metric.compute(predictions=preds, references=refs)
-            meteor_score = meteor_metric.compute(predictions=preds, references=[r[0] for r in refs])
-            
-            print(f"E2E NLG BLEU Score: {bleu_score['bleu']:.4f}")
-            print(f"E2E NLG METEOR Score: {meteor_score['meteor']:.4f}")
-            
-            # Save evaluation results
-            results = {
-                "bleu": bleu_score['bleu'],
-                "meteor": meteor_score['meteor']
-            }
+            try:
+                # Calculate metrics using built-in HF methods
+                bleu_score = bleu_metric.compute(predictions=preds, references=refs)
+                
+                # Fix METEOR format - it expects flat lists, not nested
+                meteor_score = meteor_metric.compute(predictions=preds, references=[r[0] for r in refs])
+                
+                # Safe access to metric results
+                bleu_value = bleu_score.get('bleu', 0.0) if isinstance(bleu_score, dict) else 0.0
+                meteor_value = meteor_score.get('meteor', 0.0) if isinstance(meteor_score, dict) else 0.0
+                
+                print(f"E2E NLG BLEU Score: {bleu_value:.4f}")
+                print(f"E2E NLG METEOR Score: {meteor_value:.4f}")
+                
+                # Save evaluation results
+                results = {
+                    "bleu": bleu_value,
+                    "meteor": meteor_value
+                }
+                
+            except Exception as eval_error:
+                print(f"Evaluation metric error: {eval_error}")
+                # Fallback to basic evaluation
+                results = {
+                    "bleu": 0.0,
+                    "meteor": 0.0,
+                    "error": str(eval_error)
+                }
             
             with open("./server_model/evaluation_results.json", "w") as f:
                 json.dump(results, f, indent=2)
