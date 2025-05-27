@@ -56,6 +56,24 @@ def wait_for_server(server_url, max_retries=30, delay=2):
         return False
     return True
 
+def robust_server_request(url, json_data, max_retries=3, timeout=300):
+    """Make server request with retry logic"""
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(url, json=json_data, timeout=timeout)
+            return response
+        except requests.exceptions.Timeout as e:
+            if attempt == max_retries - 1:
+                print(f"Server request failed after {max_retries} attempts: {e}")
+                raise e
+            else:
+                print(f"Request timeout (attempt {attempt + 1}/{max_retries}), retrying...")
+                time.sleep(2)  # Wait before retry
+        except Exception as e:
+            print(f"Server request error: {e}")
+            raise e
+
+
 
 class LoadedSplitModelTrainer:
     """Enhanced trainer that supports loading and incremental training"""
@@ -233,7 +251,7 @@ class LoadedSplitModelTrainer:
                     }
                     
                     server_url = self.get_server_url()
-                    sr = requests.post(f"{server_url}/forward_train", json=payload, timeout=30)
+                    sr = robust_server_request(f"{server_url}/forward_train", payload)
                     body_act = torch.tensor(sr.json()["body_activations"], device=self.device)
                     body_act.requires_grad_()
                     
@@ -261,7 +279,7 @@ class LoadedSplitModelTrainer:
                             "loss": loss.item(),
                             "rank_id": self.local_rank
                         },
-                        timeout=30
+                        timeout=300
                     )
 
                     grad_input = torch.tensor(br.json()["grad_input"], device=self.device)
@@ -332,7 +350,7 @@ class LoadedSplitModelTrainer:
             try:
                 self.head_model.eval()
                 self.tail_model.eval()
-                
+
                 generated_ids = input_ids.clone()
                 if input_ids.dtype != torch.long:
                     input_ids = input_ids.long()
@@ -356,7 +374,7 @@ class LoadedSplitModelTrainer:
                         "attention_mask": torch.ones_like(generated_ids).float().cpu().tolist()
                     }
                     server_url = self.get_server_url()  # Use load balancing
-                    resp = requests.post(f"{server_url}/forward", json=payload, timeout=10)
+                    resp = requests.post(f"{server_url}/forward", json=payload, timeout=120)
                     body_act = torch.tensor(resp.json()["body_activations"], device=self.device)
                     
                     # Tail forward

@@ -452,4 +452,11 @@ async def health():
 if __name__ == "__main__":
     # Each process runs on a different port for distributed setup
     port = 8000 + server_state["local_rank"]
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    # INCREASE SERVER TIMEOUTS
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=port,
+        timeout_keep_alive=300,  # Increase from default 5 to 120 seconds
+        timeout_graceful_shutdown=120  # Add graceful shutdown timeout
+    )
