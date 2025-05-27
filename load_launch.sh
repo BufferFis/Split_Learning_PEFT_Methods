@@ -10,7 +10,7 @@ torchrun --standalone --nproc_per_node=2 load.py \
     --model_path ./server_model \
     --continue_training \
     --epochs 1 \
-    --batch_size 128 \
+    --batch_size 64 \
     --server_url http://127.0.0.1:8000
 
 echo "Incremental training completed!"
