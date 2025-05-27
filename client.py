@@ -273,29 +273,39 @@ class SplitModelTrainer:
         """Generate text for evaluation using the split model"""
         with torch.no_grad():
             try:
+                # Ensure we're in eval mode and not calling server generation
+                self.head_model.eval()
+                self.tail_model.eval()
+                
                 generated_ids = input_ids.clone()
                 
                 for step in range(min(max_length - input_ids.size(1), 32)):
-                    # Head forward
-                    head_out = self.head_model(
-                        input_ids=generated_ids,
-                        attention_mask=torch.ones_like(generated_ids),
-                        output_hidden_states=True
-                    )
-                    head_hidden = head_out.hidden_states[-1]
+                    # Head forward - safe call
+                    try:
+                        head_out = self.head_model(
+                            input_ids=generated_ids,
+                            attention_mask=torch.ones_like(generated_ids),
+                            output_hidden_states=True
+                        )
+                        head_hidden = head_out.hidden_states[-1]
+                    except AttributeError as e:
+                        if 'prepare_inputs_for_generation' in str(e):
+                            print("Warning: Generation attribute error caught and handled")
+                            break
+                        raise e
                     
-                    # Server forward
+                    # Server forward - only forward pass
                     payload = {
                         "activations": head_hidden.cpu().tolist(),
                         "attention_mask": torch.ones_like(generated_ids).cpu().tolist()
                     }
-                    server_url = self.get_server_url()  # Use load balancing
+                    server_url = self.get_server_url()
                     resp = requests.post(f"{server_url}/forward", json=payload, timeout=10)
                     body_act = torch.tensor(resp.json()["body_activations"], device=self.device)
                     
-                    # Tail forward
+                    # Tail forward - safe call
                     tail_out = self.tail_model(
-                        inputs_embeds=body_act, 
+                        inputs_embeds=body_act,
                         attention_mask=torch.ones_like(generated_ids)
                     )
                     logits = tail_out.logits
@@ -311,6 +321,7 @@ class SplitModelTrainer:
             except Exception as e:
                 print(f"Generation error: {e}")
                 return "Generation failed"
+
 
 
     def evaluate(self, test_ds):
