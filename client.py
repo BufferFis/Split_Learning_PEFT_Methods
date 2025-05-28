@@ -389,24 +389,58 @@ class SplitModelTrainer:
             meteor_metric = load_metric("meteor")
             
             preds, refs = [], []
-            eval_samples = test_ds[:100]  # Limit for speed
             
             print("Starting evaluation on E2E NLG dataset using HF metrics...")
-            for sample in tqdm(eval_samples, desc="Evaluating"):
-                input_ids = torch.tensor(sample["input_ids"]).unsqueeze(0).to(self.device)
-                attention_mask = torch.tensor(sample["attention_mask"]).unsqueeze(0).to(self.device)
-                
-                # Generate prediction
-                generated_text = self.generate(input_ids, attention_mask)
-                preds.append(generated_text)
-                refs.append([sample["human_reference"]])  # BLEU expects list of references
             
-            # Calculate metrics using built-in HF methods
+            # FIXED: Proper dataset sampling
+            if hasattr(test_ds, 'select'):
+                # Use dataset.select() for HuggingFace datasets
+                eval_samples = test_ds.select(range(min(100, len(test_ds))))
+            else:
+                # Fallback for other dataset types
+                eval_samples = test_ds[:100]
+            
+            for i, sample in enumerate(tqdm(eval_samples, desc="Evaluating")):
+                try:
+                    # DEFENSIVE: Check if sample is a dictionary
+                    if isinstance(sample, str):
+                        print(f"Warning: Sample {i} is a string, skipping")
+                        continue
+                        
+                    if not isinstance(sample, dict):
+                        print(f"Warning: Sample {i} is not a dict, type: {type(sample)}")
+                        continue
+                    
+                    # SAFE: Check if required keys exist
+                    if "input_ids" not in sample or "human_reference" not in sample:
+                        print(f"Warning: Sample {i} missing required keys")
+                        continue
+                    
+                    # Convert to tensors safely
+                    input_ids = torch.tensor(sample["input_ids"]).unsqueeze(0).to(self.device)
+                    
+                    # Handle attention mask safely
+                    if "attention_mask" in sample:
+                        attention_mask = torch.tensor(sample["attention_mask"]).unsqueeze(0).to(self.device)
+                    else:
+                        attention_mask = torch.ones_like(input_ids, dtype=torch.float32)
+                    
+                    # Generate prediction
+                    generated_text = self.generate(input_ids, attention_mask)
+                    preds.append(generated_text)
+                    refs.append([sample["human_reference"]])
+                    
+                except Exception as sample_error:
+                    print(f"Error processing sample {i}: {sample_error}")
+                    continue
+            
+            if not preds:
+                print("No valid predictions generated")
+                return {"bleu": 0.0, "meteor": 0.0, "error": "No valid samples"}
+            
+            # Calculate metrics with error handling
             try:
-                # Calculate metrics using built-in HF methods
                 bleu_score = bleu_metric.compute(predictions=preds, references=refs)
-                
-                # Fix METEOR format - it expects flat lists, not nested
                 meteor_score = meteor_metric.compute(predictions=preds, references=[r[0] for r in refs])
                 
                 # Safe access to metric results
@@ -416,7 +450,6 @@ class SplitModelTrainer:
                 print(f"E2E NLG BLEU Score: {bleu_value:.4f}")
                 print(f"E2E NLG METEOR Score: {meteor_value:.4f}")
                 
-                # Save evaluation results
                 results = {
                     "bleu": bleu_value,
                     "meteor": meteor_value
@@ -424,22 +457,23 @@ class SplitModelTrainer:
                 
             except Exception as eval_error:
                 print(f"Evaluation metric error: {eval_error}")
-                # Fallback to basic evaluation
                 results = {
                     "bleu": 0.0,
                     "meteor": 0.0,
                     "error": str(eval_error)
                 }
             
+            # Save results
             with open("./server_model/evaluation_results.json", "w") as f:
                 json.dump(results, f, indent=2)
-            
             print("Evaluation results saved to ./server_model/evaluation_results.json")
+            
             return results
             
         except Exception as e:
             print(f"Evaluation error: {e}")
             return None
+
 
 
 
@@ -495,7 +529,7 @@ class SplitModelTrainer:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--batch_size", type=int, default=128)  # Match shell scripts
+    parser.add_argument("--batch_size", type=int, default=64)  # Match shell scripts
     parser.add_argument("--epochs", type=int, default=1)  # Match shell scripts
     parser.add_argument("--eval_only", action="store_true")
     parser.add_argument("--server_url", type=str, default="http://127.0.0.1:8000")
