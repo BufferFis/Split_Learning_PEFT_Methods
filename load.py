@@ -176,7 +176,7 @@ class LoadedSplitModelTrainer:
                 text,
                 padding="max_length",
                 truncation=True,
-                max_length=128,
+                max_length=64,
                 return_attention_mask=True  # Explicitly request attention mask
             )
             return {
@@ -192,10 +192,27 @@ class LoadedSplitModelTrainer:
 
     def create_dataloader(self, ds, batch_size, shuffle=True, sampler=None):
         def collate_fn(batch):
+            # Get max length for this batch
+            max_len = max(len(b["input_ids"]) for b in batch)
+            
+            input_ids_batch = []
+            attention_mask_batch = []
+            labels_batch = []
+            
+            for b in batch:
+                # Pad to max length in batch
+                input_ids = b["input_ids"] + [self.tokenizer.pad_token_id] * (max_len - len(b["input_ids"]))
+                attention_mask = b["attention_mask"] + [0] * (max_len - len(b["attention_mask"]))
+                labels = b["labels"] + [-100] * (max_len - len(b["labels"]))  # -100 for padding
+                
+                input_ids_batch.append(input_ids)
+                attention_mask_batch.append(attention_mask)
+                labels_batch.append(labels)
+            
             return {
-                "input_ids": torch.tensor([b["input_ids"] for b in batch], dtype=torch.long),
-                "attention_mask": torch.tensor([b["attention_mask"] for b in batch], dtype=torch.float32),
-                "labels": torch.tensor([b["labels"] for b in batch], dtype=torch.long),
+                "input_ids": torch.tensor(input_ids_batch, dtype=torch.long),
+                "attention_mask": torch.tensor(attention_mask_batch, dtype=torch.float32),
+                "labels": torch.tensor(labels_batch, dtype=torch.long),
                 "human_reference": [b["human_reference"] for b in batch]
             }
         
@@ -208,6 +225,7 @@ class LoadedSplitModelTrainer:
             num_workers=2,
             pin_memory=True
         )
+
 
     def train(self, dataloader, epochs, test_ds=None):
         """Training loop identical to client.py but using loaded state"""
@@ -350,37 +368,51 @@ class LoadedSplitModelTrainer:
             try:
                 self.head_model.eval()
                 self.tail_model.eval()
-
-                generated_ids = input_ids.clone()
+                
+                # Ensure proper tensor shapes and types
                 if input_ids.dtype != torch.long:
                     input_ids = input_ids.long()
                 if attention_mask.dtype != torch.float32:
                     attention_mask = attention_mask.float()
+                    
+                # Ensure 2D tensors
+                if input_ids.dim() == 1:
+                    input_ids = input_ids.unsqueeze(0)
+                if attention_mask.dim() == 1:
+                    attention_mask = attention_mask.unsqueeze(0)
                 
                 generated_ids = input_ids.clone()
                 
                 for step in range(min(max_length - input_ids.size(1), 32)):
+                    # Create attention mask that matches sequence length
+                    current_attention_mask = torch.ones(
+                        generated_ids.size(0), 
+                        generated_ids.size(1), 
+                        dtype=torch.float32, 
+                        device=self.device
+                    )
+                    
                     # Head forward
                     head_out = self.head_model(
                         input_ids=generated_ids,
-                        attention_mask=torch.ones_like(generated_ids).float(),
+                        attention_mask=current_attention_mask,
                         output_hidden_states=True
                     )
                     head_hidden = head_out.hidden_states[-1]
                     
-                    # Server forward with load balancing
+                    # Server forward
                     payload = {
                         "activations": head_hidden.cpu().tolist(),
-                        "attention_mask": torch.ones_like(generated_ids).float().cpu().tolist()
+                        "attention_mask": current_attention_mask.cpu().tolist()
                     }
-                    server_url = self.get_server_url()  # Use load balancing
+                    server_url = self.get_server_url()
                     resp = requests.post(f"{server_url}/forward", json=payload, timeout=120)
                     body_act = torch.tensor(resp.json()["body_activations"], device=self.device)
                     
                     # Tail forward
                     tail_out = self.tail_model(
                         inputs_embeds=body_act,
-                        attention_mask=torch.ones_like(generated_ids).float()
+                        attention_mask=current_attention_mask
                     )
                     logits = tail_out.logits
                     
@@ -395,6 +427,7 @@ class LoadedSplitModelTrainer:
             except Exception as e:
                 print(f"Generation error: {e}")
                 return "Generation failed"
+
 
 
     def evaluate(self, test_ds):

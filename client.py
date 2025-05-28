@@ -109,7 +109,7 @@ class SplitModelTrainer:
                 text,
                 padding="max_length",
                 truncation=True,
-                max_length=128,
+                max_length=64,
                 return_attention_mask=True  # Explicitly request attention mask
             )
             return {
@@ -125,10 +125,27 @@ class SplitModelTrainer:
 
     def create_dataloader(self, ds, batch_size, shuffle=True, sampler=None):
         def collate_fn(batch):
+            # Get max length for this batch
+            max_len = max(len(b["input_ids"]) for b in batch)
+            
+            input_ids_batch = []
+            attention_mask_batch = []
+            labels_batch = []
+            
+            for b in batch:
+                # Pad to max length in batch
+                input_ids = b["input_ids"] + [self.tokenizer.pad_token_id] * (max_len - len(b["input_ids"]))
+                attention_mask = b["attention_mask"] + [0] * (max_len - len(b["attention_mask"]))
+                labels = b["labels"] + [-100] * (max_len - len(b["labels"]))  # -100 for padding
+                
+                input_ids_batch.append(input_ids)
+                attention_mask_batch.append(attention_mask)
+                labels_batch.append(labels)
+            
             return {
-                "input_ids": torch.tensor([b["input_ids"] for b in batch], dtype=torch.long),
-                "attention_mask": torch.tensor([b["attention_mask"] for b in batch], dtype=torch.float32),
-                "labels": torch.tensor([b["labels"] for b in batch], dtype=torch.long),
+                "input_ids": torch.tensor(input_ids_batch, dtype=torch.long),
+                "attention_mask": torch.tensor(attention_mask_batch, dtype=torch.float32),
+                "labels": torch.tensor(labels_batch, dtype=torch.long),
                 "human_reference": [b["human_reference"] for b in batch]
             }
         
@@ -138,9 +155,10 @@ class SplitModelTrainer:
             sampler=sampler,
             shuffle=(shuffle if sampler is None else False),
             collate_fn=collate_fn,
-            num_workers=2,  # Reduced for stability
+            num_workers=2,
             pin_memory=True
         )
+
 
     def train(self, dataloader, epochs, test_ds=None):
         # Initialize server-side training (only rank 0)
@@ -292,47 +310,53 @@ class SplitModelTrainer:
         """Generate text for evaluation using the split model"""
         with torch.no_grad():
             try:
-                # Ensure we're in eval mode and not calling server generation
                 self.head_model.eval()
                 self.tail_model.eval()
-
+                
+                # Ensure proper tensor shapes and types
                 if input_ids.dtype != torch.long:
                     input_ids = input_ids.long()
                 if attention_mask.dtype != torch.float32:
                     attention_mask = attention_mask.float()
+                    
+                # Ensure 2D tensors
+                if input_ids.dim() == 1:
+                    input_ids = input_ids.unsqueeze(0)
+                if attention_mask.dim() == 1:
+                    attention_mask = attention_mask.unsqueeze(0)
                 
                 generated_ids = input_ids.clone()
                 
-            
-                
                 for step in range(min(max_length - input_ids.size(1), 32)):
-                    # Head forward - safe call
-                    try:
-                        head_out = self.head_model(
-                            input_ids=generated_ids,
-                            attention_mask=torch.ones_like(generated_ids).float(),
-                            output_hidden_states=True
-                        )
-                        head_hidden = head_out.hidden_states[-1]
-                    except AttributeError as e:
-                        if 'prepare_inputs_for_generation' in str(e):
-                            print("Warning: Generation attribute error caught and handled")
-                            break
-                        raise e
+                    # Create attention mask that matches sequence length
+                    current_attention_mask = torch.ones(
+                        generated_ids.size(0), 
+                        generated_ids.size(1), 
+                        dtype=torch.float32, 
+                        device=self.device
+                    )
                     
-                    # Server forward - only forward pass
+                    # Head forward
+                    head_out = self.head_model(
+                        input_ids=generated_ids,
+                        attention_mask=current_attention_mask,
+                        output_hidden_states=True
+                    )
+                    head_hidden = head_out.hidden_states[-1]
+                    
+                    # Server forward
                     payload = {
                         "activations": head_hidden.cpu().tolist(),
-                        "attention_mask": torch.ones_like(generated_ids).float().cpu().tolist()
+                        "attention_mask": current_attention_mask.cpu().tolist()
                     }
                     server_url = self.get_server_url()
                     resp = requests.post(f"{server_url}/forward", json=payload, timeout=120)
                     body_act = torch.tensor(resp.json()["body_activations"], device=self.device)
                     
-                    # Tail forward - safe call
+                    # Tail forward
                     tail_out = self.tail_model(
                         inputs_embeds=body_act,
-                        attention_mask=torch.ones_like(generated_ids).float()
+                        attention_mask=current_attention_mask
                     )
                     logits = tail_out.logits
                     
@@ -347,6 +371,7 @@ class SplitModelTrainer:
             except Exception as e:
                 print(f"Generation error: {e}")
                 return "Generation failed"
+
 
 
 
