@@ -40,7 +40,7 @@ def wait_for_server(server_url, max_retries=30, delay=2):
         url = f"http://127.0.0.1:{port}"
         for i in range(max_retries):
             try:
-                response = requests.get(f"{url}/health", timeout=5)
+                response = requests.get(f"{url}/health", timeout=120)
                 if response.status_code == 200:
                     print(f"Server is ready at {url}")
                     break
@@ -105,7 +105,7 @@ class LoadedSplitModelTrainer:
             server_response = requests.post(
                 f"{self.server_url}/load_model", 
                 json={"path": model_path}, 
-                timeout=30
+                timeout=300
             )
             server_data = server_response.json()
             print("Server model loaded:", server_data)
@@ -158,7 +158,7 @@ class LoadedSplitModelTrainer:
             init_response = requests.post(
                 f"{self.server_url}/start_training",
                 json={"learning_rate": 2e-4},
-                timeout=10
+                timeout=100
             )
             print("Server training initialized:", init_response.json())
         except Exception as e:
@@ -326,14 +326,14 @@ class LoadedSplitModelTrainer:
             if self.local_rank == 0:
                 is_final = (epoch == epochs-1)
                 try:
-                    requests.post(f"{self.server_url}/end_epoch", json={"is_final": is_final}, timeout=10)
+                    requests.post(f"{self.server_url}/end_epoch", json={"is_final": is_final}, timeout=100)
                 except requests.exceptions.RequestException as e:
                     print(f"Failed to signal end of epoch: {e}")
         
         # Save models (only rank 0)
         if self.local_rank == 0:
             try:
-                requests.post(f"{self.server_url}/save_model", json={"path": "./server_model"}, timeout=30)
+                requests.post(f"{self.server_url}/save_model", json={"path": "./server_model"}, timeout=300)
                 client_save_info = self.save_models("./server_model")
                 print("Client models saved:", client_save_info)
                 
