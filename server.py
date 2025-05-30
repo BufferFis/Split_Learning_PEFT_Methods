@@ -12,6 +12,8 @@ from util import split_gpt2
 import traceback
 import asyncio
 import json
+from datetime import timedelta  
+
 
 app = FastAPI()
 
@@ -163,6 +165,29 @@ def run_body_layers(activations, attention_mask=None):
         print(f"Error in run_body_layers: {e}")
         # Fallback: ensure we never call generation methods
         raise e
+    
+def setup_distributed():
+    """Setup distributed training for server with extended timeout"""
+    if "LOCAL_RANK" in os.environ:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        
+        # Initialize distributed process group with extended timeout
+        dist.init_process_group(
+            backend="nccl",
+            timeout=timedelta(hours=2)  # 2 hour timeout for heavy operations
+        )
+        torch.cuda.set_device(local_rank)
+        
+        server_state["is_distributed"] = True
+        server_state["local_rank"] = local_rank
+        server_state["world_size"] = world_size
+        
+        print(f"Server rank {local_rank}/{world_size} initialized with extended timeout")
+        return local_rank, world_size
+    else:
+        return 0, 1
+
 
 
 @app.post("/forward")
@@ -343,7 +368,7 @@ async def save_model(request: Request):
     except Exception as e:
         print(f"Error in save_model: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
+"""
 @app.post("/load_model")
 async def load_model(request: Request):
     try:
@@ -423,6 +448,74 @@ async def load_model(request: Request):
         print(f"Error in load_model: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+"""
+
+@app.post("/load_model")
+async def load_model(request: Request):
+    try:
+        global body_model
+        data = await request.json()
+        path = data.get("path")
+        
+        if not os.path.isdir(path):
+            return {"status": "error", "message": f"Path {path} not found"}
+        
+        body_model_path = os.path.join(path, "body_model")
+        if os.path.exists(body_model_path):
+            print(f"Loading PEFT model from {body_model_path} on rank {server_state['local_rank']}")
+            
+            # Load model independently (no barrier before heavy operations)
+            model_name = "gpt2"
+            full_model = AutoModelForCausalLM.from_pretrained(model_name)
+            _, new_body_model, _ = split_gpt2(full_model, head_layers=2, tail_layers=2)
+            
+            # Heavy PEFT loading (no synchronization during this)
+            loaded_peft_model = PeftModel.from_pretrained(
+                new_body_model, 
+                body_model_path,
+                is_trainable=True
+            )
+            loaded_peft_model = loaded_peft_model.to(device)
+            
+            # Update global body_model
+            if server_state["is_distributed"]:
+                body_model = DDP(loaded_peft_model, device_ids=[server_state["local_rank"]])
+            else:
+                body_model = loaded_peft_model
+            
+            body_model.train()
+            
+            # Load optimizer (only rank 0)
+            if server_state["local_rank"] == 0:
+                opt_path = os.path.join(path, "body_optimizer.pt")
+                if os.path.exists(opt_path):
+                    server_state["optimizer"] = optim.AdamW(
+                        [p for p in body_model.parameters() if p.requires_grad], lr=2e-4
+                    )
+                    server_state["optimizer"].load_state_dict(torch.load(opt_path, map_location=device))
+                    print(f"Server optimizer state loaded on rank {server_state['local_rank']}")
+            
+            # ONLY NOW synchronize after everything is loaded
+            if server_state["is_distributed"]:
+                print(f"Final synchronization on rank {server_state['local_rank']}")
+                try:
+                    dist.barrier()  # This should work now with extended timeout
+                    print(f"Barrier completed on rank {server_state['local_rank']}")
+                except Exception as barrier_error:
+                    print(f"Barrier warning on rank {server_state['local_rank']}: {barrier_error}")
+                    # Continue anyway - each process loaded independently
+            
+            print(f"Body model updated successfully on rank {server_state['local_rank']}")
+            
+            return {"status": "loaded", "path": path, "server_rank": server_state["local_rank"]}
+        else:
+            return {"status": "error", "message": f"Body model not found at {body_model_path}"}
+            
+    except Exception as e:
+        print(f"Error in load_model rank {server_state['local_rank']}: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/model_info")
 async def model_info():
