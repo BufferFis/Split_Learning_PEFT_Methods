@@ -459,5 +459,4 @@ if __name__ == "__main__":
         port=port,
         timeout_keep_alive=1200,  # Increase from default 5 to 120 seconds
         timeout_graceful_shutdown=1200,  # Add graceful shutdown timeout
-        timeout_notify=900
     )
