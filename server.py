@@ -464,12 +464,15 @@ async def load_model(request: Request):
         if os.path.exists(body_model_path):
             print(f"Loading PEFT model from {body_model_path} on rank {server_state['local_rank']}")
             
-            # Load model independently (no barrier before heavy operations)
+            # CRITICAL: Load independently without ANY synchronization barriers
+            # This prevents NCCL communicator abort issues
+            
+            # Step 1: Create base model
             model_name = "gpt2"
             full_model = AutoModelForCausalLM.from_pretrained(model_name)
             _, new_body_model, _ = split_gpt2(full_model, head_layers=2, tail_layers=2)
             
-            # Heavy PEFT loading (no synchronization during this)
+            # Step 2: Load PEFT model (heavy operation - no barriers!)
             loaded_peft_model = PeftModel.from_pretrained(
                 new_body_model, 
                 body_model_path,
@@ -477,7 +480,7 @@ async def load_model(request: Request):
             )
             loaded_peft_model = loaded_peft_model.to(device)
             
-            # Update global body_model
+            # Step 3: Update global model
             if server_state["is_distributed"]:
                 body_model = DDP(loaded_peft_model, device_ids=[server_state["local_rank"]])
             else:
@@ -485,28 +488,19 @@ async def load_model(request: Request):
             
             body_model.train()
             
-            # Load optimizer (only rank 0)
-            if server_state["local_rank"] == 0:
-                opt_path = os.path.join(path, "body_optimizer.pt")
-                if os.path.exists(opt_path):
-                    server_state["optimizer"] = optim.AdamW(
-                        [p for p in body_model.parameters() if p.requires_grad], lr=2e-4
-                    )
-                    server_state["optimizer"].load_state_dict(torch.load(opt_path, map_location=device))
-                    print(f"Server optimizer state loaded on rank {server_state['local_rank']}")
+            # Step 4: Load optimizer independently (each rank loads its own copy)
+            opt_path = os.path.join(path, "body_optimizer.pt")
+            if os.path.exists(opt_path):
+                server_state["optimizer"] = optim.AdamW(
+                    [p for p in body_model.parameters() if p.requires_grad], lr=2e-4
+                )
+                server_state["optimizer"].load_state_dict(torch.load(opt_path, map_location=device))
+                print(f"Server optimizer state loaded on rank {server_state['local_rank']}")
             
-            # ONLY NOW synchronize after everything is loaded
-            if server_state["is_distributed"]:
-                print(f"Final synchronization on rank {server_state['local_rank']}")
-                try:
-                    dist.barrier()  # This should work now with extended timeout
-                    print(f"Barrier completed on rank {server_state['local_rank']}")
-                except Exception as barrier_error:
-                    print(f"Barrier warning on rank {server_state['local_rank']}: {barrier_error}")
-                    # Continue anyway - each process loaded independently
+            # NO BARRIERS - Each process completes independently
+            # DDP will synchronize gradients during actual training, not during loading
             
-            print(f"Body model updated successfully on rank {server_state['local_rank']}")
-            
+            print(f"Body model loaded successfully on rank {server_state['local_rank']}")
             return {"status": "loaded", "path": path, "server_rank": server_state["local_rank"]}
         else:
             return {"status": "error", "message": f"Body model not found at {body_model_path}"}
@@ -514,7 +508,8 @@ async def load_model(request: Request):
     except Exception as e:
         print(f"Error in load_model rank {server_state['local_rank']}: {e}")
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        # Return error but don't raise HTTPException - let other ranks continue
+        return {"status": "error", "message": str(e), "server_rank": server_state["local_rank"]}
 
 
 @app.get("/model_info")

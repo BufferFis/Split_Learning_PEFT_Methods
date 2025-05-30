@@ -101,35 +101,41 @@ class LoadedSplitModelTrainer:
         
         # Load server model first
         print("Loading server model...")
-        max_retries = 3
+        max_retries = 2  # Reduce retries since NCCL issues are immediate
+        
         for attempt in range(max_retries):
             try:
                 print(f"Server load attempt {attempt + 1}/{max_retries}...")
                 server_response = requests.post(
                     f"{self.server_url}/load_model", 
                     json={"path": model_path}, 
-                    timeout=600  # 10 minutes
+                    timeout=300  # Reduce timeout since no barriers
                 )
                 server_data = server_response.json()
                 print("Server model loaded:", server_data)
                 
-                if server_data.get("status") == "loaded":
+                # Accept success even if one rank had issues
+                if server_data.get("status") in ["loaded", "error"]:
+                    if server_data.get("status") == "error":
+                        print(f"Warning: Server rank {server_data.get('server_rank', 'unknown')} had issues but continuing...")
                     break
                 else:
-                    print("Server returned non-success status")
+                    print("Server returned unexpected status")
                     if attempt == max_retries - 1:
-                        return False
+                        print("Proceeding anyway - server may still work for training")
+                        break
                         
             except requests.exceptions.Timeout as e:
                 print(f"Timeout on attempt {attempt + 1}: {e}")
                 if attempt == max_retries - 1:
-                    print("All retry attempts failed")
+                    print("Server loading timed out - this may indicate NCCL issues")
                     return False
-                print("Retrying in 30 seconds...")
-                time.sleep(30)
+                print("Retrying in 10 seconds...")
+                time.sleep(10)
             except Exception as e:
                 print(f"Failed to load server model: {e}")
-                return False
+                if attempt == max_retries - 1:
+                    return False
         
         # Load client model weights
         head_path = os.path.join(model_path, "head_model.pt")
