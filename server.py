@@ -457,6 +457,7 @@ if __name__ == "__main__":
         app, 
         host="0.0.0.0", 
         port=port,
-        timeout_keep_alive=300,  # Increase from default 5 to 120 seconds
-        timeout_graceful_shutdown=120  # Add graceful shutdown timeout
+        timeout_keep_alive=1200,  # Increase from default 5 to 120 seconds
+        timeout_graceful_shutdown=1200,  # Add graceful shutdown timeout
+        timeout_notify=900
     )

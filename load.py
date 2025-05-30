@@ -101,22 +101,35 @@ class LoadedSplitModelTrainer:
         
         # Load server model first
         print("Loading server model...")
-        try:
-            server_response = requests.post(
-                f"{self.server_url}/load_model", 
-                json={"path": model_path}, 
-                timeout=300
-            )
-            server_data = server_response.json()
-            print("Server model loaded:", server_data)
-            
-            if server_data.get("status") != "loaded":
-                print("Failed to load server model")
-                return False
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                print(f"Server load attempt {attempt + 1}/{max_retries}...")
+                server_response = requests.post(
+                    f"{self.server_url}/load_model", 
+                    json={"path": model_path}, 
+                    timeout=600  # 10 minutes
+                )
+                server_data = server_response.json()
+                print("Server model loaded:", server_data)
                 
-        except Exception as e:
-            print(f"Failed to load server model: {e}")
-            return False
+                if server_data.get("status") == "loaded":
+                    break
+                else:
+                    print("Server returned non-success status")
+                    if attempt == max_retries - 1:
+                        return False
+                        
+            except requests.exceptions.Timeout as e:
+                print(f"Timeout on attempt {attempt + 1}: {e}")
+                if attempt == max_retries - 1:
+                    print("All retry attempts failed")
+                    return False
+                print("Retrying in 30 seconds...")
+                time.sleep(30)
+            except Exception as e:
+                print(f"Failed to load server model: {e}")
+                return False
         
         # Load client model weights
         head_path = os.path.join(model_path, "head_model.pt")
