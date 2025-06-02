@@ -15,6 +15,7 @@ from util import split_gpt2
 from tqdm import tqdm
 from evaluate import load as load_metric
 import json
+import sys
 
 def setup_ddp():
     """Setup distributed training if available"""
@@ -482,7 +483,13 @@ class LoadedSplitModelTrainer:
                 # Fallback for other dataset types
                 eval_samples = test_ds[:100]
             
+            print(f"Evaluating on {len(eval_samples)} samples...", flush=True)
+            sys.stdout.flush()
+
             for i, sample in enumerate(tqdm(eval_samples, desc="Evaluating")):
+                if i%20 == 0:
+                    print(f"processed {i}/100 samples...", flush=True)
+                
                 try:
                     # DEFENSIVE: Check if sample is a dictionary
                     if isinstance(sample, str):
@@ -513,13 +520,16 @@ class LoadedSplitModelTrainer:
                     refs.append([sample["human_reference"]])
                     
                 except Exception as sample_error:
-                    print(f"Error processing sample {i}: {sample_error}")
+                    print(f"Error processing sample {i}: {sample_error}", flush=True)
                     continue
             
             if not preds:
                 print("No valid predictions generated")
                 return {"bleu": 0.0, "meteor": 0.0, "error": "No valid samples"}
             
+            print(f"Generated {len(preds)} predictions, computing metrics...", flush=True)
+            sys.stdout.flush()
+
             # Calculate metrics with error handling
             try:
                 bleu_score = bleu_metric.compute(predictions=preds, references=refs)
@@ -529,8 +539,9 @@ class LoadedSplitModelTrainer:
                 bleu_value = bleu_score.get('bleu', 0.0) if isinstance(bleu_score, dict) else 0.0
                 meteor_value = meteor_score.get('meteor', 0.0) if isinstance(meteor_score, dict) else 0.0
                 
-                print(f"E2E NLG BLEU Score: {bleu_value:.4f}")
-                print(f"E2E NLG METEOR Score: {meteor_value:.4f}")
+                print(f"E2E NLG BLEU Score: {bleu_value:.4f}", flush=True)
+                print(f"E2E NLG METEOR Score: {meteor_value:.4f}", flush=True)
+                sys.stdout.flush()
                 
                 results = {
                     "bleu": bleu_value,
@@ -549,11 +560,12 @@ class LoadedSplitModelTrainer:
             with open("./server_model/evaluation_results.json", "w") as f:
                 json.dump(results, f, indent=2)
             print("Evaluation results saved to ./server_model/evaluation_results.json")
-            
+            sys.stdout.flush()
             return results
             
         except Exception as e:
             print(f"Evaluation error: {e}")
+            sys.stdout.flush()
             return None
 
     
@@ -626,19 +638,40 @@ def main():
         
         # ADD THIS: Handle eval_only mode
         if args.eval_only:
-            print("Running evaluation only...")
+            print("Running evaluation only...", flush=True)
+            sys.stdout.flush()
+            
             # Load dataset for evaluation
             train_ds, test_ds = trainer.load_e2e_dataset()
             
             # Run evaluation only (no training)
             if local_rank == 0:  # Only rank 0 evaluates
-                print("Starting evaluation with Hugging Face metrics...")
-                eval_results = trainer.evaluate(test_ds)
-                if eval_results:
-                    print(f"Final BLEU: {eval_results['bleu']:.4f}, METEOR: {eval_results['meteor']:.4f}")
-                else:
-                    print("Evaluation failed")
-            print("Evaluation-only mode completed!")
+                print("Starting evaluation with Hugging Face metrics...", flush=True)
+                sys.stdout.flush()
+                
+                try:
+                    eval_results = trainer.evaluate(test_ds)
+                    if eval_results:
+                        bleu_score = eval_results.get('bleu', 0.0)
+                        meteor_score = eval_results.get('meteor', 0.0)
+                        print(f"=== EVALUATION RESULTS ===", flush=True)
+                        print(f"Final BLEU: {bleu_score:.4f}", flush=True)
+                        print(f"Final METEOR: {meteor_score:.4f}", flush=True)
+                        print(f"========================", flush=True)
+                        sys.stdout.flush()
+                    else:
+                        print("Evaluation failed - no results returned", flush=True)
+                        sys.stdout.flush()
+                except Exception as eval_error:
+                    print(f"Evaluation error: {eval_error}", flush=True)
+                    sys.stdout.flush()
+            else:
+                print(f"Rank {local_rank}: Waiting for rank 0 to complete evaluation...", flush=True)
+                sys.stdout.flush()
+            
+            print("Evaluation-only mode completed!", flush=True)
+            sys.stdout.flush()
+
             
         # Continue training if requested (existing logic)
         elif args.continue_training:
