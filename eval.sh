@@ -2,15 +2,13 @@
 
 # Launch evaluation-only mode using load.py
 export CUDA_VISIBLE_DEVICES=0,1
-
-# CRITICAL: Add unbuffered output environment variables
 export PYTHONUNBUFFERED=1
 export PYTHONIOENCODING=utf-8
 
 echo "Starting evaluation-only mode using saved model..."
 
-# FIXED: Remove the space between python and -u
-torchrun --standalone --nproc_per_node=2 python3 load.py \
+# FIXED: Use torchrun with the module approach
+torchrun --standalone --nproc_per_node=2 load.py \
     --model_path ./server_model \
     --eval_only \
     --batch_size 64 \
