@@ -9,8 +9,8 @@ export PYTHONIOENCODING=utf-8
 
 echo "Starting evaluation-only mode using saved model..."
 
-# Run load.py in evaluation-only mode with unbuffered output
-torchrun --standalone --nproc_per_node=2 python -u load.py \
+# FIXED: Remove the space between python and -u
+torchrun --standalone --nproc_per_node=2 python3 load.py \
     --model_path ./server_model \
     --eval_only \
     --batch_size 64 \
