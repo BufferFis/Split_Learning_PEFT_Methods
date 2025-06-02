@@ -191,6 +191,7 @@ def setup_distributed():
 
 
 @app.post("/forward")
+@app.post("/forward")
 async def forward(request: Request):
     try:
         payload = await request.json()
@@ -198,14 +199,19 @@ async def forward(request: Request):
         attention_mask = None
         if "attention_mask" in payload and payload["attention_mask"] is not None:
             attention_mask = torch.tensor(payload["attention_mask"], device=device, dtype=torch.float32)
-             # Validate attention mask shape and values
-            if attention_mask.dim() != 2:
-                raise ValueError(f"Expected 2D attention mask, got {attention_mask.dim()}D")
-            if not torch.all((attention_mask == 0) | (attention_mask == 1)):
-                print("Warning: Attention mask contains non-binary values")
-
-
-        # Explicitly set to eval mode and use forward only
+            
+            # CRITICAL FIX: Ensure attention mask matches activations sequence length
+            if attention_mask.size(-1) != activations.size(1):
+                print(f"Attention mask length mismatch: {attention_mask.size(-1)} vs {activations.size(1)}")
+                # Resize attention mask to match activations
+                if attention_mask.size(-1) > activations.size(1):
+                    attention_mask = attention_mask[:, :activations.size(1)]
+                else:
+                    # Pad with zeros
+                    pad_length = activations.size(1) - attention_mask.size(-1)
+                    padding = torch.zeros(attention_mask.size(0), pad_length, device=device, dtype=torch.float32)
+                    attention_mask = torch.cat([attention_mask, padding], dim=1)
+        
         body_model.eval()
         with torch.no_grad():
             last_hidden = run_body_layers(activations, attention_mask)
@@ -213,8 +219,43 @@ async def forward(request: Request):
         return {"body_activations": last_hidden.cpu().tolist()}
     except Exception as e:
         print(f"Error in forward: {e}")
-        traceback.print_exc()  # Add this for better debugging
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/forward_train")
+async def forward_train(request: Request):
+    try:
+        data = await request.json()
+        client_rank_id = data.get("rank_id", 0)
+        rank_key = f"client_{client_rank_id}_server_{server_state['local_rank']}"
+        
+        activations = torch.tensor(data["activations"], requires_grad=True, device=device)
+        attention_mask = None
+        if "attention_mask" in data and data["attention_mask"] is not None:
+            attention_mask = torch.tensor(data["attention_mask"], device=device, dtype=torch.float32)
+            
+            # CRITICAL FIX: Ensure consistent dimensions
+            if attention_mask.size(-1) != activations.size(1):
+                print(f"Training: Attention mask length mismatch: {attention_mask.size(-1)} vs {activations.size(1)}")
+                if attention_mask.size(-1) > activations.size(1):
+                    attention_mask = attention_mask[:, :activations.size(1)]
+                else:
+                    pad_length = activations.size(1) - attention_mask.size(-1)
+                    padding = torch.zeros(attention_mask.size(0), pad_length, device=device, dtype=torch.float32)
+                    attention_mask = torch.cat([attention_mask, padding], dim=1)
+        
+        body_model.train()
+        last_hidden = run_body_layers(activations, attention_mask)
+        
+        server_state["last_activations"][rank_key] = (activations, attention_mask, last_hidden)
+        server_state["requires_backward"][rank_key] = True
+        
+        return {"body_activations": last_hidden.detach().cpu().tolist()}
+    except Exception as e:
+        print(f"Error in forward_train: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @app.post("/forward_train")

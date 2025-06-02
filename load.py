@@ -195,7 +195,7 @@ class LoadedSplitModelTrainer:
                 text,
                 padding="max_length",
                 truncation=True,
-                max_length=64,
+                max_length=128,
                 return_attention_mask=True  # Explicitly request attention mask
             )
             return {
@@ -211,18 +211,25 @@ class LoadedSplitModelTrainer:
 
     def create_dataloader(self, ds, batch_size, shuffle=True, sampler=None):
         def collate_fn(batch):
-            # Get max length for this batch
-            max_len = max(len(b["input_ids"]) for b in batch)
+            # Use FIXED length instead of dynamic max_len
+            FIXED_LENGTH = 128  # Consistent with preprocessing
             
             input_ids_batch = []
             attention_mask_batch = []
             labels_batch = []
             
             for b in batch:
-                # Pad to max length in batch
-                input_ids = b["input_ids"] + [self.tokenizer.pad_token_id] * (max_len - len(b["input_ids"]))
-                attention_mask = b["attention_mask"] + [0] * (max_len - len(b["attention_mask"]))
-                labels = b["labels"] + [-100] * (max_len - len(b["labels"]))  # -100 for padding
+                # Ensure all sequences are exactly FIXED_LENGTH
+                input_ids = b["input_ids"][:FIXED_LENGTH]  # Truncate if longer
+                attention_mask = b["attention_mask"][:FIXED_LENGTH]
+                labels = b["labels"][:FIXED_LENGTH]
+                
+                # Pad if shorter
+                if len(input_ids) < FIXED_LENGTH:
+                    pad_length = FIXED_LENGTH - len(input_ids)
+                    input_ids.extend([self.tokenizer.pad_token_id] * pad_length)
+                    attention_mask.extend([0] * pad_length)
+                    labels.extend([-100] * pad_length)
                 
                 input_ids_batch.append(input_ids)
                 attention_mask_batch.append(attention_mask)
@@ -234,6 +241,7 @@ class LoadedSplitModelTrainer:
                 "labels": torch.tensor(labels_batch, dtype=torch.long),
                 "human_reference": [b["human_reference"] for b in batch]
             }
+
         
         return DataLoader(
             ds,
@@ -381,29 +389,27 @@ class LoadedSplitModelTrainer:
         return {"head_path": os.path.join(path, "head_model.pt"), 
                 "tail_path": os.path.join(path, "tail_model.pt")}
 
-    def generate(self, input_ids, attention_mask, max_length=64):
+    def generate(self, input_ids, attention_mask, max_length=128):  # Match preprocessing
         """Generate text for evaluation using the split model"""
         with torch.no_grad():
             try:
                 self.head_model.eval()
                 self.tail_model.eval()
                 
-                # Ensure proper tensor shapes and types
-                if input_ids.dtype != torch.long:
-                    input_ids = input_ids.long()
-                if attention_mask.dtype != torch.float32:
-                    attention_mask = attention_mask.float()
-                    
-                # Ensure 2D tensors
+                # Ensure consistent dimensions
                 if input_ids.dim() == 1:
                     input_ids = input_ids.unsqueeze(0)
                 if attention_mask.dim() == 1:
                     attention_mask = attention_mask.unsqueeze(0)
+                    
+                # Ensure proper types
+                input_ids = input_ids.long()
+                attention_mask = attention_mask.float()
                 
                 generated_ids = input_ids.clone()
                 
                 for step in range(min(max_length - input_ids.size(1), 32)):
-                    # Create attention mask that matches sequence length
+                    # Create attention mask that EXACTLY matches sequence length
                     current_attention_mask = torch.ones(
                         generated_ids.size(0), 
                         generated_ids.size(1), 
@@ -411,7 +417,7 @@ class LoadedSplitModelTrainer:
                         device=self.device
                     )
                     
-                    # Head forward
+                    # Head forward with exact dimensions
                     head_out = self.head_model(
                         input_ids=generated_ids,
                         attention_mask=current_attention_mask,
@@ -419,11 +425,12 @@ class LoadedSplitModelTrainer:
                     )
                     head_hidden = head_out.hidden_states[-1]
                     
-                    # Server forward
+                    # Server forward with dimension validation
                     payload = {
                         "activations": head_hidden.cpu().tolist(),
                         "attention_mask": current_attention_mask.cpu().tolist()
                     }
+                    
                     server_url = self.get_server_url()
                     resp = requests.post(f"{server_url}/forward", json=payload, timeout=120)
                     body_act = torch.tensor(resp.json()["body_activations"], device=self.device)
@@ -446,6 +453,7 @@ class LoadedSplitModelTrainer:
             except Exception as e:
                 print(f"Generation error: {e}")
                 return "Generation failed"
+
 
 
 
