@@ -573,64 +573,79 @@ def main():
     parser.add_argument("--server_url", type=str, default="http://localhost:8000")
     parser.add_argument("--continue_training", action="store_true", help="Continue training after loading")
     parser.add_argument("--epochs", type=int, default=1, help="Number of epochs to train")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training")  # Match shell scripts
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training")
+    parser.add_argument("--eval_only", action="store_true", help="Only run evaluation, no training")  # This exists
     args = parser.parse_args()
-    
-    
+
     # Setup distributed training
     local_rank, world_size, is_distributed = setup_ddp()
-    
+
     # Wait for server (only rank 0)
     if local_rank == 0:
         if not wait_for_server(args.server_url):
             print("Server is not available. Please start the server first.")
             return
-    
+
     # Synchronize all processes
     if is_distributed:
         dist.barrier()
-    
+
     # Check if model path exists
     if not os.path.exists(args.model_path):
         print(f"Model path {args.model_path} does not exist!")
         return
-    
+
     device = torch.device(f"cuda:{local_rank}")
-    
+
     # Initialize models with same configuration as training
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
-    
+
     full_model = AutoModelForCausalLM.from_pretrained("gpt2")
     head_m, _, tail_m = split_gpt2(full_model, head_layers=2, tail_layers=2)
-    
+
     lora_cfg = LoraConfig(
         r=8, lora_alpha=16, lora_dropout=0.05,
         bias="none", use_dora=True, task_type="CAUSAL_LM",
         target_modules=["c_attn", "c_proj"]
     )
-    
+
     head_m = get_peft_model(head_m, lora_cfg).to(device)
     tail_m = get_peft_model(tail_m, lora_cfg).to(device)
-    
+
     if is_distributed:
         head_m = DDP(head_m, device_ids=[local_rank])
         tail_m = DDP(tail_m, device_ids=[local_rank])
-    
+
     # Create loaded trainer
     trainer = LoadedSplitModelTrainer(head_m, tail_m, tokenizer, args.server_url, local_rank, world_size)
-    
+
     # Load models and optimizers
     if trainer.load_models_and_optimizers(args.model_path):
         print("All models and optimizers loaded successfully!")
         
-        # Continue training if requested
-        if args.continue_training:
-            print(f"Continuing training for {args.epochs} epochs...")
-            
-            # Load dataset and create dataloader
+        # ADD THIS: Handle eval_only mode
+        if args.eval_only:
+            print("Running evaluation only...")
+            # Load dataset for evaluation
             train_ds, test_ds = trainer.load_e2e_dataset()
             
+            # Run evaluation only (no training)
+            if local_rank == 0:  # Only rank 0 evaluates
+                print("Starting evaluation with Hugging Face metrics...")
+                eval_results = trainer.evaluate(test_ds)
+                if eval_results:
+                    print(f"Final BLEU: {eval_results['bleu']:.4f}, METEOR: {eval_results['meteor']:.4f}")
+                else:
+                    print("Evaluation failed")
+            print("Evaluation-only mode completed!")
+            
+        # Continue training if requested (existing logic)
+        elif args.continue_training:
+            print(f"Continuing training for {args.epochs} epochs...")
+            # Load dataset and create dataloader
+            train_ds, test_ds = trainer.load_e2e_dataset()
+
             if is_distributed:
                 train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=local_rank)
                 train_dl = trainer.create_dataloader(
@@ -640,16 +655,14 @@ def main():
                 train_dl = trainer.create_dataloader(
                     train_ds, batch_size=args.batch_size, shuffle=True
                 )
-            
+
             # Continue training
-            trainer.train(train_dl, epochs=args.epochs, test_ds = test_ds)
+            trainer.train(train_dl, epochs=args.epochs, test_ds=test_ds)
             print("Incremental training completed!")
         else:
-            print("Models loaded successfully. Use --continue_training to resume training.")
+            print("Models loaded successfully. Use --continue_training to resume training or --eval_only for evaluation.")
     else:
         print("Failed to load models properly!")
-    
+
     cleanup_ddp(is_distributed)
 
-if __name__ == "__main__":
-    main()
