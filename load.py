@@ -636,40 +636,92 @@ def main():
     if trainer.load_models_and_optimizers(args.model_path):
         print("All models and optimizers loaded successfully!")
         
+        # Add this before the evaluation section in load.py
+        if args.eval_only and local_rank == 0:
+            print("Checking server connectivity...", flush=True)
+            try:
+                health_response = requests.get(f"{args.server_url}/health", timeout=10)
+                if health_response.status_code == 200:
+                    print(f"✅ Server is healthy: {health_response.json()}", flush=True)
+                else:
+                    print(f"⚠️ Server health check failed: {health_response.status_code}", flush=True)
+            except Exception as health_error:
+                print(f"❌ Server health check error: {health_error}", flush=True)
+                print("Make sure ./server_launch.sh is running!", flush=True)
+            sys.stdout.flush()
+
         # ADD THIS: Handle eval_only mode
         if args.eval_only:
-            print("Running evaluation only...", flush=True)
+            print("=== EVAL ONLY MODE STARTED ===", flush=True)
+            print(f"Local rank: {local_rank}, World size: {world_size}", flush=True)
             sys.stdout.flush()
             
             # Load dataset for evaluation
-            train_ds, test_ds = trainer.load_e2e_dataset()
+            print("Loading E2E dataset...", flush=True)
+            try:
+                train_ds, test_ds = trainer.load_e2e_dataset()
+                print(f"Dataset loaded: train={len(train_ds)}, test={len(test_ds)}", flush=True)
+            except Exception as dataset_error:
+                print(f"Dataset loading failed: {dataset_error}", flush=True)
+                sys.stdout.flush()
+                return
             
-            # Run evaluation only (no training)
-            if local_rank == 0:  # Only rank 0 evaluates
-                print("Starting evaluation with Hugging Face metrics...", flush=True)
+            # CRITICAL: Only rank 0 should evaluate, others should wait
+            if local_rank == 0:
+                print("=== RANK 0: Starting evaluation ===", flush=True)
                 sys.stdout.flush()
                 
                 try:
+                    print("Calling trainer.evaluate()...", flush=True)
+                    sys.stdout.flush()
+                    
                     eval_results = trainer.evaluate(test_ds)
-                    if eval_results:
+                    
+                    print(f"Evaluation returned: {eval_results}", flush=True)
+                    sys.stdout.flush()
+                    
+                    if eval_results and isinstance(eval_results, dict):
                         bleu_score = eval_results.get('bleu', 0.0)
                         meteor_score = eval_results.get('meteor', 0.0)
-                        print(f"=== EVALUATION RESULTS ===", flush=True)
-                        print(f"Final BLEU: {bleu_score:.4f}", flush=True)
-                        print(f"Final METEOR: {meteor_score:.4f}", flush=True)
-                        print(f"========================", flush=True)
+                        
+                        print("=" * 50, flush=True)
+                        print("        EVALUATION RESULTS", flush=True)
+                        print("=" * 50, flush=True)
+                        print(f"BLEU Score:   {bleu_score:.4f}", flush=True)
+                        print(f"METEOR Score: {meteor_score:.4f}", flush=True)
+                        print("=" * 50, flush=True)
                         sys.stdout.flush()
+                        
+                        # Also save to file for verification
+                        result_file = "./server_model/eval_only_results.json"
+                        with open(result_file, "w") as f:
+                            json.dump(eval_results, f, indent=2)
+                        print(f"Results saved to: {result_file}", flush=True)
+                        
                     else:
-                        print("Evaluation failed - no results returned", flush=True)
+                        print("ERROR: Evaluation failed - no results returned", flush=True)
+                        print(f"eval_results type: {type(eval_results)}", flush=True)
+                        print(f"eval_results content: {eval_results}", flush=True)
                         sys.stdout.flush()
+                        
                 except Exception as eval_error:
-                    print(f"Evaluation error: {eval_error}", flush=True)
+                    print(f"EVALUATION ERROR: {eval_error}", flush=True)
+                    import traceback
+                    traceback.print_exc()
                     sys.stdout.flush()
             else:
-                print(f"Rank {local_rank}: Waiting for rank 0 to complete evaluation...", flush=True)
+                print(f"=== RANK {local_rank}: Waiting for rank 0 evaluation ===", flush=True)
                 sys.stdout.flush()
             
-            print("Evaluation-only mode completed!", flush=True)
+            # Synchronize all ranks before finishing
+            if is_distributed:
+                print(f"Rank {local_rank}: Waiting at barrier...", flush=True)
+                sys.stdout.flush()
+                dist.barrier()
+                print(f"Rank {local_rank}: Barrier completed", flush=True)
+                sys.stdout.flush()
+            
+            print("=== EVAL ONLY MODE COMPLETED ===", flush=True)
             sys.stdout.flush()
 
             

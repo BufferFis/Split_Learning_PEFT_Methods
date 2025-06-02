@@ -15,3 +15,21 @@ torchrun --standalone --nproc_per_node=2 load.py \
     --server_url http://127.0.0.1:8000
 
 echo "Evaluation completed!"
+
+echo "Checking for evaluation results..."
+if [ -f "./server_model/evaluation_results.json" ]; then
+    echo "=== EVALUATION RESULTS FOUND ==="
+    cat ./server_model/evaluation_results.json
+    echo ""
+    echo "================================"
+else
+    echo "❌ No evaluation results file found"
+fi
+
+if [ -f "./server_model/eval_only_results.json" ]; then
+    echo "=== EVAL ONLY RESULTS FOUND ==="
+    cat ./server_model/eval_only_results.json
+    echo ""
+    echo "=============================="
+fi
+
