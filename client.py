@@ -124,7 +124,6 @@ class SplitModelTrainer:
         return train, test
 
     def create_dataloader(self, ds, batch_size, shuffle=True, sampler=None):
-        FIXED_LENGTH = 128
         def collate_fn(batch):
             FIXED_LENGTH = 128
             input_ids_batch = []
@@ -160,16 +159,7 @@ class SplitModelTrainer:
             drop_last=True  # Ensures all batches are [batch_size, 128]
         )
 
-        
-        return DataLoader(
-            ds,
-            batch_size=batch_size,
-            sampler=sampler,
-            shuffle=(shuffle if sampler is None else False),
-            collate_fn=collate_fn,
-            num_workers=2,
-            pin_memory=True
-        )
+    
 
 
     def train(self, dataloader, epochs, test_ds=None):
@@ -205,11 +195,16 @@ class SplitModelTrainer:
                     attn_mask = batch["attention_mask"].to(self.device).float()
                     labels = batch["labels"].to(self.device)
                     
-                    # ADD THESE ASSERTIONS HERE - Before any forward passes
-                    assert input_ids.shape[1] == 128, f"input_ids shape {input_ids.shape}"
-                    assert attn_mask.shape[1] == 128, f"attn_mask shape {attn_mask.shape}"
-                    assert labels.shape[1] == 128, f"labels shape {labels.shape}"
-                    assert input_ids.shape[0] == attn_mask.shape[0] == labels.shape[0], f"Batch size mismatch: input_ids {input_ids.shape[0]}, attn_mask {attn_mask.shape[0]}, labels {labels.shape[0]}"
+                   # Expand attention mask to 4D [batch_size, num_heads, seq_len, seq_len]
+                    attn_mask_expanded = attn_mask.unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, 128]
+                    attn_mask_expanded = attn_mask_expanded.expand(-1, 12, 128, -1)  # [batch, 12, 128, 128]
+
+                    # Validate ALL shapes
+                    assert input_ids.shape == torch.Size([64, 128]), f"input_ids shape {input_ids.shape}"
+                    assert attn_mask_expanded.shape == torch.Size([64, 12, 128, 128]), "Invalid mask shape"
+                    assert labels.shape == torch.Size([64, 128]), f"labels shape {labels.shape}"
+                    
+                    #assert input_ids.shape[0] == attn_mask.shape[0] == labels.shape[0], f"Batch size mismatch: input_ids {input_ids.shape[0]}, attn_mask {attn_mask.shape[0]}, labels {labels.shape[0]}"
 
                     # Zero optimizers
                     self.head_optimizer.zero_grad()
@@ -218,7 +213,7 @@ class SplitModelTrainer:
                     # Head forward
                     head_out = self.head_model(
                         input_ids=input_ids,
-                        attention_mask=attn_mask,
+                        attention_mask=attn_mask_expanded,
                         output_hidden_states=True
                     )
                     head_hid = head_out.hidden_states[-1]

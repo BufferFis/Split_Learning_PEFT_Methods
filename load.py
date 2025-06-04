@@ -247,16 +247,7 @@ class LoadedSplitModelTrainer:
         )
 
 
-        
-        return DataLoader(
-            ds,
-            batch_size=batch_size,
-            sampler=sampler,
-            shuffle=(shuffle if sampler is None else False),
-            collate_fn=collate_fn,
-            num_workers=2,
-            pin_memory=True
-        )
+
 
 
     def train(self, dataloader, epochs, test_ds=None):
@@ -281,11 +272,14 @@ class LoadedSplitModelTrainer:
                     attn_mask = batch["attention_mask"].to(self.device).float()
                     labels = batch["labels"].to(self.device)
                     
-                    # ADD THESE ASSERTIONS HERE - Before any forward passes
-                    assert input_ids.shape[1] == 128, f"input_ids shape {input_ids.shape}"
-                    assert attn_mask.shape[1] == 128, f"attn_mask shape {attn_mask.shape}"
-                    assert labels.shape[1] == 128, f"labels shape {labels.shape}"
-                    assert input_ids.shape[0] == attn_mask.shape[0] == labels.shape[0], f"Batch size mismatch: input_ids {input_ids.shape[0]}, attn_mask {attn_mask.shape[0]}, labels {labels.shape[0]}"
+                    # Expand attention mask to 4D [batch, heads, seq_len, seq_len]
+                    attn_mask_expanded = attn_mask.unsqueeze(1).unsqueeze(2)  # [64, 1, 1, 128]
+                    attn_mask_expanded = attn_mask_expanded.expand(-1, 12, 128, -1)  # [64, 12, 128, 128]
+                    
+                    # Validate ALL shapes
+                    assert input_ids.shape == torch.Size([64, 128]), f"input_ids shape {input_ids.shape}"
+                    assert attn_mask_expanded.shape == torch.Size([64, 12, 128, 128]), "Invalid mask shape"
+                    assert labels.shape == torch.Size([64, 128]), f"labels shape {labels.shape}"
 
 
                     # Zero optimizers
@@ -295,7 +289,7 @@ class LoadedSplitModelTrainer:
                     # Head forward
                     head_out = self.head_model(
                         input_ids=input_ids,
-                        attention_mask=attn_mask,
+                        attention_mask=attn_mask_expanded,
                         output_hidden_states=True
                     )
                     head_hid = head_out.hidden_states[-1]
@@ -401,7 +395,7 @@ class LoadedSplitModelTrainer:
         return {"head_path": os.path.join(path, "head_model.pt"), 
                 "tail_path": os.path.join(path, "tail_model.pt")}
 
-    def generate(self, input_ids, attention_mask, max_length=128):  # Match preprocessing
+    def generate(self, input_ids, attention_mask, max_length=128):
         """Generate text for evaluation using the split model"""
         with torch.no_grad():
             try:
@@ -429,7 +423,7 @@ class LoadedSplitModelTrainer:
                         device=self.device
                     )
                     
-                    # Head forward with exact dimensions
+                    # Head forward (HeadModel handles mask expansion internally)
                     head_out = self.head_model(
                         input_ids=generated_ids,
                         attention_mask=current_attention_mask,
@@ -437,17 +431,16 @@ class LoadedSplitModelTrainer:
                     )
                     head_hidden = head_out.hidden_states[-1]
                     
-                    # Server forward with dimension validation
+                    # Server forward
                     payload = {
                         "activations": head_hidden.cpu().tolist(),
                         "attention_mask": current_attention_mask.cpu().tolist()
                     }
-                    
                     server_url = self.get_server_url()
                     resp = requests.post(f"{server_url}/forward", json=payload, timeout=120)
                     body_act = torch.tensor(resp.json()["body_activations"], device=self.device)
                     
-                    # Tail forward
+                    # Tail forward (TailModel now handles mask expansion internally)
                     tail_out = self.tail_model(
                         inputs_embeds=body_act,
                         attention_mask=current_attention_mask
@@ -465,6 +458,7 @@ class LoadedSplitModelTrainer:
             except Exception as e:
                 print(f"Generation error: {e}")
                 return "Generation failed"
+
 
 
 

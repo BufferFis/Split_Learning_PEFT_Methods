@@ -33,24 +33,6 @@ server_state = {
     "world_size": 1
 }
 
-def setup_distributed():
-    """Setup distributed training for server"""
-    if "LOCAL_RANK" in os.environ:
-        local_rank = int(os.environ["LOCAL_RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        
-        # Initialize distributed process group
-        dist.init_process_group(backend="nccl")
-        torch.cuda.set_device(local_rank)
-        
-        server_state["is_distributed"] = True
-        server_state["local_rank"] = local_rank
-        server_state["world_size"] = world_size
-        
-        print(f"Server rank {local_rank}/{world_size} initialized")
-        return local_rank, world_size
-    else:
-        return 0, 1
 
 def initialize_model():
     global body_model, device
@@ -148,23 +130,31 @@ def run_body_layers(activations, attention_mask=None):
     """Run hidden states through transformer blocks - NEVER call generation methods"""
     model = get_model()
     hidden = activations
-    
-    # SAFE: Only use forward passes, never generation
+    config = model.config
+
+    def expand_mask(mask, hidden_states):
+        if mask is not None and mask.dim() == 2:
+            batch_size, seq_len = mask.shape
+            num_heads = config.n_head
+            mask = mask.unsqueeze(1).unsqueeze(3)
+            mask = mask.expand(batch_size, num_heads, seq_len, seq_len)
+        return mask
+
     try:
         for block in model.transformer.h:
-            if attention_mask is not None:
-                # Direct forward call only
-                hidden = block(hidden, attention_mask=attention_mask)[0]
-            else:
-                hidden = block(hidden)[0]
+            # Expand mask before passing to block
+            expanded_mask = expand_mask(attention_mask, hidden)
+            hidden = block(hidden, attention_mask=expanded_mask)[0]
+            
         
         # Final layer norm
         hidden = model.transformer.ln_f(hidden)
         return hidden
     except Exception as e:
         print(f"Error in run_body_layers: {e}")
-        # Fallback: ensure we never call generation methods
-        raise e
+        # Critical: Re-raise to prevent silent failures
+        raise
+
     
 def setup_distributed():
     """Setup distributed training for server with extended timeout"""
@@ -190,7 +180,7 @@ def setup_distributed():
 
 
 
-@app.post("/forward")
+
 @app.post("/forward")
 async def forward(request: Request):
     try:
@@ -258,33 +248,7 @@ async def forward_train(request: Request):
 
 
 
-@app.post("/forward_train")
-async def forward_train(request: Request):
-    try:
-        data = await request.json()
-        client_rank_id = data.get("rank_id", 0)  # Client rank identifier
-        
-        # Create unique key combining client rank and server rank
-        rank_key = f"client_{client_rank_id}_server_{server_state['local_rank']}"
-        
-        activations = torch.tensor(data["activations"], requires_grad=True, device=device)
-        attention_mask = None
-        if "attention_mask" in data and data["attention_mask"] is not None:
-            attention_mask = torch.tensor(data["attention_mask"], device=device)
-        
-        body_model.train()
-        
-        # Forward through body blocks
-        last_hidden = run_body_layers(activations, attention_mask)
-        
-        # Store per-rank for backward
-        server_state["last_activations"][rank_key] = (activations, attention_mask, last_hidden)
-        server_state["requires_backward"][rank_key] = True
-        
-        return {"body_activations": last_hidden.detach().cpu().tolist()}
-    except Exception as e:
-        print(f"Error in forward_train: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/backward")
 async def backward(request: Request):
@@ -409,87 +373,7 @@ async def save_model(request: Request):
     except Exception as e:
         print(f"Error in save_model: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-"""
-@app.post("/load_model")
-async def load_model(request: Request):
-    try:
-        global body_model
-        
-        data = await request.json()
-        path = data.get("path")
-        
-        if not os.path.isdir(path):
-            return {"status": "error", "message": f"Path {path} not found"}
-        
-        # Synchronize before loading (if distributed)
-        if server_state["is_distributed"]:
-            dist.barrier()
-        
-        body_model_path = os.path.join(path, "body_model")
-        
-        if os.path.exists(body_model_path):
-            print(f"Loading PEFT model from {body_model_path} on rank {server_state['local_rank']}")
-            
-            # Recreate the base model structure
-            model_name = "gpt2"
-            full_model = AutoModelForCausalLM.from_pretrained(model_name)
-            _, new_body_model, _ = split_gpt2(full_model, head_layers=2, tail_layers=2)
-            
-            # Load PEFT model from checkpoint
-            loaded_peft_model = PeftModel.from_pretrained(new_body_model, body_model_path, is_trainable=True)
-            loaded_peft_model = loaded_peft_model.to(device)
-            
-            # Verify the model is properly loaded and trainable
-            trainable_params = sum(p.numel() for p in loaded_peft_model.parameters() if p.requires_grad)
-            total_params = sum(p.numel() for p in loaded_peft_model.parameters())
-            frozen_params = total_params - trainable_params
-            
-            print(f"Model verification: {trainable_params:,} trainable / {total_params:,} total parameters")
-            print(f"Frozen parameters: {frozen_params:,}")
-            
-            # Verify PEFT adapter is loaded
-            if hasattr(loaded_peft_model, 'peft_config'):
-                print(f"PEFT config loaded: {loaded_peft_model.peft_config}")
-            else:
-                print("Warning: No PEFT config found in loaded model")
-            
-            # Update global body_model with DDP
-            if server_state["is_distributed"]:
-                body_model = DDP(loaded_peft_model, device_ids=[server_state["local_rank"]])
-            else:
-                body_model = loaded_peft_model
-            
-            # Verify model is in training mode
-            body_model.train()
-            training_mode = body_model.training
-            print(f"Model training mode: {training_mode}")
-            
-            print(f"Body model updated and verified successfully on rank {server_state['local_rank']}")
 
-            
-            # Load optimizer state if exists (only on rank 0)
-            if server_state["local_rank"] == 0:
-                opt_path = os.path.join(path, "body_optimizer.pt")
-                if os.path.exists(opt_path):
-                    server_state["optimizer"] = optim.AdamW(
-                        [p for p in body_model.parameters() if p.requires_grad], lr=2e-4
-                    )
-                    server_state["optimizer"].load_state_dict(torch.load(opt_path, map_location=device))
-                    print(f"Server optimizer state loaded on rank {server_state['local_rank']}")
-            
-            # Synchronize after loading
-            if server_state["is_distributed"]:
-                dist.barrier()
-            
-            return {"status": "loaded", "path": path, "server_rank": server_state["local_rank"]}
-        else:
-            return {"status": "error", "message": f"Body model not found at {body_model_path}"}
-            
-    except Exception as e:
-        print(f"Error in load_model: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
-"""
 
 @app.post("/load_model")
 async def load_model(request: Request):
@@ -535,7 +419,7 @@ async def load_model(request: Request):
                 server_state["optimizer"] = optim.AdamW(
                     [p for p in body_model.parameters() if p.requires_grad], lr=2e-4
                 )
-                server_state["optimizer"].load_state_dict(torch.load(opt_path, map_location=device))
+                server_state["optimizer"].load_state_dict(torch.load(opt_path, map_location=device), strict=False)
                 print(f"Server optimizer state loaded on rank {server_state['local_rank']}")
             
             # NO BARRIERS - Each process completes independently

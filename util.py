@@ -49,7 +49,17 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
                 if 'generation' in name or 'prepare_inputs' in name:
                     return lambda *args, **kwargs: None
                 raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
-            
+
+        def _expand_attention_mask(self, attention_mask, hidden_states):
+            # Only expand if not already 4D
+            if attention_mask is not None and attention_mask.dim() == 2:
+                batch_size, seq_len = attention_mask.shape
+                num_heads = self.config.n_head
+                attention_mask = attention_mask.unsqueeze(1).unsqueeze(3)  # [batch, 1, seq_len, 1]
+                attention_mask = attention_mask.expand(batch_size, num_heads, seq_len, seq_len)  # [batch, num_heads, seq_len, seq_len]
+            return attention_mask
+
+
         def forward(self, input_ids=None, attention_mask=None, output_hidden_states=False, **kwargs):
             # Token + position embeddings
             inputs_embeds = self.wte(input_ids)
@@ -59,7 +69,8 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             
             hidden_states = inputs_embeds + position_embeds
             hidden_states = self.drop(hidden_states)
-            
+            attention_mask = self._expand_attention_mask(attention_mask, hidden_states)
+
              # Ensure consistent dtype
             if attention_mask is not None and attention_mask.dtype != hidden_states.dtype:
                 attention_mask = attention_mask.to(hidden_states.dtype)
@@ -67,10 +78,8 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             all_hidden_states = ()
             # Process through head layers
             for block in self.h:
-                if attention_mask is not None:
-                    hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
-                else:
-                    hidden_states = block(hidden_states)[0]
+                expanded_mask = self._expand_attention_mask(attention_mask, hidden_states)
+                hidden_states = block(hidden_states, attention_mask=expanded_mask)[0]
                 all_hidden_states = all_hidden_states + (hidden_states,)
             
             if output_hidden_states:
@@ -118,7 +127,18 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
                 if 'generation' in name or 'prepare_inputs' in name:
                     return lambda *args, **kwargs: None
                 raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
-            
+
+        def _expand_attention_mask(self, attention_mask, hidden_states):
+            # Same as HeadModel's version
+            if attention_mask is not None and attention_mask.dim() == 2:
+                batch_size, seq_len = attention_mask.shape
+                num_heads = self.config.n_head
+                attention_mask = attention_mask.unsqueeze(1).unsqueeze(3)
+                attention_mask = attention_mask.expand(batch_size, num_heads, seq_len, seq_len)
+            return attention_mask
+
+
+
         def forward(self, hidden_states=None, attention_mask=None, **kwargs):
             # Handle both direct hidden_states and input_ids (for PEFT compatibility)
             if hidden_states is None and 'input_ids' in kwargs:
@@ -127,8 +147,9 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
                 
             # Process through body layers
             for block in self.transformer.h:
-                if attention_mask is not None:
-                    hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
+                expanded_mask = self._expand_attention_mask(attention_mask, hidden_states)
+                if expanded_mask is not None:
+                    hidden_states = block(hidden_states, attention_mask=expanded_mask)[0]
                 else:
                     hidden_states = block(hidden_states)[0]
             
@@ -173,13 +194,18 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             
         def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
             hidden_states = inputs_embeds
+            def _expand_attention_mask(self, attention_mask, hidden_states):
+                if attention_mask is not None and attention_mask.dim() == 2:
+                    batch_size, seq_len = attention_mask.shape
+                    num_heads = self.config.n_head
+                    attention_mask = attention_mask.unsqueeze(1).unsqueeze(3)
+                    attention_mask = attention_mask.expand(batch_size, num_heads, seq_len, seq_len)
+                return attention_mask
             
             # Process through tail layers
             for block in self.transformer.h:
-                if attention_mask is not None:
-                    hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
-                else:
-                    hidden_states = block(hidden_states)[0]
+                expanded_mask = self._expand_attention_mask(attention_mask, hidden_states)
+                hidden_states = block(hidden_states, attention_mask=expanded_mask)[0]
             
             # Generate logits
             logits = self.lm_head(hidden_states)
