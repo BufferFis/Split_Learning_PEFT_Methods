@@ -212,36 +212,40 @@ class LoadedSplitModelTrainer:
 
     def create_dataloader(self, ds, batch_size, shuffle=True, sampler=None):
         def collate_fn(batch):
-            # Use FIXED length instead of dynamic max_len
-            FIXED_LENGTH = 128  # Consistent with preprocessing
-            
+            FIXED_LENGTH = 128
             input_ids_batch = []
             attention_mask_batch = []
             labels_batch = []
-            
             for b in batch:
-                # Ensure all sequences are exactly FIXED_LENGTH
-                input_ids = b["input_ids"][:FIXED_LENGTH]  # Truncate if longer
+                input_ids = b["input_ids"][:FIXED_LENGTH]
                 attention_mask = b["attention_mask"][:FIXED_LENGTH]
                 labels = b["labels"][:FIXED_LENGTH]
-                
                 # Pad if shorter
                 if len(input_ids) < FIXED_LENGTH:
                     pad_length = FIXED_LENGTH - len(input_ids)
                     input_ids.extend([self.tokenizer.pad_token_id] * pad_length)
                     attention_mask.extend([0] * pad_length)
                     labels.extend([-100] * pad_length)
-                
                 input_ids_batch.append(input_ids)
                 attention_mask_batch.append(attention_mask)
                 labels_batch.append(labels)
-            
             return {
                 "input_ids": torch.tensor(input_ids_batch, dtype=torch.long),
                 "attention_mask": torch.tensor(attention_mask_batch, dtype=torch.float32),
                 "labels": torch.tensor(labels_batch, dtype=torch.long),
                 "human_reference": [b["human_reference"] for b in batch]
             }
+        return DataLoader(
+            ds,
+            batch_size=batch_size,
+            sampler=sampler,
+            shuffle=(shuffle if sampler is None else False),
+            collate_fn=collate_fn,
+            num_workers=2,
+            pin_memory=True,
+            drop_last=True  # Ensures all batches are [batch_size, 128]
+        )
+
 
         
         return DataLoader(
@@ -277,6 +281,13 @@ class LoadedSplitModelTrainer:
                     attn_mask = batch["attention_mask"].to(self.device).float()
                     labels = batch["labels"].to(self.device)
                     
+                    # ADD THESE ASSERTIONS HERE - Before any forward passes
+                    assert input_ids.shape[1] == 128, f"input_ids shape {input_ids.shape}"
+                    assert attn_mask.shape[1] == 128, f"attn_mask shape {attn_mask.shape}"
+                    assert labels.shape[1] == 128, f"labels shape {labels.shape}"
+                    assert input_ids.shape[0] == attn_mask.shape[0] == labels.shape[0], f"Batch size mismatch: input_ids {input_ids.shape[0]}, attn_mask {attn_mask.shape[0]}, labels {labels.shape[0]}"
+
+
                     # Zero optimizers
                     self.head_optimizer.zero_grad()
                     self.tail_optimizer.zero_grad()
@@ -611,7 +622,8 @@ def main():
 
     # Initialize models with same configuration as training
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     full_model = AutoModelForCausalLM.from_pretrained("gpt2")
     head_m, _, tail_m = split_gpt2(full_model, head_layers=2, tail_layers=2)
