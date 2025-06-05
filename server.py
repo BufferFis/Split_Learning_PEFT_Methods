@@ -33,6 +33,28 @@ server_state = {
     "world_size": 1
 }
 
+def setup_distributed():
+    """Setup distributed training for server with extended timeout"""
+    if "LOCAL_RANK" in os.environ:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        
+        # Initialize distributed process group with extended timeout
+        dist.init_process_group(
+            backend="nccl",
+            timeout=timedelta(hours=2)  # 2 hour timeout for heavy operations
+        )
+        torch.cuda.set_device(local_rank)
+        
+        server_state["is_distributed"] = True
+        server_state["local_rank"] = local_rank
+        server_state["world_size"] = world_size
+        
+        print(f"Server rank {local_rank}/{world_size} initialized with extended timeout")
+        return local_rank, world_size
+    else:
+        return 0, 1
+
 
 def initialize_model():
     global body_model, device
@@ -156,27 +178,7 @@ def run_body_layers(activations, attention_mask=None):
         raise
 
     
-def setup_distributed():
-    """Setup distributed training for server with extended timeout"""
-    if "LOCAL_RANK" in os.environ:
-        local_rank = int(os.environ["LOCAL_RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        
-        # Initialize distributed process group with extended timeout
-        dist.init_process_group(
-            backend="nccl",
-            timeout=timedelta(hours=2)  # 2 hour timeout for heavy operations
-        )
-        torch.cuda.set_device(local_rank)
-        
-        server_state["is_distributed"] = True
-        server_state["local_rank"] = local_rank
-        server_state["world_size"] = world_size
-        
-        print(f"Server rank {local_rank}/{world_size} initialized with extended timeout")
-        return local_rank, world_size
-    else:
-        return 0, 1
+
 
 
 
