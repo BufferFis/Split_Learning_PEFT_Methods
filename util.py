@@ -192,15 +192,17 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
                     return lambda *args, **kwargs: None
                 raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
             
-        def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
-            hidden_states = inputs_embeds
-            def _expand_attention_mask(self, attention_mask, hidden_states):
+        def _expand_attention_mask(self, attention_mask, hidden_states):
                 if attention_mask is not None and attention_mask.dim() == 2:
                     batch_size, seq_len = attention_mask.shape
                     num_heads = self.config.n_head
                     attention_mask = attention_mask.unsqueeze(1).unsqueeze(3)
                     attention_mask = attention_mask.expand(batch_size, num_heads, seq_len, seq_len)
                 return attention_mask
+        
+        def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
+            hidden_states = inputs_embeds
+            
             
             # Process through tail layers
             for block in self.transformer.h:
