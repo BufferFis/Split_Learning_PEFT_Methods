@@ -12,7 +12,7 @@ echo "Starting distributed training on 2 H100 GPUs..."
 # Use torchrun for proper distributed launch
 torchrun --standalone --nproc_per_node=2 client.py \
     --batch_size 64 \
-    --epochs 3 \
+    --epochs 1 \
     --server_url http://127.0.0.1:8000
 
 echo "Training completed!"
