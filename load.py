@@ -1,3 +1,4 @@
+#load.py
 import os
 import torch
 import requests
@@ -43,17 +44,17 @@ def wait_for_server(server_url, max_retries=30, delay=2):
             try:
                 response = requests.get(f"{url}/health", timeout=120)
                 if response.status_code == 200:
-                    print(f"Server is ready at {url}")
+                    print(f"Server is ready at {url}", flush=True)
                     break
             except requests.exceptions.RequestException:
                 if i == max_retries - 1:
-                    print(f"Server at {url} not ready after {max_retries} attempts")
+                    print(f"Server at {url} not ready after {max_retries} attempts", flush=True)
                 continue
         else:
             continue
         break
     else:
-        print("No servers ready")
+        print("No servers ready", flush=True)
         return False
     return True
 
@@ -65,13 +66,13 @@ def robust_server_request(url, json_data, max_retries=3, timeout=300):
             return response
         except requests.exceptions.Timeout as e:
             if attempt == max_retries - 1:
-                print(f"Server request failed after {max_retries} attempts: {e}")
+                print(f"Server request failed after {max_retries} attempts: {e}", flush=True)
                 raise e
             else:
-                print(f"Request timeout (attempt {attempt + 1}/{max_retries}), retrying...")
+                print(f"Request timeout (attempt {attempt + 1}/{max_retries}), retrying...", flush=True)
                 time.sleep(2)  # Wait before retry
         except Exception as e:
-            print(f"Server request error: {e}")
+            print(f"Server request error: {e}", flush=True)
             raise e
 
 
@@ -99,42 +100,41 @@ class LoadedSplitModelTrainer:
 
     def load_models_and_optimizers(self, model_path):
         """Load both models and optimizers for true incremental training"""
-        
+        print("[load_models_and_optimizers] Loading server model...", flush=True)
         # Load server model first
-        print("Loading server model...")
         max_retries = 2  # Reduce retries since NCCL issues are immediate
         
         for attempt in range(max_retries):
             try:
-                print(f"Server load attempt {attempt + 1}/{max_retries}...")
+                print(f"Server load attempt {attempt + 1}/{max_retries}...", flush=True)
                 server_response = requests.post(
                     f"{self.server_url}/load_model", 
                     json={"path": model_path}, 
                     timeout=300  # Reduce timeout since no barriers
                 )
                 server_data = server_response.json()
-                print("Server model loaded:", server_data)
+                print("Server model loaded:", server_data, flush=True)
                 
                 # Accept success even if one rank had issues
                 if server_data.get("status") in ["loaded", "error"]:
                     if server_data.get("status") == "error":
-                        print(f"Warning: Server rank {server_data.get('server_rank', 'unknown')} had issues but continuing...")
+                        print(f"Warning: Server rank {server_data.get('server_rank', 'unknown')} had issues but continuing...", flush=True)
                     break
                 else:
-                    print("Server returned unexpected status")
+                    print("Server returned unexpected status", flush=True)
                     if attempt == max_retries - 1:
-                        print("Proceeding anyway - server may still work for training")
+                        print("Proceeding anyway - server may still work for training", flush=True)
                         break
                         
             except requests.exceptions.Timeout as e:
-                print(f"Timeout on attempt {attempt + 1}: {e}")
+                print(f"Timeout on attempt {attempt + 1}: {e}", flush=True)
                 if attempt == max_retries - 1:
                     print("Server loading timed out - this may indicate NCCL issues")
                     return False
-                print("Retrying in 10 seconds...")
+                print("Retrying in 10 seconds...", flush=True)
                 time.sleep(10)
             except Exception as e:
-                print(f"Failed to load server model: {e}")
+                print(f"Failed to load server model: {e}", flush=True)
                 if attempt == max_retries - 1:
                     return False
         
@@ -143,7 +143,7 @@ class LoadedSplitModelTrainer:
         tail_path = os.path.join(model_path, "tail_model.pt")
         
         if os.path.exists(head_path) and os.path.exists(tail_path):
-            print("Loading client model weights...")
+            print("Loading client model weights...", flush=True)
             
             # Get actual models (unwrap DDP if needed)
             head_model_to_load = self.head_model.module if hasattr(self.head_model, "module") else self.head_model
@@ -151,9 +151,9 @@ class LoadedSplitModelTrainer:
             
             head_model_to_load.load_state_dict(torch.load(head_path, map_location=self.device))
             tail_model_to_load.load_state_dict(torch.load(tail_path, map_location=self.device))
-            print("Client model weights loaded successfully")
+            print("Client model weights loaded successfully", flush=True)
         else:
-            print(f"Warning: Client model weights not found at {model_path}")
+            print(f"Warning: Client model weights not found at {model_path}", flush=True)
             return False
         
         # Load optimizer states
@@ -161,16 +161,16 @@ class LoadedSplitModelTrainer:
         tail_opt_path = os.path.join(model_path, "tail_optimizer.pt")
         
         if os.path.exists(head_opt_path) and os.path.exists(tail_opt_path):
-            print("Loading optimizer states...")
+            print("Loading optimizer states...", flush=True)
             try:
                 self.head_optimizer.load_state_dict(torch.load(head_opt_path, map_location=self.device))
                 self.tail_optimizer.load_state_dict(torch.load(tail_opt_path, map_location=self.device))
-                print("Optimizer states loaded successfully")
+                print("Optimizer states loaded successfully", flush=True)
             except Exception as e:
-                print(f"Warning: Failed to load optimizer states: {e}")
+                print(f"Warning: Failed to load optimizer states: {e}", flush=True)
                 return False
         else:
-            print("Warning: Optimizer states not found")
+            print("Warning: Optimizer states not found", flush=True)
             return False
         
         # Initialize server training state
@@ -180,9 +180,9 @@ class LoadedSplitModelTrainer:
                 json={"learning_rate": 2e-4},
                 timeout=100
             )
-            print("Server training initialized:", init_response.json())
+            print("Server training initialized:", init_response.json(), flush=True)
         except Exception as e:
-            print(f"Warning: Failed to initialize server training: {e}")
+            print(f"Warning: Failed to initialize server training: {e}", flush=True)
             return False
         
         return True
@@ -345,15 +345,15 @@ class LoadedSplitModelTrainer:
                     total_loss += loss.item()
                     
                 except requests.exceptions.RequestException as e:
-                    print(f"Rank {self.local_rank}: Server communication error: {e}")
+                    print(f"Rank {self.local_rank}: Server communication error: {e}", flush=True)
                     continue
                 except Exception as e:
-                    print(f"Rank {self.local_rank}: Training error: {e}")
+                    print(f"Rank {self.local_rank}: Training error: {e}", flush=True)
                     continue
             
             avg = total_loss / len(dataloader) if len(dataloader) > 0 else 0.0
             if self.local_rank == 0:
-                print(f"Epoch {epoch+1} avg loss: {avg:.4f}")
+                print(f"Epoch {epoch+1} avg loss: {avg:.4f}", flush=True)
             
             # End epoch (only rank 0)
             if self.local_rank == 0:
@@ -361,23 +361,23 @@ class LoadedSplitModelTrainer:
                 try:
                     requests.post(f"{self.server_url}/end_epoch", json={"is_final": is_final}, timeout=100)
                 except requests.exceptions.RequestException as e:
-                    print(f"Failed to signal end of epoch: {e}")
+                    print(f"Failed to signal end of epoch: {e}", flush=True)
         
         # Save models (only rank 0)
         if self.local_rank == 0:
             try:
                 requests.post(f"{self.server_url}/save_model", json={"path": "./server_model"}, timeout=300)
                 client_save_info = self.save_models("./server_model")
-                print("Client models saved:", client_save_info)
+                print("Client models saved:", client_save_info, flush=True)
                 
                 # EVALUATE USING BUILT-IN HF METRICS
-                print("Starting evaluation with Hugging Face metrics...")
+                print("Starting evaluation with Hugging Face metrics...", flush=True)
                 eval_results = self.evaluate(test_ds)
                 if eval_results:
-                    print(f"Final BLEU: {eval_results['bleu']:.4f}, METEOR: {eval_results['meteor']:.4f}")
+                    print(f"Final BLEU: {eval_results['bleu']:.4f}, METEOR: {eval_results['meteor']:.4f}", flush=True)
                 
             except requests.exceptions.RequestException as e:
-                print(f"Failed to save models: {e}")
+                print(f"Failed to save models: {e}", flush=True)
 
     def save_models(self, path="./server_model"):
         """Save head and tail models"""
@@ -456,7 +456,7 @@ class LoadedSplitModelTrainer:
                 
                 return self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
             except Exception as e:
-                print(f"Generation error: {e}")
+                print(f"Generation error: {e}", flush=True)
                 return "Generation failed"
 
 
@@ -478,7 +478,7 @@ class LoadedSplitModelTrainer:
             
             preds, refs = [], []
             
-            print("Starting evaluation on E2E NLG dataset using HF metrics...")
+            print("Starting evaluation on E2E NLG dataset using HF metrics...", flush=True)
             
             # FIXED: Proper dataset sampling
             if hasattr(test_ds, 'select'):
@@ -498,16 +498,16 @@ class LoadedSplitModelTrainer:
                 try:
                     # DEFENSIVE: Check if sample is a dictionary
                     if isinstance(sample, str):
-                        print(f"Warning: Sample {i} is a string, skipping")
+                        print(f"Warning: Sample {i} is a string, skipping", flush=True)
                         continue
                         
                     if not isinstance(sample, dict):
-                        print(f"Warning: Sample {i} is not a dict, type: {type(sample)}")
+                        print(f"Warning: Sample {i} is not a dict, type: {type(sample)}", flush=True)
                         continue
                     
                     # SAFE: Check if required keys exist
                     if "input_ids" not in sample or "human_reference" not in sample:
-                        print(f"Warning: Sample {i} missing required keys")
+                        print(f"Warning: Sample {i} missing required keys", flush=True)
                         continue
                     
                     # Convert to tensors safely
@@ -529,7 +529,7 @@ class LoadedSplitModelTrainer:
                     continue
             
             if not preds:
-                print("No valid predictions generated")
+                print("No valid predictions generated", flush=True)
                 return {"bleu": 0.0, "meteor": 0.0, "error": "No valid samples"}
             
             print(f"Generated {len(preds)} predictions, computing metrics...", flush=True)
@@ -554,7 +554,7 @@ class LoadedSplitModelTrainer:
                 }
                 
             except Exception as eval_error:
-                print(f"Evaluation metric error: {eval_error}")
+                print(f"Evaluation metric error: {eval_error}", flush=True)
                 results = {
                     "bleu": 0.0,
                     "meteor": 0.0,
@@ -564,12 +564,12 @@ class LoadedSplitModelTrainer:
             # Save results
             with open("./server_model/evaluation_results.json", "w") as f:
                 json.dump(results, f, indent=2)
-            print("Evaluation results saved to ./server_model/evaluation_results.json")
+            print("Evaluation results saved to ./server_model/evaluation_results.json", flush=True)
             sys.stdout.flush()
             return results
             
         except Exception as e:
-            print(f"Evaluation error: {e}")
+            print(f"Evaluation error: {e}", flush=True)
             sys.stdout.flush()
             return None
 
@@ -600,7 +600,7 @@ def main():
     # Wait for server (only rank 0)
     if local_rank == 0:
         if not wait_for_server(args.server_url):
-            print("Server is not available. Please start the server first.")
+            print("Server is not available. Please start the server first.", flush=True)
             return
 
     # Synchronize all processes
@@ -609,7 +609,7 @@ def main():
 
     # Check if model path exists
     if not os.path.exists(args.model_path):
-        print(f"Model path {args.model_path} does not exist!")
+        print(f"Model path {args.model_path} does not exist!", flush=True)
         return
 
     device = torch.device(f"cuda:{local_rank}")
@@ -635,12 +635,13 @@ def main():
         head_m = DDP(head_m, device_ids=[local_rank])
         tail_m = DDP(tail_m, device_ids=[local_rank])
 
+    print(f"[RANK {local_rank}] Creating LoadedSplitModelTrainer...", flush=True)
     # Create loaded trainer
     trainer = LoadedSplitModelTrainer(head_m, tail_m, tokenizer, args.server_url, local_rank, world_size)
 
     # Load models and optimizers
     if trainer.load_models_and_optimizers(args.model_path):
-        print("All models and optimizers loaded successfully!")
+        print("All models and optimizers loaded successfully!", flush=True)
         
         # Add this before the evaluation section in load.py
         if args.eval_only and local_rank == 0:
@@ -732,28 +733,31 @@ def main():
 
             
         # Continue training if requested (existing logic)
-        elif args.continue_training:
-            print(f"Continuing training for {args.epochs} epochs...")
+        if args.continue_training:
+            print(f"[RANK {local_rank}] Models and optimizers loaded!", flush=True)
+            print(f"Continuing training for {args.epochs} epochs...", flush=True)
             # Load dataset and create dataloader
             train_ds, test_ds = trainer.load_e2e_dataset()
 
             if is_distributed:
+                print("Distributed is true, initiating", flush=True)
                 train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=local_rank)
                 train_dl = trainer.create_dataloader(
                     train_ds, batch_size=args.batch_size, shuffle=False, sampler=train_sampler
                 )
             else:
+                print("No distributed", flush=True)
                 train_dl = trainer.create_dataloader(
                     train_ds, batch_size=args.batch_size, shuffle=True
                 )
 
             # Continue training
             trainer.train(train_dl, epochs=args.epochs, test_ds=test_ds)
-            print("Incremental training completed!")
+            print("Incremental training completed!", flush=True)
         else:
-            print("Models loaded successfully. Use --continue_training to resume training or --eval_only for evaluation.")
+            print("Models loaded successfully. Use --continue_training to resume training or --eval_only for evaluation.", flush=True)
     else:
-        print("Failed to load models properly!")
+        print("Failed to load models properly!", flush=True)
 
     cleanup_ddp(is_distributed)
 
