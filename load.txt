@@ -100,7 +100,8 @@ class LoadedSplitModelTrainer:
 
     def load_models_and_optimizers(self, model_path):
         """Load both models and optimizers for true incremental training"""
-        print("[load_models_and_optimizers] Loading server model...", flush=True)
+        print(f"[RANK {self.local_rank}] Starting load_models_and_optimizers from {model_path}", flush=True)
+        
         # Load server model first
         max_retries = 2  # Reduce retries since NCCL issues are immediate
         
@@ -141,9 +142,11 @@ class LoadedSplitModelTrainer:
         # Load client model weights
         head_path = os.path.join(model_path, "head_model.pt")
         tail_path = os.path.join(model_path, "tail_model.pt")
+        print(f"[RANK {self.local_rank}] Checking for client models: {head_path}, {tail_path}", flush=True)
         
         if os.path.exists(head_path) and os.path.exists(tail_path):
             print("Loading client model weights...", flush=True)
+            print(f"[RANK {self.local_rank}] Client model files found, loading...", flush=True)
             
             # Get actual models (unwrap DDP if needed)
             head_model_to_load = self.head_model.module if hasattr(self.head_model, "module") else self.head_model
@@ -153,15 +156,18 @@ class LoadedSplitModelTrainer:
             tail_model_to_load.load_state_dict(torch.load(tail_path, map_location=self.device))
             print("Client model weights loaded successfully", flush=True)
         else:
-            print(f"Warning: Client model weights not found at {model_path}", flush=True)
+            print(f"[RANK {self.local_rank}] ERROR: Client model weights not found!", flush=True)
+            print(f"[RANK {self.local_rank}] head_path exists: {os.path.exists(head_path)}", flush=True)
+            print(f"[RANK {self.local_rank}] tail_path exists: {os.path.exists(tail_path)}", flush=True)
             return False
         
         # Load optimizer states
         head_opt_path = os.path.join(model_path, "head_optimizer.pt")
         tail_opt_path = os.path.join(model_path, "tail_optimizer.pt")
+        print(f"[RANK {self.local_rank}] Checking for optimizer files: {head_opt_path}, {tail_opt_path}", flush=True)
         
         if os.path.exists(head_opt_path) and os.path.exists(tail_opt_path):
-            print("Loading optimizer states...", flush=True)
+            print(f"[RANK {self.local_rank}] Optimizer files found, loading...", flush=True)
             try:
                 self.head_optimizer.load_state_dict(torch.load(head_opt_path, map_location=self.device))
                 self.tail_optimizer.load_state_dict(torch.load(tail_opt_path, map_location=self.device))
@@ -170,7 +176,7 @@ class LoadedSplitModelTrainer:
                 print(f"Warning: Failed to load optimizer states: {e}", flush=True)
                 return False
         else:
-            print("Warning: Optimizer states not found", flush=True)
+            print(f"[RANK {self.local_rank}] ERROR: Optimizer files not found!", flush=True)
             return False
         
         # Initialize server training state
@@ -576,11 +582,52 @@ class LoadedSplitModelTrainer:
     
     def get_server_url(self):
         """Load balance between server processes"""
+        # Always try port 8000 first for load operations
+        base_url = "http://127.0.0.1:8000"
+        
+        # Test if server is reachable
+        try:
+            import requests
+            resp = requests.get(f"{base_url}/health", timeout=5)
+            if resp.status_code == 200:
+                return base_url
+        except:
+            pass
+        
+        # Fallback to original logic
         if self.world_size > 1:
-            # Alternate between servers based on client rank
             server_port = 8000 + (self.local_rank % 2)
             return f"http://127.0.0.1:{server_port}"
         return self.server_url
+
+
+def check_required_files(model_path, local_rank):
+    """Check if all required model files exist"""
+    required_files = [
+        "head_model.pt",
+        "tail_model.pt", 
+        "head_optimizer.pt",
+        "tail_optimizer.pt",
+        "body_model",  # directory
+        "body_optimizer.pt"
+    ]
+    
+    print(f"[RANK {local_rank}] Checking required files in {model_path}:", flush=True)
+    missing_files = []
+    
+    for file in required_files:
+        path = os.path.join(model_path, file)
+        exists = os.path.exists(path)
+        print(f"[RANK {local_rank}] {file}: {'✓' if exists else '✗'}", flush=True)
+        if not exists:
+            missing_files.append(file)
+    
+    if missing_files:
+        print(f"[RANK {local_rank}] MISSING FILES: {missing_files}", flush=True)
+        return False
+    
+    print(f"[RANK {local_rank}] All required files found!", flush=True)
+    return True
 
 
 
@@ -638,6 +685,11 @@ def main():
     print(f"[RANK {local_rank}] Creating LoadedSplitModelTrainer...", flush=True)
     # Create loaded trainer
     trainer = LoadedSplitModelTrainer(head_m, tail_m, tokenizer, args.server_url, local_rank, world_size)
+
+    """if not check_required_files(args.model_path, local_rank):
+        print(f"[RANK {local_rank}] Cannot proceed - missing required files", flush=True)
+        cleanup_ddp(is_distributed)
+        return
 
     # Load models and optimizers
     if trainer.load_models_and_optimizers(args.model_path):
@@ -758,6 +810,43 @@ def main():
             print("Models loaded successfully. Use --continue_training to resume training or --eval_only for evaluation.", flush=True)
     else:
         print("Failed to load models properly!", flush=True)
+
+    cleanup_ddp(is_distributed)"""
+    print(f"[RANK {local_rank}] Attempting to load models and optimizers...", flush=True)
+    load_success = trainer.load_models_and_optimizers(args.model_path)
+    print(f"[RANK {local_rank}] Load result: {load_success}", flush=True)
+    
+    if load_success:
+        print(f"[RANK {local_rank}] All models and optimizers loaded successfully!", flush=True)
+        
+        if args.continue_training:
+            print(f"[RANK {local_rank}] ENTERING TRAINING MODE for {args.epochs} epochs...", flush=True)
+            
+            # Load dataset and create dataloader
+            print(f"[RANK {local_rank}] Loading E2E dataset...", flush=True)
+            train_ds, test_ds = trainer.load_e2e_dataset()
+            print(f"[RANK {local_rank}] Dataset loaded: train={len(train_ds)}, test={len(test_ds)}", flush=True)
+
+            if is_distributed:
+                print(f"[RANK {local_rank}] Creating distributed dataloader...", flush=True)
+                train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=local_rank)
+                train_dl = trainer.create_dataloader(
+                    train_ds, batch_size=args.batch_size, shuffle=False, sampler=train_sampler
+                )
+            else:
+                print(f"[RANK {local_rank}] Creating single-process dataloader...", flush=True)
+                train_dl = trainer.create_dataloader(
+                    train_ds, batch_size=args.batch_size, shuffle=True
+                )
+
+            print(f"[RANK {local_rank}] Starting training...", flush=True)
+            trainer.train(train_dl, epochs=args.epochs, test_ds=test_ds)
+            print(f"[RANK {local_rank}] Training completed!", flush=True)
+        else:
+            print(f"[RANK {local_rank}] No --continue_training flag, skipping training", flush=True)
+    else:
+        print(f"[RANK {local_rank}] FAILED TO LOAD MODELS - training cannot proceed!", flush=True)
+        print(f"[RANK {local_rank}] Check if all required files exist in {args.model_path}", flush=True)
 
     cleanup_ddp(is_distributed)
 

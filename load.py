@@ -686,136 +686,23 @@ def main():
     # Create loaded trainer
     trainer = LoadedSplitModelTrainer(head_m, tail_m, tokenizer, args.server_url, local_rank, world_size)
 
-    """if not check_required_files(args.model_path, local_rank):
-        print(f"[RANK {local_rank}] Cannot proceed - missing required files", flush=True)
-        cleanup_ddp(is_distributed)
-        return
-
-    # Load models and optimizers
-    if trainer.load_models_and_optimizers(args.model_path):
-        print("All models and optimizers loaded successfully!", flush=True)
-        
-        # Add this before the evaluation section in load.py
-        if args.eval_only and local_rank == 0:
-            print("Checking server connectivity...", flush=True)
-            try:
-                health_response = requests.get(f"{args.server_url}/health", timeout=10)
-                if health_response.status_code == 200:
-                    print(f"✅ Server is healthy: {health_response.json()}", flush=True)
-                else:
-                    print(f"⚠️ Server health check failed: {health_response.status_code}", flush=True)
-            except Exception as health_error:
-                print(f"❌ Server health check error: {health_error}", flush=True)
-                print("Make sure ./server_launch.sh is running!", flush=True)
-            sys.stdout.flush()
-
-        # ADD THIS: Handle eval_only mode
-        if args.eval_only:
-            print("=== EVAL ONLY MODE STARTED ===", flush=True)
-            print(f"Local rank: {local_rank}, World size: {world_size}", flush=True)
-            sys.stdout.flush()
-            
-            # Load dataset for evaluation
-            print("Loading E2E dataset...", flush=True)
-            try:
-                train_ds, test_ds = trainer.load_e2e_dataset()
-                print(f"Dataset loaded: train={len(train_ds)}, test={len(test_ds)}", flush=True)
-            except Exception as dataset_error:
-                print(f"Dataset loading failed: {dataset_error}", flush=True)
-                sys.stdout.flush()
-                return
-            
-            # CRITICAL: Only rank 0 should evaluate, others should wait
-            if local_rank == 0:
-                print("=== RANK 0: Starting evaluation ===", flush=True)
-                sys.stdout.flush()
-                
-                try:
-                    print("Calling trainer.evaluate()...", flush=True)
-                    sys.stdout.flush()
-                    
-                    eval_results = trainer.evaluate(test_ds)
-                    
-                    print(f"Evaluation returned: {eval_results}", flush=True)
-                    sys.stdout.flush()
-                    
-                    if eval_results and isinstance(eval_results, dict):
-                        bleu_score = eval_results.get('bleu', 0.0)
-                        meteor_score = eval_results.get('meteor', 0.0)
-                        
-                        print("=" * 50, flush=True)
-                        print("        EVALUATION RESULTS", flush=True)
-                        print("=" * 50, flush=True)
-                        print(f"BLEU Score:   {bleu_score:.4f}", flush=True)
-                        print(f"METEOR Score: {meteor_score:.4f}", flush=True)
-                        print("=" * 50, flush=True)
-                        sys.stdout.flush()
-                        
-                        # Also save to file for verification
-                        result_file = "./server_model/eval_only_results.json"
-                        with open(result_file, "w") as f:
-                            json.dump(eval_results, f, indent=2)
-                        print(f"Results saved to: {result_file}", flush=True)
-                        
-                    else:
-                        print("ERROR: Evaluation failed - no results returned", flush=True)
-                        print(f"eval_results type: {type(eval_results)}", flush=True)
-                        print(f"eval_results content: {eval_results}", flush=True)
-                        sys.stdout.flush()
-                        
-                except Exception as eval_error:
-                    print(f"EVALUATION ERROR: {eval_error}", flush=True)
-                    import traceback
-                    traceback.print_exc()
-                    sys.stdout.flush()
-            else:
-                print(f"=== RANK {local_rank}: Waiting for rank 0 evaluation ===", flush=True)
-                sys.stdout.flush()
-            
-            # Synchronize all ranks before finishing
-            if is_distributed:
-                print(f"Rank {local_rank}: Waiting at barrier...", flush=True)
-                sys.stdout.flush()
-                dist.barrier()
-                print(f"Rank {local_rank}: Barrier completed", flush=True)
-                sys.stdout.flush()
-            
-            print("=== EVAL ONLY MODE COMPLETED ===", flush=True)
-            sys.stdout.flush()
-
-            
-        # Continue training if requested (existing logic)
-        if args.continue_training:
-            print(f"[RANK {local_rank}] Models and optimizers loaded!", flush=True)
-            print(f"Continuing training for {args.epochs} epochs...", flush=True)
-            # Load dataset and create dataloader
-            train_ds, test_ds = trainer.load_e2e_dataset()
-
-            if is_distributed:
-                print("Distributed is true, initiating", flush=True)
-                train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=local_rank)
-                train_dl = trainer.create_dataloader(
-                    train_ds, batch_size=args.batch_size, shuffle=False, sampler=train_sampler
-                )
-            else:
-                print("No distributed", flush=True)
-                train_dl = trainer.create_dataloader(
-                    train_ds, batch_size=args.batch_size, shuffle=True
-                )
-
-            # Continue training
-            trainer.train(train_dl, epochs=args.epochs, test_ds=test_ds)
-            print("Incremental training completed!", flush=True)
-        else:
-            print("Models loaded successfully. Use --continue_training to resume training or --eval_only for evaluation.", flush=True)
-    else:
-        print("Failed to load models properly!", flush=True)
-
-    cleanup_ddp(is_distributed)"""
+    
+    
+    
     print(f"[RANK {local_rank}] Attempting to load models and optimizers...", flush=True)
     load_success = trainer.load_models_and_optimizers(args.model_path)
     print(f"[RANK {local_rank}] Load result: {load_success}", flush=True)
     
+    if not check_required_files(args.model_path, local_rank):
+        print(f"[RANK {local_rank}] Cannot proceed - missing required files", flush=True)
+        cleanup_ddp(is_distributed)
+        return
+
+    print(f"[RANK {local_rank}] Attempting to load models and optimizers...", flush=True)
+    load_success = trainer.load_models_and_optimizers(args.model_path)
+    print(f"[RANK {local_rank}] Load result: {load_success}", flush=True)
+
+
     if load_success:
         print(f"[RANK {local_rank}] All models and optimizers loaded successfully!", flush=True)
         

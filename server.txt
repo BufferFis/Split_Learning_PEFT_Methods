@@ -389,22 +389,22 @@ async def load_model(request: Request):
         data = await request.json()
         path = data.get("path")
         
+        print(f"[SERVER RANK {server_state['local_rank']}] Loading model from {path}", flush=True)
+        
         if not os.path.isdir(path):
-            return {"status": "error", "message": f"Path {path} not found"}
+            return {"status": "error", "message": f"Path {path} not found", "server_rank": server_state['local_rank']}
         
         body_model_path = os.path.join(path, "body_model")
         if os.path.exists(body_model_path):
-            print(f"Loading PEFT model from {body_model_path} on rank {server_state['local_rank']}")
+            print(f"[SERVER RANK {server_state['local_rank']}] Found body model at {body_model_path}", flush=True)
             
-            # CRITICAL: Load independently without ANY synchronization barriers
-            # This prevents NCCL communicator abort issues
-            
-            # Step 1: Create base model
+            # Create base model
             model_name = "gpt2"
             full_model = AutoModelForCausalLM.from_pretrained(model_name)
             _, new_body_model, _ = split_gpt2(full_model, head_layers=2, tail_layers=2)
             
-            # Step 2: Load PEFT model (heavy operation - no barriers!)
+            print(f"[SERVER RANK {server_state['local_rank']}] Loading PEFT model...", flush=True)
+            # Load PEFT model
             loaded_peft_model = PeftModel.from_pretrained(
                 new_body_model, 
                 body_model_path,
@@ -412,36 +412,43 @@ async def load_model(request: Request):
             )
             loaded_peft_model = loaded_peft_model.to(device)
             
-            # Step 3: Update global model
+            # Update global model
             if server_state["is_distributed"]:
                 body_model = DDP(loaded_peft_model, device_ids=[server_state["local_rank"]])
+                print(f"[SERVER RANK {server_state['local_rank']}] Wrapped with DDP", flush=True)
             else:
                 body_model = loaded_peft_model
             
             body_model.train()
             
-            # Step 4: Load optimizer independently (each rank loads its own copy)
+            # Load optimizer
             opt_path = os.path.join(path, "body_optimizer.pt")
             if os.path.exists(opt_path):
+                print(f"[SERVER RANK {server_state['local_rank']}] Loading optimizer...", flush=True)
                 server_state["optimizer"] = optim.AdamW(
                     [p for p in body_model.parameters() if p.requires_grad], lr=2e-4
                 )
-                server_state["optimizer"].load_state_dict(torch.load(opt_path, map_location=device), strict=False)
-                print(f"Server optimizer state loaded on rank {server_state['local_rank']}")
+                try:
+                    server_state["optimizer"].load_state_dict(
+                        torch.load(opt_path, map_location=device), strict=False
+                    )
+                    print(f"[SERVER RANK {server_state['local_rank']}] Optimizer loaded", flush=True)
+                except Exception as opt_error:
+                    print(f"[SERVER RANK {server_state['local_rank']}] Optimizer load failed: {opt_error}", flush=True)
+            else:
+                print(f"[SERVER RANK {server_state['local_rank']}] No optimizer file found at {opt_path}", flush=True)
             
-            # NO BARRIERS - Each process completes independently
-            # DDP will synchronize gradients during actual training, not during loading
-            
-            print(f"Body model loaded successfully on rank {server_state['local_rank']}")
+            print(f"[SERVER RANK {server_state['local_rank']}] Model loading completed successfully", flush=True)
             return {"status": "loaded", "path": path, "server_rank": server_state["local_rank"]}
         else:
-            return {"status": "error", "message": f"Body model not found at {body_model_path}"}
+            print(f"[SERVER RANK {server_state['local_rank']}] ERROR: Body model not found at {body_model_path}", flush=True)
+            return {"status": "error", "message": f"Body model not found at {body_model_path}", "server_rank": server_state["local_rank"]}
             
     except Exception as e:
-        print(f"Error in load_model rank {server_state['local_rank']}: {e}")
+        print(f"[SERVER RANK {server_state['local_rank']}] ERROR in load_model: {e}", flush=True)
         traceback.print_exc()
-        # Return error but don't raise HTTPException - let other ranks continue
         return {"status": "error", "message": str(e), "server_rank": server_state["local_rank"]}
+
 
 
 @app.get("/model_info")
