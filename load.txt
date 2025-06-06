@@ -638,11 +638,12 @@ def main():
     parser.add_argument("--continue_training", action="store_true", help="Continue training after loading")
     parser.add_argument("--epochs", type=int, default=1, help="Number of epochs to train")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training")
-    parser.add_argument("--eval_only", action="store_true", help="Only run evaluation, no training")  # This exists
+    parser.add_argument("--eval_only", action="store_true", help="Only run evaluation, no training")
     args = parser.parse_args()
 
     # Setup distributed training
     local_rank, world_size, is_distributed = setup_ddp()
+    print(f"[RANK {local_rank}] Started load.py with args: {args}", flush=True)
 
     # Wait for server (only rank 0)
     if local_rank == 0:
@@ -656,12 +657,21 @@ def main():
 
     # Check if model path exists
     if not os.path.exists(args.model_path):
-        print(f"Model path {args.model_path} does not exist!", flush=True)
+        print(f"[RANK {local_rank}] Model path {args.model_path} does not exist!", flush=True)
+        return
+
+    # STEP 1: Check required files FIRST
+    print(f"[RANK {local_rank}] Checking for required files...", flush=True)
+    if not check_required_files(args.model_path, local_rank):
+        print(f"[RANK {local_rank}] Cannot proceed - missing required files", flush=True)
+        print(f"[RANK {local_rank}] You need to run ./client_launch.sh first to create initial checkpoints", flush=True)
+        cleanup_ddp(is_distributed)
         return
 
     device = torch.device(f"cuda:{local_rank}")
 
     # Initialize models with same configuration as training
+    print(f"[RANK {local_rank}] Initializing models...", flush=True)
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -683,30 +693,34 @@ def main():
         tail_m = DDP(tail_m, device_ids=[local_rank])
 
     print(f"[RANK {local_rank}] Creating LoadedSplitModelTrainer...", flush=True)
-    # Create loaded trainer
     trainer = LoadedSplitModelTrainer(head_m, tail_m, tokenizer, args.server_url, local_rank, world_size)
 
-    
-    
-    
+    # STEP 2: Try to load models and optimizers
     print(f"[RANK {local_rank}] Attempting to load models and optimizers...", flush=True)
     load_success = trainer.load_models_and_optimizers(args.model_path)
     print(f"[RANK {local_rank}] Load result: {load_success}", flush=True)
-    
-    if not check_required_files(args.model_path, local_rank):
-        print(f"[RANK {local_rank}] Cannot proceed - missing required files", flush=True)
-        cleanup_ddp(is_distributed)
-        return
-
-    print(f"[RANK {local_rank}] Attempting to load models and optimizers...", flush=True)
-    load_success = trainer.load_models_and_optimizers(args.model_path)
-    print(f"[RANK {local_rank}] Load result: {load_success}", flush=True)
-
 
     if load_success:
         print(f"[RANK {local_rank}] All models and optimizers loaded successfully!", flush=True)
         
-        if args.continue_training:
+        if args.eval_only:
+            print(f"[RANK {local_rank}] Running evaluation only...", flush=True)
+            # Load dataset for evaluation
+            train_ds, test_ds = trainer.load_e2e_dataset()
+            
+            # Run evaluation only (no training)
+            if local_rank == 0:  # Only rank 0 evaluates
+                print("Starting evaluation with Hugging Face metrics...", flush=True)
+                eval_results = trainer.evaluate(test_ds)
+                if eval_results:
+                    bleu_score = eval_results.get('bleu', 0.0)
+                    meteor_score = eval_results.get('meteor', 0.0)
+                    print(f"=== EVALUATION RESULTS ===", flush=True)
+                    print(f"Final BLEU: {bleu_score:.4f}", flush=True)
+                    print(f"Final METEOR: {meteor_score:.4f}", flush=True)
+                    print(f"========================", flush=True)
+            
+        elif args.continue_training:
             print(f"[RANK {local_rank}] ENTERING TRAINING MODE for {args.epochs} epochs...", flush=True)
             
             # Load dataset and create dataloader
@@ -730,10 +744,11 @@ def main():
             trainer.train(train_dl, epochs=args.epochs, test_ds=test_ds)
             print(f"[RANK {local_rank}] Training completed!", flush=True)
         else:
-            print(f"[RANK {local_rank}] No --continue_training flag, skipping training", flush=True)
+            print(f"[RANK {local_rank}] No --continue_training or --eval_only flag provided", flush=True)
     else:
-        print(f"[RANK {local_rank}] FAILED TO LOAD MODELS - training cannot proceed!", flush=True)
+        print(f"[RANK {local_rank}] FAILED TO LOAD MODELS - cannot proceed!", flush=True)
         print(f"[RANK {local_rank}] Check if all required files exist in {args.model_path}", flush=True)
 
     cleanup_ddp(is_distributed)
+
 

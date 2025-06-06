@@ -1,4 +1,20 @@
 #load.py
+print("=== SCRIPT STARTING ===", flush=True)
+try:
+    import os
+    print("os import OK", flush=True)
+    import torch
+    print("torch import OK", flush=True)
+    import transformers
+    print("transformers import OK", flush=True)
+    from util import split_gpt2
+    print("util import OK", flush=True)
+    print("All imports successful", flush=True)
+except Exception as e:
+    print(f"IMPORT ERROR: {e}", flush=True)
+    exit(1)
+
+
 import os
 import torch
 import requests
@@ -17,6 +33,9 @@ from tqdm import tqdm
 from evaluate import load as load_metric
 import json
 import sys
+
+
+
 
 def setup_ddp():
     """Setup distributed training if available"""
