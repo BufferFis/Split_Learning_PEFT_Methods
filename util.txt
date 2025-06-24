@@ -3,6 +3,9 @@ import torch
 import torch.nn as nn
 from transformers import GPT2Model, GPT2LMHeadModel
 
+from torch.utils.checkpoint import checkpoint
+
+
 def split_gpt2(model, head_layers=2, tail_layers=2):
     """
     Properly split GPT2 model into head, body, and tail parts
@@ -79,6 +82,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             all_hidden_states = ()
             # Process through head layers
             for block in self.h:
+                hidden_states = checkpoint(block, hidden_states, attention_mask)
                 expanded_mask = self._expand_attention_mask(attention_mask, hidden_states)
                 hidden_states = block(hidden_states, attention_mask=expanded_mask)[0]
                 all_hidden_states = all_hidden_states + (hidden_states,)
@@ -148,6 +152,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
                 
             # Process through body layers
             for block in self.transformer.h:
+                hidden_states = checkpoint(block, hidden_states, attention_mask)
                 expanded_mask = self._expand_attention_mask(attention_mask, hidden_states)
                 if expanded_mask is not None:
                     hidden_states = block(hidden_states, attention_mask=expanded_mask)[0]
@@ -207,6 +212,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             
             # Process through tail layers
             for block in self.transformer.h:
+                hidden_states = checkpoint(block, hidden_states, attention_mask)
                 expanded_mask = self._expand_attention_mask(attention_mask, hidden_states)
                 hidden_states = block(hidden_states, attention_mask=expanded_mask)[0]
             

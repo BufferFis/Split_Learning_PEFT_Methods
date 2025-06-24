@@ -1,0 +1,7 @@
+pip uninstall transformers datasets accelerate peft huggingface-hub -y
+pip install transformers==4.34.0
+pip install huggingface-hub==0.17.3
+pip install datasets==2.14.4
+pip install accelerate==0.24.1
+pip install peft==0.6.2
+pip install torch==2.1.0

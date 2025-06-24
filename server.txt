@@ -14,6 +14,8 @@ import traceback
 import asyncio
 import json
 from datetime import timedelta  
+from torch.amp import autocast, GradScaler
+
 
 
 app = FastAPI()
@@ -150,33 +152,52 @@ def safe_model_forward(model, *args, **kwargs):
         return model(*args, **kwargs)
 
 def run_body_layers(activations, attention_mask=None):
-    """Run hidden states through transformer blocks - NEVER call generation methods"""
+    """Run hidden states through transformer blocks with consistent attention mask handling"""
     model = get_model()
     hidden = activations
     config = model.config
 
-    def expand_mask(mask, hidden_states):
-        if mask is not None and mask.dim() == 2:
-            batch_size, seq_len = mask.shape
-            num_heads = config.n_head
-            mask = mask.unsqueeze(1).unsqueeze(3)
-            mask = mask.expand(batch_size, num_heads, seq_len, seq_len)
+    def expand_mask_consistently(mask, hidden_states):
+        """Consistent 4D attention mask expansion"""
+        if mask is not None:
+            if mask.dim() == 2:
+                batch_size, seq_len = mask.shape
+                num_heads = config.n_head
+                # Create causal mask
+                mask = mask.unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, seq_len]
+                mask = mask.expand(batch_size, num_heads, seq_len, seq_len)
+            elif mask.dim() == 3:
+                # Handle case where mask is [batch, seq_len, seq_len]
+                mask = mask.unsqueeze(1)  # [batch, 1, seq_len, seq_len]
+                mask = mask.expand(-1, config.n_head, -1, -1)
+            
+            # Ensure mask is float32 and on correct device
+            mask = mask.float().to(hidden_states.device)
+            
+            # Convert to attention weights (0 for masked, large negative for unmasked positions)
+            mask = (1.0 - mask) * -10000.0
         return mask
 
     try:
-        for block in model.transformer.h:
-            # Expand mask before passing to block
-            expanded_mask = expand_mask(attention_mask, hidden)
-            hidden = block(hidden, attention_mask=expanded_mask)[0]
-            
+        # Expand attention mask once
+        expanded_mask = expand_mask_consistently(attention_mask, hidden)
         
+        for block in model.transformer.h:
+            # ADD: Explicitly disable use_cache
+            hidden = block(
+                hidden, 
+                attention_mask=expanded_mask, 
+                use_cache=False  # ADD THIS LINE
+            )[0]
+            
         # Final layer norm
         hidden = model.transformer.ln_f(hidden)
         return hidden
     except Exception as e:
         print(f"Error in run_body_layers: {e}")
-        # Critical: Re-raise to prevent silent failures
+        traceback.print_exc()
         raise
+
 
     
 
@@ -206,7 +227,7 @@ async def forward(request: Request):
                     attention_mask = torch.cat([attention_mask, padding], dim=1)
         
         body_model.eval()
-        with torch.no_grad():
+        with torch.no_grad(): #change
             last_hidden = run_body_layers(activations, attention_mask)
         
         return {"body_activations": last_hidden.cpu().tolist()}
@@ -252,6 +273,62 @@ async def forward_train(request: Request):
 
 
 
+#change
+"""@app.post("/backward")
+async def backward(request: Request):
+    try:
+        data = await request.json()
+        client_rank_id = data.get("rank_id", 0)
+        rank_key = f"client_{client_rank_id}_server_{server_state['local_rank']}"
+        
+        if rank_key not in server_state["requires_backward"] or not server_state["requires_backward"][rank_key]:
+            return {"status": "error", "message": "No forward state for this rank"}
+        
+        grad_output = torch.tensor(data["grad_output"], device=device)
+        loss_val = data.get("loss", 0.0)
+        
+        activations, attention_mask, last_hidden = server_state["last_activations"][rank_key]
+        
+        # Initialize optimizer if needed
+        if server_state["optimizer"] is None:
+            server_state["optimizer"] = optim.AdamW(
+                [p for p in body_model.parameters() if p.requires_grad], lr=2e-4
+            )
+        
+        opt = server_state["optimizer"]
+        opt.zero_grad()
+        
+        # Backward pass - DDP will handle gradient synchronization
+        #last_hidden.backward(grad_output, retain_graph=True)
+        #changed line above
+        torch.autograd.backward(
+            tensors=[last_hidden],
+            grad_tensors=[grad_output],
+            retain_graph=True
+        )
+
+        # Before opt.step():
+        if server_state["is_distributed"]:
+            dist.all_reduce(input_grad)  # Sync gradients
+
+        # Step optimizer
+        opt.step()
+        
+        # Get gradient w.r.t. input activations
+        input_grad = activations.grad if activations.grad is not None else torch.zeros_like(activations)
+        
+        # Cleanup this rank's state
+        del server_state["last_activations"][rank_key]
+        server_state["requires_backward"][rank_key] = False
+        server_state["step_count"] += 1
+        server_state["metrics"]["loss"].append(loss_val)
+        
+        
+        return {"grad_input": input_grad.cpu().tolist(), "step": server_state["step_count"]}
+    except Exception as e:
+        print(f"Error in backward: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+"""
 
 @app.post("/backward")
 async def backward(request: Request):
@@ -277,18 +354,25 @@ async def backward(request: Request):
         opt = server_state["optimizer"]
         opt.zero_grad()
         
-        # Backward pass - DDP will handle gradient synchronization
-        last_hidden.backward(grad_output, retain_graph=True)
+        # FIXED: Backward pass with proper gradient computation
+        torch.autograd.backward(
+            tensors=[last_hidden],
+            grad_tensors=[grad_output],
+            retain_graph=False  # Changed to False to free memory
+        )
         
-        # Before opt.step():
+        # FIXED: Get input gradient BEFORE optimizer step
+        input_grad = activations.grad if activations.grad is not None else torch.zeros_like(activations)
+        
+        # FIXED: Gradient synchronization for DDP (if distributed)
         if server_state["is_distributed"]:
-            dist.all_reduce(input_grad)  # Sync gradients
-
+            # Sync model gradients (DDP handles this automatically for model params)
+            # But we need to manually sync input gradients across ranks
+            dist.all_reduce(input_grad, op=dist.ReduceOp.SUM)
+            input_grad = input_grad / server_state["world_size"]
+        
         # Step optimizer
         opt.step()
-        
-        # Get gradient w.r.t. input activations
-        input_grad = activations.grad if activations.grad is not None else torch.zeros_like(activations)
         
         # Cleanup this rank's state
         del server_state["last_activations"][rank_key]
@@ -296,10 +380,59 @@ async def backward(request: Request):
         server_state["step_count"] += 1
         server_state["metrics"]["loss"].append(loss_val)
         
+        # Clear memory
+        del activations, attention_mask, last_hidden, grad_output
+        torch.cuda.empty_cache()
+        
         return {"grad_input": input_grad.cpu().tolist(), "step": server_state["step_count"]}
     except Exception as e:
         print(f"Error in backward: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+# FIXED: Improved run_body_layers with better attention mask handling
+def run_body_layers(activations, attention_mask=None):
+    """Run hidden states through transformer blocks with consistent attention mask handling"""
+    model = get_model()
+    hidden = activations
+    config = model.config
+
+    def expand_mask_consistently(mask, hidden_states):
+        """Consistent 4D attention mask expansion"""
+        if mask is not None:
+            if mask.dim() == 2:
+                batch_size, seq_len = mask.shape
+                num_heads = config.n_head
+                # Create causal mask
+                mask = mask.unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, seq_len]
+                mask = mask.expand(batch_size, num_heads, seq_len, seq_len)
+            elif mask.dim() == 3:
+                # Handle case where mask is [batch, seq_len, seq_len]
+                mask = mask.unsqueeze(1)  # [batch, 1, seq_len, seq_len]
+                mask = mask.expand(-1, config.n_head, -1, -1)
+            
+            # Ensure mask is float32 and on correct device
+            mask = mask.float().to(hidden_states.device)
+            
+            # Convert to attention weights (0 for masked, large negative for unmasked positions)
+            mask = (1.0 - mask) * -10000.0
+        return mask
+
+    try:
+        # Expand attention mask once
+        expanded_mask = expand_mask_consistently(attention_mask, hidden)
+        
+        for block in model.transformer.h:
+            hidden = block(hidden, attention_mask=expanded_mask)[0]
+            
+        # Final layer norm
+        hidden = model.transformer.ln_f(hidden)
+        return hidden
+    except Exception as e:
+        print(f"Error in run_body_layers: {e}")
+        traceback.print_exc()
+        raise
+
 
 @app.post("/start_training")
 async def start_training(request: Request):

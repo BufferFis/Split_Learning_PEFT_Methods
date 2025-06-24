@@ -3,6 +3,9 @@ import torch
 import torch.nn as nn
 from transformers import GPT2Model, GPT2LMHeadModel
 
+from torch.utils.checkpoint import checkpoint
+
+
 def split_gpt2(model, head_layers=2, tail_layers=2):
     """
     Properly split GPT2 model into head, body, and tail parts
@@ -70,17 +73,25 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             
             hidden_states = inputs_embeds + position_embeds
             hidden_states = self.drop(hidden_states)
-            attention_mask = self._expand_attention_mask(attention_mask, hidden_states)
-
-             # Ensure consistent dtype
-            if attention_mask is not None and attention_mask.dtype != hidden_states.dtype:
-                attention_mask = attention_mask.to(hidden_states.dtype)
+            
+            # FIXED: Handle attention mask properly
+            if attention_mask is not None:
+                if attention_mask.dim() == 2:
+                    # Convert 2D mask to 4D causal mask
+                    batch_size, seq_len = attention_mask.shape
+                    causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=attention_mask.device))
+                    attention_mask = attention_mask.unsqueeze(-1).unsqueeze(-1) * causal_mask
+                    attention_mask = attention_mask.unsqueeze(1).expand(-1, self.config.n_head, -1, -1)
+                
+                # Ensure proper dtype
+                attention_mask = attention_mask.float()
+                # Convert to attention weights
+                attention_mask = (1.0 - attention_mask) * -10000.0
 
             all_hidden_states = ()
             # Process through head layers
             for block in self.h:
-                expanded_mask = self._expand_attention_mask(attention_mask, hidden_states)
-                hidden_states = block(hidden_states, attention_mask=expanded_mask)[0]
+                hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
                 all_hidden_states = all_hidden_states + (hidden_states,)
             
             if output_hidden_states:
@@ -90,6 +101,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
                 })()
             else:
                 return type('HeadOutput', (), {'last_hidden_state': hidden_states})()
+
     
     # Create body model (middle layers only) - FIXED FOR PEFT
     class BodyModel(nn.Module):
@@ -148,6 +160,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
                 
             # Process through body layers
             for block in self.transformer.h:
+                hidden_states = checkpoint(block, hidden_states, attention_mask)
                 expanded_mask = self._expand_attention_mask(attention_mask, hidden_states)
                 if expanded_mask is not None:
                     hidden_states = block(hidden_states, attention_mask=expanded_mask)[0]
@@ -207,6 +220,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             
             # Process through tail layers
             for block in self.transformer.h:
+                hidden_states = checkpoint(block, hidden_states, attention_mask)
                 expanded_mask = self._expand_attention_mask(attention_mask, hidden_states)
                 hidden_states = block(hidden_states, attention_mask=expanded_mask)[0]
             

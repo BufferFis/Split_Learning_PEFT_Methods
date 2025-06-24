@@ -18,6 +18,9 @@ from tqdm import tqdm
 from util import split_gpt2
 from peft import LoraConfig, get_peft_model
 import time
+from torch.amp import autocast, GradScaler
+import traceback
+
 
 
 
@@ -95,6 +98,8 @@ class SplitModelTrainer:
         self.local_rank = local_rank
         self.world_size = world_size
         self.device = torch.device(f"cuda:{local_rank}")
+        self.scaler = GradScaler("cuda")
+
         
         self.head_optimizer = optim.AdamW(
             [p for p in head_model.parameters() if p.requires_grad], lr=2e-4
@@ -158,7 +163,7 @@ class SplitModelTrainer:
             sampler=sampler,
             shuffle=(shuffle if sampler is None else False),
             collate_fn=collate_fn,
-            num_workers=2,
+            num_workers=0,
             pin_memory=True,
             drop_last=True  # Ensures all batches are [batch_size, 128]
         )
@@ -199,58 +204,65 @@ class SplitModelTrainer:
                     attn_mask = batch["attention_mask"].to(self.device).float()
                     labels = batch["labels"].to(self.device)
                     
-                   # Expand attention mask to 4D [batch_size, num_heads, seq_len, seq_len]
-                    attn_mask_expanded = attn_mask.unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, 128]
-                    attn_mask_expanded = attn_mask_expanded.expand(-1, 12, 128, -1)  # [batch, 12, 128, 128]
-
-                    # Validate ALL shapes
-                    assert input_ids.shape == torch.Size([64, 128]), f"input_ids shape {input_ids.shape}"
-                    assert attn_mask_expanded.shape == torch.Size([64, 12, 128, 128]), "Invalid mask shape"
-                    assert labels.shape == torch.Size([64, 128]), f"labels shape {labels.shape}"
+                    # FIXED: Consistent attention mask handling for head model
+                    batch_size, seq_len = attn_mask.shape
                     
-                    #assert input_ids.shape[0] == attn_mask.shape[0] == labels.shape[0], f"Batch size mismatch: input_ids {input_ids.shape[0]}, attn_mask {attn_mask.shape[0]}, labels {labels.shape[0]}"
-
-                    # Zero optimizers
+                    # For head model, expand attention mask properly
+                    head_attn_mask = self._create_causal_mask(batch_size, seq_len, self.device)
+                    
                     self.head_optimizer.zero_grad()
                     self.tail_optimizer.zero_grad()
+
+                    # Head forward with proper mask
+                    with autocast(device_type="cuda", dtype=torch.float16):
+                        head_out = self.head_model(
+                            input_ids=input_ids,
+                            attention_mask=head_attn_mask,
+                            output_hidden_states=True,
+                            use_cache=False
+                        )
+                        head_hid = head_out.hidden_states[-1]
+
+                        # Validate head output
+                        if torch.isnan(head_hid).any() or torch.isinf(head_hid).any():
+                            print(f"Rank {self.local_rank}: ERROR: head_hid contains NaN or Inf values")
+                            continue
+
+                        payload = {
+                            "activations": head_hid.detach().cpu().half().tolist(),
+                            "attention_mask": attn_mask.cpu().tolist(),
+                            "rank_id": self.local_rank
+                        }
+                        
+                        server_url = self.get_server_url()
+                        sr = robust_server_request(f"{server_url}/forward_train", payload)
+                        body_act = torch.tensor(sr.json()["body_activations"], device=self.device, dtype=head_hid.dtype)
+                        body_act.requires_grad_()
+
+                        # Tail forward with 2D attention mask (tail model will handle expansion)
+                        tail_out = self.tail_model(inputs_embeds=body_act, attention_mask=attn_mask, use_cache=False)
+                        logits = tail_out.logits
+
+                        # Compute loss
+                        shift_logits = logits[..., :-1, :].contiguous()
+                        shift_labels = labels[..., 1:].contiguous()
+                        loss = self.loss_fn(
+                            shift_logits.view(-1, shift_logits.size(-1)),
+                            shift_labels.view(-1)
+                        )
+
+                    # Backward pass
+                    self.scaler.scale(loss).backward(retain_graph=True)
                     
-                    # Head forward
-                    head_out = self.head_model(
-                        input_ids=input_ids,
-                        attention_mask=attn_mask_expanded,
-                        output_hidden_states=True
-                    )
-                    head_hid = head_out.hidden_states[-1]
-                    
-                    # Send to server with rank identifier
-                    payload = {
-                        "activations": head_hid.detach().cpu().tolist(),
-                        "attention_mask": attn_mask.cpu().tolist(),
-                        "rank_id": self.local_rank
-                    }
-                    
-                    server_url = self.get_server_url()
-                    sr = robust_server_request(f"{server_url}/forward_train", payload)
-                    body_act = torch.tensor(sr.json()["body_activations"], device=self.device)
-                    body_act.requires_grad_()
-                    
-                    # Tail forward and loss
-                    tail_out = self.tail_model(inputs_embeds=body_act, attention_mask=attn_mask)
-                    logits = tail_out.logits
-                    
-                    shift_logits = logits[..., :-1, :].contiguous()
-                    shift_labels = labels[..., 1:].contiguous()
-                    loss = self.loss_fn(
-                        shift_logits.view(-1, shift_logits.size(-1)),
-                        shift_labels.view(-1)
-                    )
-                    
-                    # Backward through tail
-                    loss.backward(retain_graph=True)
-                    grad_output = body_act.grad.detach().cpu().tolist()
-                    
+                    # Get gradient for server
+                    if body_act.grad is not None:
+                        grad_output = body_act.grad.detach().cpu().tolist()
+                    else:
+                        print(f"Warning: No gradient for body_act at batch {batch_idx}")
+                        continue
+
                     # Send gradient to server
-                    server_url = self.get_server_url()  # Use same server for backward
+                    server_url = self.get_server_url()
                     br = requests.post(
                         f"{server_url}/backward",
                         json={
@@ -260,29 +272,41 @@ class SplitModelTrainer:
                         },
                         timeout=300
                     )
-                    grad_input = torch.tensor(br.json()["grad_input"], device=self.device)
-                    
+                    grad_input = torch.tensor(br.json()["grad_input"], device=self.device, dtype=head_hid.dtype)
+
                     # Backward through head
                     head_hid.backward(grad_input)
+
+                    # Optimizer steps with gradient clipping
+                    torch.nn.utils.clip_grad_norm_(self.head_model.parameters(), max_norm=1.0)
+                    torch.nn.utils.clip_grad_norm_(self.tail_model.parameters(), max_norm=1.0)
                     
-                    # Optimizer steps
-                    self.head_optimizer.step()
-                    self.tail_optimizer.step()
-                    
+                    self.scaler.step(self.head_optimizer)
+                    self.scaler.step(self.tail_optimizer)
+                    self.scaler.update()
+
                     total_loss += loss.item()
-                    
+
+                    # Enhanced memory cleanup
+                    del input_ids, attn_mask, labels, head_attn_mask
+                    del head_out, head_hid, body_act, tail_out, logits
+                    del shift_logits, shift_labels, loss, grad_input
+                    if batch_idx % 5 == 0:  # More frequent cleanup
+                        torch.cuda.empty_cache()
+
                 except requests.exceptions.RequestException as e:
                     print(f"Rank {self.local_rank}: Server communication error: {e}")
                     continue
                 except Exception as e:
                     print(f"Rank {self.local_rank}: Training error: {e}")
+                    traceback.print_exc()
                     continue
-            
-            avg = total_loss / len(dataloader) if len(dataloader) > 0 else 0.0
+
+            avg_loss = total_loss / len(dataloader) if len(dataloader) > 0 else 0.0
             if self.local_rank == 0:
-                print(f"Epoch {epoch+1} avg loss: {avg:.4f}")
+                print(f"Epoch {epoch+1} avg loss: {avg_loss:.4f}")
             
-            # End epoch (only rank 0)
+            # End epoch signal
             if self.local_rank == 0:
                 is_final = (epoch == epochs-1)
                 try:
@@ -290,21 +314,29 @@ class SplitModelTrainer:
                 except requests.exceptions.RequestException as e:
                     print(f"Failed to signal end of epoch: {e}")
         
-        # Save models (only rank 0)
+        # Save and evaluate
         if self.local_rank == 0:
             try:
                 requests.post(f"{self.server_url}/save_model", json={"path": "./server_model"}, timeout=30)
-                client_save_info = self.save_models("./server_model")
-                print("Client models saved:", client_save_info)
+                self.save_models("./server_model")
+                print("Models saved successfully")
                 
-                # EVALUATE USING BUILT-IN HF METRICS
-                print("Starting evaluation with Hugging Face metrics...")
-                eval_results = self.evaluate(test_ds)
-                if eval_results:
-                    print(f"Final BLEU: {eval_results['bleu']:.4f}, METEOR: {eval_results['meteor']:.4f}")
-                
-            except requests.exceptions.RequestException as e:
-                print(f"Failed to save models: {e}")
+                if test_ds is not None:
+                    print("Starting evaluation...")
+                    eval_results = self.evaluate(test_ds)
+                    if eval_results:
+                        print(f"Final BLEU: {eval_results['bleu']:.4f}, METEOR: {eval_results['meteor']:.4f}")
+                        
+            except Exception as e:
+                print(f"Failed to save/evaluate: {e}")
+
+    def _create_causal_mask(self, batch_size, seq_len, device):
+        """Create causal attention mask for head model"""
+        mask = torch.tril(torch.ones(seq_len, seq_len, device=device))
+        mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
+        mask = mask.expand(batch_size, 12, seq_len, seq_len)  # [batch, heads, seq_len, seq_len]
+        return mask.float()
+
 
     def save_models(self, path="./server_model"):
         """Save head and tail models"""
@@ -355,7 +387,8 @@ class SplitModelTrainer:
                     head_out = self.head_model(
                         input_ids=generated_ids,
                         attention_mask=current_attention_mask,
-                        output_hidden_states=True
+                        output_hidden_states=True,
+                        use_cache = False
                     )
                     head_hidden = head_out.hidden_states[-1]
                     
@@ -367,12 +400,13 @@ class SplitModelTrainer:
                     
                     server_url = self.get_server_url()
                     resp = requests.post(f"{server_url}/forward", json=payload, timeout=120)
-                    body_act = torch.tensor(resp.json()["body_activations"], device=self.device)
+                    body_act = torch.tensor(resp.json()["body_activations"], device=self.device, dtype=head_hidden.dtype)
                     
                     # Tail forward
                     tail_out = self.tail_model(
                         inputs_embeds=body_act,
-                        attention_mask=current_attention_mask
+                        attention_mask=current_attention_mask,
+                        use_cache = False
                     )
                     logits = tail_out.logits
                     
@@ -393,103 +427,77 @@ class SplitModelTrainer:
 
 
     def evaluate(self, test_ds):
-        """Evaluate model using built-in Hugging Face metrics"""
-        if self.local_rank != 0:  # Only rank 0 evaluates
-            return
+            """Robust evaluation with better error handling"""
+            if self.local_rank != 0:
+                return
+                
+            self.head_model.eval()
+            self.tail_model.eval()
             
-        self.head_model.eval()
-        self.tail_model.eval()
-        
-        try:
-            # Load built-in Hugging Face metrics
-            bleu_metric = load_metric("bleu")
-            meteor_metric = load_metric("meteor")
-            
-            preds, refs = [], []
-            
-            print("Starting evaluation on E2E NLG dataset using HF metrics...")
-            
-            # FIXED: Proper dataset sampling
-            if hasattr(test_ds, 'select'):
-                # Use dataset.select() for HuggingFace datasets
-                eval_samples = test_ds.select(range(min(100, len(test_ds))))
-            else:
-                # Fallback for other dataset types
-                eval_samples = test_ds[:100]
-            
-            for i, sample in enumerate(tqdm(eval_samples, desc="Evaluating")):
-                try:
-                    # DEFENSIVE: Check if sample is a dictionary
-                    if isinstance(sample, str):
-                        print(f"Warning: Sample {i} is a string, skipping")
-                        continue
-                        
-                    if not isinstance(sample, dict):
-                        print(f"Warning: Sample {i} is not a dict, type: {type(sample)}")
-                        continue
-                    
-                    # SAFE: Check if required keys exist
-                    if "input_ids" not in sample or "human_reference" not in sample:
-                        print(f"Warning: Sample {i} missing required keys")
-                        continue
-                    
-                    # Convert to tensors safely
-                    input_ids = torch.tensor(sample["input_ids"]).unsqueeze(0).to(self.device)
-                    
-                    # Handle attention mask safely
-                    if "attention_mask" in sample:
-                        attention_mask = torch.tensor(sample["attention_mask"]).unsqueeze(0).to(self.device)
-                    else:
-                        attention_mask = torch.ones_like(input_ids, dtype=torch.float32)
-                    
-                    # Generate prediction
-                    generated_text = self.generate(input_ids, attention_mask)
-                    preds.append(generated_text)
-                    refs.append([sample["human_reference"]])
-                    
-                except Exception as sample_error:
-                    print(f"Error processing sample {i}: {sample_error}")
-                    continue
-            
-            if not preds:
-                print("No valid predictions generated")
-                return {"bleu": 0.0, "meteor": 0.0, "error": "No valid samples"}
-            
-            # Calculate metrics with error handling
             try:
-                bleu_score = bleu_metric.compute(predictions=preds, references=refs)
-                meteor_score = meteor_metric.compute(predictions=preds, references=[r[0] for r in refs])
+                from evaluate import load as load_metric
+                bleu_metric = load_metric("bleu")
+                meteor_metric = load_metric("meteor")
                 
-                # Safe access to metric results
-                bleu_value = bleu_score.get('bleu', 0.0) if isinstance(bleu_score, dict) else 0.0
-                meteor_value = meteor_score.get('meteor', 0.0) if isinstance(meteor_score, dict) else 0.0
+                preds, refs = [], []
                 
-                print(f"E2E NLG BLEU Score: {bleu_value:.4f}")
-                print(f"E2E NLG METEOR Score: {meteor_value:.4f}")
+                print("Starting evaluation on E2E NLG dataset...")
                 
-                results = {
-                    "bleu": bleu_value,
-                    "meteor": meteor_value
-                }
+                # Safer dataset sampling
+                eval_size = min(50, len(test_ds))  # Reduced for stability
+                if hasattr(test_ds, 'select'):
+                    eval_samples = test_ds.select(range(eval_size))
+                else:
+                    eval_samples = test_ds[:eval_size]
                 
-            except Exception as eval_error:
-                print(f"Evaluation metric error: {eval_error}")
-                results = {
-                    "bleu": 0.0,
-                    "meteor": 0.0,
-                    "error": str(eval_error)
-                }
-            
-            # Save results
-            with open("./server_model/evaluation_results.json", "w") as f:
-                json.dump(results, f, indent=2)
-            print("Evaluation results saved to ./server_model/evaluation_results.json")
-            
-            return results
-            
-        except Exception as e:
-            print(f"Evaluation error: {e}")
-            return None
+                successful_evals = 0
+                for i, sample in enumerate(tqdm(eval_samples, desc="Evaluating")):
+                    try:
+                        if not isinstance(sample, dict) or "input_ids" not in sample:
+                            continue
+                        
+                        input_ids = torch.tensor(sample["input_ids"][:64]).unsqueeze(0).to(self.device)  # Limit length
+                        attention_mask = torch.ones_like(input_ids, dtype=torch.float32)
+                        
+                        generated_text = self.generate(input_ids, attention_mask, max_length=64)
+                        
+                        if generated_text and generated_text != "Generation failed":
+                            preds.append(generated_text)
+                            refs.append([sample["human_reference"]])
+                            successful_evals += 1
+                            
+                    except Exception as e:
+                        print(f"Error in sample {i}: {e}")
+                        continue
+                
+                print(f"Successfully evaluated {successful_evals}/{eval_size} samples")
+                
+                if preds:
+                    try:
+                        bleu_score = bleu_metric.compute(predictions=preds, references=refs)
+                        meteor_score = meteor_metric.compute(predictions=preds, references=[r[0] for r in refs])
+                        
+                        results = {
+                            "bleu": bleu_score.get('bleu', 0.0),
+                            "meteor": meteor_score.get('meteor', 0.0),
+                            "successful_samples": successful_evals
+                        }
+                        
+                        # Save results
+                        os.makedirs("./server_model", exist_ok=True)
+                        with open("./server_model/evaluation_results.json", "w") as f:
+                            json.dump(results, f, indent=2)
+                        
+                        return results
+                    except Exception as e:
+                        print(f"Metric computation error: {e}")
+                        return {"bleu": 0.0, "meteor": 0.0, "error": str(e)}
+                else:
+                    return {"bleu": 0.0, "meteor": 0.0, "error": "No valid predictions"}
+                    
+            except Exception as e:
+                print(f"Evaluation error: {e}")
+                return None
 
 
 

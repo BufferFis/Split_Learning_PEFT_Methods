@@ -1,0 +1,46 @@
+# --- CORE DEEP LEARNING (GPU-ENABLED) ---
+
+# TensorFlow with CUDA (GPU support, as of 2.17.0 needs CUDA 12.2 and cuDNN 8.9)
+tensorflow[and-cuda]==2.17.0
+tensorboard==2.17.0
+
+# PyTorch with CUDA 12.1 (for RTX 3050, official pip wheel)
+torch==2.2.0+cu121
+torchvision==0.17.0+cu121
+torchaudio==2.2.0+cu121
+# Use the extra index for CUDA wheels:
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+# --- TRANSFORMERS & DATA ---
+
+transformers>=4.41.0
+datasets>=2.19.0
+evaluate>=0.4.2
+peft>=0.12.0
+
+# --- FASTAPI & SERVER ---
+
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+
+# --- UTILITIES ---
+
+tqdm>=4.66.0
+requests>=2.31.0
+
+# --- GRPC & PROTOBUF (COMPATIBLE VERSIONS) ---
+
+grpcio-tools==1.62.2
+protobuf==4.25.3
+
+# --- OPTIONAL: Jupyter & Data Science (uncomment if needed) ---
+# jupyter
+# numpy
+# matplotlib
+# pandas
+
+# --- NOTES ---
+# - This setup ensures TensorFlow, PyTorch, and gRPC/protobuf versions are compatible.
+# - If you encounter protobuf conflicts, install all packages in a fresh virtual environment.
+# - For CUDA, ensure your NVIDIA drivers are up to date and CUDA 12.x is installed.
+# - If you use a different CUDA version, adjust torch/torchvision/torchaudio versions accordingly.
