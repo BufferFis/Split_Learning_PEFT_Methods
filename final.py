@@ -394,8 +394,8 @@ class SplitLoRATrainer:
             print(f"   - Sequence length: 32 (instead of 64)")
             print(f"   - Training samples: 100 (instead of {len(train_ds):,})")
             print(f"   - Test samples: 20 (instead of {len(test_ds):,})")
-            train_ds = train_ds.select(range(100))  # Only 100 samples!
-            test_ds = test_ds.select(range(20))     # Only 20 samples!
+            train_ds = train_ds.select(range(1000))  # Only 100 samples!
+            test_ds = test_ds.select(range(100))     # Only 20 samples!
         
         return train_ds, test_ds
 
