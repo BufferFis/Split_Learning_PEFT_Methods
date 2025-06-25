@@ -371,58 +371,56 @@ class SplitLoRATrainer:
         self.metrics = {"loss": []}
         
     def load_e2e_dataset(self):
+        """FIXED: Proper conditional generation with consistent lengths"""
         dataset = load_dataset("e2e_nlg", trust_remote_code=True)
         
         def preprocess(example):
-            """FIXED: Proper conditional generation preprocessing"""
-            # Concatenate MR + reference as one sequence
-            mr_text = example["meaning_representation"] 
+            SEQUENCE_LENGTH = 128  # Use consistent length everywhere
+            
+            mr_text = example["meaning_representation"]
             ref_text = example["human_reference"]
             
-            # Add special tokens to separate condition from generation
-            full_text = mr_text + " <|generate|> " + ref_text
+            # Create input and target sequences
+            input_text = mr_text + " <|startoftext|>"  # Clear delimiter
+            target_text = ref_text + " <|endoftext|>"
+            full_text = input_text + " " + target_text
             
-            # Tokenize the full sequence
+            # Tokenize separately to get proper split point
+            input_tokens = self.tokenizer.encode(input_text, add_special_tokens=False)
+            input_length = len(input_tokens)
+            
+            # Tokenize full sequence
             encoding = self.tokenizer(
                 full_text,
-                max_length=128,
+                max_length=SEQUENCE_LENGTH,
                 truncation=True,
                 padding="max_length",
                 return_attention_mask=True
             )
             
-            # Create labels with proper masking
-            input_ids = encoding["input_ids"]
-            labels = input_ids.copy()
-            
-            # Find where generation starts (after <|generate|> token)
-            generate_token = self.tokenizer.encode(" <|generate|> ")[0]
-            try:
-                gen_start = input_ids.index(generate_token) + 1
-                # Mask the condition part (don't compute loss on MR tokens)
-                labels[:gen_start] = [-100] * gen_start
-            except ValueError:
-                # If token not found, mask first half
-                labels[:len(input_ids)//2] = [-100] * (len(input_ids)//2)
+            # Create labels - mask input portion
+            labels = encoding["input_ids"].copy()
+            labels[:input_length] = [-100] * input_length  # Mask conditioning part
             
             return {
-                "input_ids": input_ids,
-                "attention_mask": encoding["attention_mask"], 
+                "input_ids": encoding["input_ids"],
+                "attention_mask": encoding["attention_mask"],
                 "labels": labels,
-                "human_reference": example["human_reference"]
+                "human_reference": example["human_reference"],
+                "input_length": input_length  # Store for generation
             }
-
         
         train_ds = dataset["train"].map(preprocess, remove_columns=dataset["train"].column_names)
-        test_ds = dataset["test"].map(preprocess, remove_columns=dataset["test"].column_names) 
+        test_ds = dataset["test"].map(preprocess, remove_columns=dataset["test"].column_names)
         return train_ds, test_ds
 
 
     
     def create_dataloader(self, dataset, batch_size=8, shuffle=True):
-        """Create DataLoader with proper collation"""
+        """FIXED: Consistent sequence length"""
         def collate_fn(batch):
-            FIXED_LENGTH = 64
+            FIXED_LENGTH = 128  # Match preprocessing length!
+            
             input_ids_batch = []
             attention_mask_batch = []
             labels_batch = []
@@ -450,15 +448,7 @@ class SplitLoRATrainer:
                 "human_reference": [b["human_reference"] for b in batch]
             }
         
-        return DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            collate_fn=collate_fn,
-            num_workers=2,
-            pin_memory=True,
-            drop_last=True
-        )
+        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn)
     
     def train(self, train_dataloader, epochs=1):
         """Train the split model - PROPER SPLIT LEARNING"""
@@ -513,37 +503,44 @@ class SplitLoRATrainer:
         print("Training completed!")
     
     def generate(self, prompt_ids, attention_mask, max_length=64):
-        """Generate from meaning representation only - FIXED VERSION"""
+        """FIXED: Proper conditioning + causal masking + greedy decoding"""
         with torch.no_grad():
             try:
                 if prompt_ids.dim() == 1:
                     prompt_ids = prompt_ids.unsqueeze(0)
                 
-                generated_ids = prompt_ids.clone()
-                prompt_length = prompt_ids.size(1)
+                # Find the conditioning boundary
+                startoftext_token = self.tokenizer.encode(" <|startoftext|>")[0]
+                try:
+                    condition_end = prompt_ids[0].tolist().index(startoftext_token) + 1
+                except ValueError:
+                    condition_end = len(prompt_ids[0]) // 2  # Fallback
                 
-                # Debug: Print input
-                input_text = self.tokenizer.decode(prompt_ids[0], skip_special_tokens=True)
-                print(f"Input: '{input_text}'")
+                # Start generation from condition end
+                generated_ids = prompt_ids[:, :condition_end].clone()
                 
                 for step in range(max_length):
                     current_length = generated_ids.size(1)
                     
-                    # FIX: Create proper attention mask for current sequence
-                    current_attention_mask = torch.ones(
-                        generated_ids.size(0), current_length,
-                        dtype=torch.float32, device=device
+                    # FIXED: Create proper causal attention mask
+                    causal_mask = torch.tril(torch.ones(
+                        current_length, current_length,
+                        dtype=torch.bool, device=device
+                    ))
+                    
+                    # Convert to attention mask format
+                    current_attention_mask = causal_mask.unsqueeze(0).float()
+                    current_attention_mask = current_attention_mask.masked_fill(
+                        ~causal_mask.unsqueeze(0), -10000.0
                     )
                     
-                    # Split forward pass
+                    # Forward through pipeline
                     head_activations = self.head_client.forward(generated_ids, current_attention_mask)
                     body_activations = self.server.forward(head_activations, current_attention_mask)
                     logits = self.tail_client.forward(body_activations, current_attention_mask)
                     
-                    # Get next token (use sampling for better generation)
-                    next_token_logits = logits[:, -1, :]
-                    next_token = torch.multinomial(torch.softmax(next_token_logits, dim=-1), 1)
-                    
+                    # FIXED: Greedy decoding (deterministic)
+                    next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(-1)
                     generated_ids = torch.cat([generated_ids, next_token], dim=1)
                     
                     # Stop conditions
@@ -552,21 +549,14 @@ class SplitLoRATrainer:
                     if next_token.item() == self.tokenizer.pad_token_id:
                         break
                 
-                # Extract only generated part (excluding prompt)
-                if generated_ids.size(1) > prompt_length:
-                    generated_part = generated_ids[0, prompt_length:]
+                # Extract only generated part (after condition)
+                if generated_ids.size(1) > condition_end:
+                    generated_part = generated_ids[0, condition_end:]
                     generated_text = self.tokenizer.decode(generated_part, skip_special_tokens=True).strip()
                 else:
                     generated_text = ""
                 
-                # Debug: Print output
-                print(f"Generated: '{generated_text}'")
-                
-                # FIX: Ensure we return something meaningful
-                if not generated_text or len(generated_text.strip()) == 0:
-                    generated_text = "no output generated"
-                
-                return generated_text
+                return generated_text if generated_text else "no output"
                 
             except Exception as e:
                 print(f"Generation error: {e}")
