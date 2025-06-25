@@ -768,7 +768,7 @@ class SplitLoRATrainer:
         # Test initial generation (should be random)
         print("\n🔬 INITIAL GENERATION TEST (should be random):")
         for mr, expected in test_samples:
-            generated = self.debug_generate_sample(mr, max_length=16)
+            generated = self.debug_generate_sample(mr, max_length=64)
             print(f"  MR: {mr}")
             print(f"  Generated: {generated}")
             print("---")
