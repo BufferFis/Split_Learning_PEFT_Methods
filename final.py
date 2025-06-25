@@ -33,6 +33,34 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
     
     # Head Model (embedding + first few layers)
     class HeadModel(nn.Module):
+        def __init__(self, original_model, num_layers):
+            super().__init__()  # CRITICAL: Call parent constructor
+            self.wte = original_model.transformer.wte
+            self.wpe = original_model.transformer.wpe
+            self.drop = original_model.transformer.drop
+            self.h = nn.ModuleList(original_model.transformer.h[:num_layers])
+            self.config = original_model.config
+            
+            # Add missing generation attributes for PEFT compatibility
+            self.generation_config = getattr(original_model, 'generation_config', None)
+            self.main_input_name = getattr(original_model, 'main_input_name', 'input_ids')
+            
+            # Add the missing prepare_inputs_for_generation method
+            if hasattr(original_model, 'prepare_inputs_for_generation'):
+                self.prepare_inputs_for_generation = original_model.prepare_inputs_for_generation
+            else:
+                self.prepare_inputs_for_generation = self._prepare_inputs_for_generation
+                
+            # Add other missing attributes that PEFT might need
+            for attr in ['_get_resized_embeddings', 'get_input_embeddings', 'set_input_embeddings', 
+                        'get_output_embeddings', 'set_output_embeddings', 'resize_token_embeddings']:
+                if hasattr(original_model, attr):
+                    setattr(self, attr, getattr(original_model, attr))
+        
+        def _prepare_inputs_for_generation(self, input_ids, **kwargs):
+            """Default implementation for prepare_inputs_for_generation"""
+            return {"input_ids": input_ids}
+            
         def forward(self, input_ids=None, attention_mask=None, output_hidden_states=False, **kwargs):
             inputs_embeds = self.wte(input_ids)
             seq_length = input_ids.size(-1)
@@ -55,7 +83,37 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             else:
                 return type('HeadOutput', (), {'last_hidden_state': hidden_states})()
     
+    # Body Model (middle layers)
     class BodyModel(nn.Module):
+        def __init__(self, original_model, start_layer, num_layers):
+            super().__init__()  # CRITICAL: Call parent constructor
+            self.transformer = nn.Module()
+            self.transformer.h = nn.ModuleList(
+                original_model.transformer.h[start_layer:start_layer + num_layers]
+            )
+            self.transformer.ln_f = original_model.transformer.ln_f
+            self.config = original_model.config
+            
+            # Add missing generation attributes for PEFT compatibility
+            self.generation_config = getattr(original_model, 'generation_config', None)
+            self.main_input_name = getattr(original_model, 'main_input_name', 'input_ids')
+            
+            # Add the missing prepare_inputs_for_generation method
+            if hasattr(original_model, 'prepare_inputs_for_generation'):
+                self.prepare_inputs_for_generation = original_model.prepare_inputs_for_generation
+            else:
+                self.prepare_inputs_for_generation = self._prepare_inputs_for_generation
+                
+            # Add other missing attributes that PEFT might need
+            for attr in ['_get_resized_embeddings', 'get_input_embeddings', 'set_input_embeddings', 
+                        'get_output_embeddings', 'set_output_embeddings', 'resize_token_embeddings']:
+                if hasattr(original_model, attr):
+                    setattr(self, attr, getattr(original_model, attr))
+        
+        def _prepare_inputs_for_generation(self, input_ids, **kwargs):
+            """Default implementation for prepare_inputs_for_generation"""
+            return {"input_ids": input_ids}
+            
         def forward(self, hidden_states=None, attention_mask=None, **kwargs):
             # SIMPLIFIED: Remove complex attention mask handling
             for block in self.transformer.h:
@@ -64,7 +122,35 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             hidden_states = self.transformer.ln_f(hidden_states)
             return type('BodyOutput', (), {'last_hidden_state': hidden_states})()
     
+    # Tail Model (last few layers + LM head)
     class TailModel(nn.Module):
+        def __init__(self, original_model, start_layer):
+            super().__init__()  # CRITICAL: Call parent constructor
+            self.transformer = nn.Module()
+            self.transformer.h = nn.ModuleList(original_model.transformer.h[start_layer:])
+            self.lm_head = original_model.lm_head
+            self.config = original_model.config
+            
+            # Add missing generation attributes for PEFT compatibility
+            self.generation_config = getattr(original_model, 'generation_config', None)
+            self.main_input_name = getattr(original_model, 'main_input_name', 'input_ids')
+            
+            # Add the missing prepare_inputs_for_generation method
+            if hasattr(original_model, 'prepare_inputs_for_generation'):
+                self.prepare_inputs_for_generation = original_model.prepare_inputs_for_generation
+            else:
+                self.prepare_inputs_for_generation = self._prepare_inputs_for_generation
+                
+            # Add other missing attributes that PEFT might need
+            for attr in ['_get_resized_embeddings', 'get_input_embeddings', 'set_input_embeddings', 
+                        'get_output_embeddings', 'set_output_embeddings', 'resize_token_embeddings']:
+                if hasattr(original_model, attr):
+                    setattr(self, attr, getattr(original_model, attr))
+        
+        def _prepare_inputs_for_generation(self, input_ids, **kwargs):
+            """Default implementation for prepare_inputs_for_generation"""
+            return {"input_ids": input_ids}
+            
         def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
             hidden_states = inputs_embeds
             
@@ -80,6 +166,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
     tail_model = TailModel(model, head_layers + body_layers)
     
     return head_model, body_model, tail_model
+
 
 
 class ServerModel:
