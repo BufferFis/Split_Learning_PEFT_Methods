@@ -371,7 +371,7 @@ class SplitLoRATrainer:
         self.metrics = {"loss": []}
         
     def load_e2e_dataset(self):
-        """FIXED: Proper conditional generation with consistent lengths"""
+        """Improved preprocessing with clear separator"""
         dataset = load_dataset("e2e_nlg", trust_remote_code=True)
         
         def preprocess(example):
@@ -379,25 +379,37 @@ class SplitLoRATrainer:
             
             mr_text = example["meaning_representation"]
             ref_text = example["human_reference"] 
-            full_text = mr_text + " " + ref_text
             
-            # Tokenize MR to get masking boundary
-            mr_tokens = self.tokenizer.encode(mr_text + " ", add_special_tokens=False)
-            mr_length = len(mr_tokens)
+            # Use clear separator between MR and reference
+            full_text = mr_text + " \n\n" + ref_text
             
-            # Tokenize full sequence
-            encoding = self.tokenizer(full_text, max_length=SEQUENCE_LENGTH, truncation=True, padding="max_length")
+            # Tokenize
+            encoding = self.tokenizer(
+                full_text, 
+                max_length=SEQUENCE_LENGTH, 
+                truncation=True, 
+                padding="max_length"
+            )
             
-            # Simple masking
-            labels = encoding["input_ids"].copy()
-            labels[:mr_length] = [-100] * mr_length
+            # Find separator position
+            sep_tokens = self.tokenizer.encode("\n\n", add_special_tokens=False)
+            sep_position = None
+            for i in range(len(encoding["input_ids"]) - len(sep_tokens) + 1):
+                if encoding["input_ids"][i:i+len(sep_tokens)] == sep_tokens:
+                    sep_position = i + len(sep_tokens)
+                    break
+            
+            # Create labels (mask MR and separator)
+            labels = [-100] * len(encoding["input_ids"])
+            if sep_position:
+                labels[sep_position:] = encoding["input_ids"][sep_position:]
             
             return {
                 "input_ids": encoding["input_ids"],
                 "attention_mask": encoding["attention_mask"],
                 "labels": labels,
                 "human_reference": example["human_reference"],
-                "meaning_representation": example["meaning_representation"]  # KEEP MR FOR EVALUATION!
+                "meaning_representation": example["meaning_representation"]
             }
 
         
@@ -494,22 +506,40 @@ class SplitLoRATrainer:
         print("Training completed!")
     
     def generate(self, prompt_ids, prompt_attention_mask, max_length=64):
-        """FIXED: Generate continuation from MR prompt"""
+        """FIXED: Generate continuation from MR prompt with proper causal masking"""
         with torch.no_grad():
             try:
                 # Start with the prompt (MR only)
                 generated_ids = prompt_ids.clone()
                 
+                # Initialize attention mask with causal structure
+                current_attention_mask = torch.ones_like(prompt_attention_mask)
+                
                 for step in range(max_length):
                     current_length = generated_ids.size(1)
                     
-                    # Create attention mask for current sequence
-                    current_attention_mask = torch.ones(1, current_length, dtype=torch.float32, device=device)
+                    # Create causal attention mask for current sequence
+                    causal_mask = torch.tril(
+                        torch.ones(current_length, current_length, device=device, dtype=torch.bool)
+                    ).unsqueeze(0)  # Add batch dimension
+                    
+                    # Convert to attention scores format
+                    attention_mask_4d = causal_mask.float()
+                    attention_mask_4d = (1.0 - attention_mask_4d) * -10000.0
                     
                     # Forward through pipeline
-                    head_activations = self.head_client.forward(generated_ids, attention_mask=current_attention_mask)
-                    body_activations = self.server.forward(head_activations, attention_mask=current_attention_mask)
-                    logits = self.tail_client.forward(body_activations, attention_mask=current_attention_mask)
+                    head_activations = self.head_client.forward(
+                        generated_ids, 
+                        attention_mask=attention_mask_4d
+                    )
+                    body_activations = self.server.forward(
+                        head_activations, 
+                        attention_mask=attention_mask_4d
+                    )
+                    logits = self.tail_client.forward(
+                        body_activations, 
+                        attention_mask=attention_mask_4d
+                    )
                     
                     # Greedy decoding
                     next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(-1)
@@ -520,7 +550,7 @@ class SplitLoRATrainer:
                         break
                     if next_token.item() == self.tokenizer.pad_token_id:
                         break
-                
+                    
                 # Extract only generated part (after prompt)
                 generated_tokens = generated_ids[0, prompt_ids.size(1):].tolist()
                 generated_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
@@ -529,6 +559,7 @@ class SplitLoRATrainer:
                 
             except Exception as e:
                 print(f"Generation error: {e}")
+                traceback.print_exc()
                 return "generation failed"
 
 
