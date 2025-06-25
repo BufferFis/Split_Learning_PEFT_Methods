@@ -842,12 +842,37 @@ def main():
     parser.add_argument("--load_checkpoint", type=str, default=None, help="Path to checkpoint to load")
     parser.add_argument("--save_path", type=str, default="./splitlora_checkpoint", help="Path to save checkpoint")
     parser.add_argument("--gpu_device", type=str, default="1", help="GPU device to use")
+    parser.add_argument("--debug", action="store_true", help="Ultra-fast debug mode")  # NEW
     
     args = parser.parse_args()
     
     # Set GPU device
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_device
     
+    # DEBUG MODE
+    if args.debug:
+        print("🐛 STARTING ULTRA-FAST DEBUG MODE")
+        
+        # Initialize trainer
+        trainer = SplitLoRATrainer(learning_rate=1e-4)  # Slightly higher LR for debug
+        
+        # Load tiny dataset
+        train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=True)
+        
+        # Create dataloader with debug settings
+        train_dl = trainer.create_dataloader(train_ds, batch_size=16, shuffle=True, debug_mode=True)
+        
+        # Debug training (10 batches only)
+        avg_loss = trainer.debug_train_and_test(train_dl, max_batches=10)
+        
+        if not math.isnan(avg_loss) and avg_loss > 0:
+            print("✅ Training is working! You can now run full training.")
+        else:
+            print("❌ Training failed - check your implementation.")
+        
+        return
+    
+    # REGULAR MODE (existing code)
     # Initialize trainer
     trainer = SplitLoRATrainer(learning_rate=1e-5)
     
@@ -855,12 +880,12 @@ def main():
     if args.load_checkpoint:
         trainer.load_checkpoint(args.load_checkpoint)
     
-    # Load dataset
-    train_ds, test_ds = trainer.load_e2e_dataset()
+    # Load dataset (regular mode)
+    train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
     
     if not args.eval_only:
         # Create dataloader and train
-        train_dl = trainer.create_dataloader(train_ds, batch_size=args.batch_size, shuffle=True)
+        train_dl = trainer.create_dataloader(train_ds, batch_size=args.batch_size, shuffle=True, debug_mode=False)
         trainer.train(train_dl, epochs=args.epochs)
         
         # Save checkpoint
@@ -877,3 +902,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
