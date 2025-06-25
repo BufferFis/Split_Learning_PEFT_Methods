@@ -16,7 +16,7 @@ import traceback
 from datetime import datetime
 
 # Set GPU device to A1000 (GPU 1)
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
@@ -43,6 +43,22 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             # Add missing generation attributes for PEFT compatibility
             self.generation_config = getattr(original_model, 'generation_config', None)
             self.main_input_name = getattr(original_model, 'main_input_name', 'input_ids')
+            
+            # FIX: Add the missing prepare_inputs_for_generation method
+            if hasattr(original_model, 'prepare_inputs_for_generation'):
+                self.prepare_inputs_for_generation = original_model.prepare_inputs_for_generation
+            else:
+                self.prepare_inputs_for_generation = self._prepare_inputs_for_generation
+                
+            # Add other missing attributes that PEFT might need
+            for attr in ['_get_resized_embeddings', 'get_input_embeddings', 'set_input_embeddings', 
+                        'get_output_embeddings', 'set_output_embeddings', 'resize_token_embeddings']:
+                if hasattr(original_model, attr):
+                    setattr(self, attr, getattr(original_model, attr))
+            
+        def _prepare_inputs_for_generation(self, input_ids, **kwargs):
+            """Default implementation for prepare_inputs_for_generation"""
+            return {"input_ids": input_ids}
             
         def forward(self, input_ids=None, attention_mask=None, output_hidden_states=False, **kwargs):
             inputs_embeds = self.wte(input_ids)
@@ -89,6 +105,22 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             self.generation_config = getattr(original_model, 'generation_config', None)
             self.main_input_name = getattr(original_model, 'main_input_name', 'input_ids')
             
+            # FIX: Add the missing prepare_inputs_for_generation method
+            if hasattr(original_model, 'prepare_inputs_for_generation'):
+                self.prepare_inputs_for_generation = original_model.prepare_inputs_for_generation
+            else:
+                self.prepare_inputs_for_generation = self._prepare_inputs_for_generation
+                
+            # Add other missing attributes that PEFT might need
+            for attr in ['_get_resized_embeddings', 'get_input_embeddings', 'set_input_embeddings', 
+                        'get_output_embeddings', 'set_output_embeddings', 'resize_token_embeddings']:
+                if hasattr(original_model, attr):
+                    setattr(self, attr, getattr(original_model, attr))
+            
+        def _prepare_inputs_for_generation(self, input_ids, **kwargs):
+            """Default implementation for prepare_inputs_for_generation"""
+            return {"input_ids": input_ids}
+            
         def forward(self, hidden_states=None, attention_mask=None, **kwargs):
             if attention_mask is not None and attention_mask.dim() == 2:
                 batch_size, seq_len = attention_mask.shape
@@ -116,6 +148,22 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             # Add missing generation attributes for PEFT compatibility
             self.generation_config = getattr(original_model, 'generation_config', None)
             self.main_input_name = getattr(original_model, 'main_input_name', 'input_ids')
+            
+            # FIX: Add the missing prepare_inputs_for_generation method
+            if hasattr(original_model, 'prepare_inputs_for_generation'):
+                self.prepare_inputs_for_generation = original_model.prepare_inputs_for_generation
+            else:
+                self.prepare_inputs_for_generation = self._prepare_inputs_for_generation
+                
+            # Add other missing attributes that PEFT might need
+            for attr in ['_get_resized_embeddings', 'get_input_embeddings', 'set_input_embeddings', 
+                        'get_output_embeddings', 'set_output_embeddings', 'resize_token_embeddings']:
+                if hasattr(original_model, attr):
+                    setattr(self, attr, getattr(original_model, attr))
+            
+        def _prepare_inputs_for_generation(self, input_ids, **kwargs):
+            """Default implementation for prepare_inputs_for_generation"""
+            return {"input_ids": input_ids}
             
         def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
             hidden_states = inputs_embeds
@@ -274,13 +322,13 @@ class SplitLoRATrainer:
         full_model = AutoModelForCausalLM.from_pretrained(model_name)
         head_model, body_model, tail_model = split_gpt2(full_model, head_layers, tail_layers)
         
-        # Apply LoRA/DoRA
+        # Apply LoRA/DoRA - Now supported with Python 3.11.9!
         lora_config = LoraConfig(
             r=8,
             lora_alpha=16,
             lora_dropout=0.05,
             bias="none",
-            use_dora=True,  # Enable DoRA
+            use_dora=True,  # DoRA is now fully supported!
             task_type="CAUSAL_LM",
             target_modules=["c_attn", "c_proj"]
         )
@@ -581,8 +629,12 @@ def main():
     parser.add_argument("--eval_only", action="store_true", help="Only run evaluation")
     parser.add_argument("--load_checkpoint", type=str, default=None, help="Path to checkpoint to load")
     parser.add_argument("--save_path", type=str, default="./splitlora_checkpoint", help="Path to save checkpoint")
+    parser.add_argument("--gpu_device", type=str, default="1", help="GPU device to use")
     
     args = parser.parse_args()
+    
+    # Set GPU device
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_device
     
     # Initialize trainer
     trainer = SplitLoRATrainer(learning_rate=args.learning_rate)
