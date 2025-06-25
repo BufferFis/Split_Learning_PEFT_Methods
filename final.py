@@ -325,7 +325,8 @@ class SplitLoRATrainer:
         full_model = AutoModelForCausalLM.from_pretrained(model_name)
         head_model, body_model, tail_model = split_gpt2(full_model, head_layers, tail_layers)
         
-        self.DELIM = "<|gen|>"                          # ONE token
+        self.delimiter = "<|gen|>"                          # ONE token
+        self.DELIM = f" {self.delimiter} "
         if self.DELIM not in self.tokenizer.get_vocab():
             self.tokenizer.add_special_tokens(
                 {"additional_special_tokens": [self.DELIM]}
