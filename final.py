@@ -347,12 +347,12 @@ class SplitLoRATrainer:
         
         self.metrics = {"loss": []}
         
-    def load_e2e_dataset(self):
-        """Improved preprocessing with clear separator"""
+    def load_e2e_dataset(self, debug_mode=False):
+        """Improved preprocessing with optional debug mode"""
         dataset = load_dataset("e2e_nlg", trust_remote_code=True)
         
         def preprocess(example):
-            SEQUENCE_LENGTH = 64
+            SEQUENCE_LENGTH = 64  
             
             mr_text = example["meaning_representation"]
             ref_text = example["human_reference"]
@@ -383,16 +383,25 @@ class SplitLoRATrainer:
                 "human_reference": example["human_reference"],
                 "meaning_representation": example["meaning_representation"]
             }
-
         
         train_ds = dataset["train"].map(preprocess, remove_columns=dataset["train"].column_names)
         test_ds = dataset["test"].map(preprocess, remove_columns=dataset["test"].column_names)
+        
+        # DEBUG MODE: Use only tiny subset
+        if debug_mode:
+            print("🐛 DEBUG MODE: Using tiny dataset subset")
+            print(f"   - Sequence length: 32 (instead of 64)")
+            print(f"   - Training samples: 100 (instead of {len(train_ds):,})")
+            print(f"   - Test samples: 20 (instead of {len(test_ds):,})")
+            train_ds = train_ds.select(range(100))  # Only 100 samples!
+            test_ds = test_ds.select(range(20))     # Only 20 samples!
+        
         return train_ds, test_ds
 
 
     
-    def create_dataloader(self, dataset, batch_size=8, shuffle=True):
-        """FIXED: Consistent sequence length"""
+    def create_dataloader(self, dataset, batch_size=8, shuffle=True, debug_mode=False):
+        """FIXED: Consistent sequence length with debug support"""
         def collate_fn(batch):
             FIXED_LENGTH = 64  # Match preprocessing length!
             
@@ -711,6 +720,118 @@ class SplitLoRATrainer:
             print(f"Error loading checkpoint: {e}")
             traceback.print_exc()
             return False
+    
+
+    def debug_generate_sample(self, sample_mr, max_length=64):
+        """Quick generation test during training"""
+        with torch.no_grad():
+            try:
+                # Tokenize the MR
+                input_text = sample_mr + " "
+                encoding = self.tokenizer(input_text, return_tensors="pt", padding=False, truncation=False)
+                input_ids = encoding["input_ids"].to(device)
+                attention_mask = encoding["attention_mask"].to(device)
+                
+                # Generate using your existing generate method but shorter
+                generated_text = self.generate(input_ids, attention_mask, max_length=max_length)
+                
+                return generated_text if generated_text else "[EMPTY]"
+                
+            except Exception as e:
+                return f"[ERROR: {str(e)}]"
+
+    def debug_train_and_test(self, train_dataloader, max_batches=10):
+        """SUPER FAST DEBUG: Train a few batches and test generation"""
+        print(f"🐛 DEBUG TRAINING: Max {max_batches} batches")
+        
+        # Test samples for consistent monitoring
+        test_samples = [
+            ("name[Blue Spice], eatType[coffee shop], area[city centre]", 
+            "Blue Spice is a coffee shop in the city centre."),
+            ("name[Aromi], food[English], area[riverside]", 
+            "Aromi is an English restaurant in the riverside area."),
+        ]
+        
+        # Test initial generation (should be random)
+        print("\n🔬 INITIAL GENERATION TEST (should be random):")
+        for mr, expected in test_samples:
+            generated = self.debug_generate_sample(mr, max_length=16)
+            print(f"  MR: {mr}")
+            print(f"  Generated: {generated}")
+            print("---")
+        
+        total_loss = 0.0
+        num_batches = 0
+        
+        for batch_idx, batch in enumerate(tqdm(train_dataloader, desc="Debug Training")):
+            if batch_idx >= max_batches:  # Stop after max_batches
+                break
+                
+            try:
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                labels = batch["labels"].to(device)
+                
+                # Check for NaN inputs
+                if torch.isnan(input_ids.float()).any() or torch.isnan(labels.float()).any():
+                    print(f"❌ NaN inputs in batch {batch_idx}")
+                    continue
+                
+                # Forward through pipeline
+                head_activations = self.head_client.forward(input_ids, attention_mask)
+                body_activations, stored_head_activations = self.server.forward_train(
+                    head_activations, attention_mask
+                )
+                loss, body_grad = self.tail_client.compute_loss_and_backward(
+                    body_activations, labels, attention_mask
+                )
+                
+                # Check for NaN loss
+                if math.isnan(loss):
+                    print(f"❌ NaN loss at batch {batch_idx}")
+                    continue
+                
+                # Backward through body and head
+                head_grad = self.server.backward(body_activations, body_grad, stored_head_activations)
+                self.head_client.backward(head_activations, head_grad)
+                
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(self.head_client.head_model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(self.tail_client.tail_model.parameters(), max_norm=1.0)
+                
+                total_loss += loss
+                num_batches += 1
+                
+                print(f"✅ Batch {batch_idx}, Loss: {loss:.4f}")
+                
+            except Exception as e:
+                print(f"❌ Training error at batch {batch_idx}: {e}")
+                continue
+        
+        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+        print(f"\n🐛 Debug training completed! Average loss: {avg_loss:.4f}")
+        
+        # Test post-training generation
+        print("\n🔬 POST-TRAINING GENERATION TEST:")
+        for mr, expected in test_samples:
+            generated = self.debug_generate_sample(mr, max_length=16)
+            print(f"  MR: {mr}")
+            print(f"  Expected: {expected}")
+            print(f"  Generated: {generated}")
+            
+            # Quick quality check
+            if generated == "[EMPTY]":
+                print("  ❌ EMPTY - Model broken!")
+            elif "wiz" in generated.lower() or "mcgee" in generated.lower():
+                print("  ❌ REPETITIVE TOKENS - Model collapsed!")
+            elif len(set(generated.split())) <= 2:
+                print("  ❌ TOO REPETITIVE")
+            else:
+                print("  ✅ Shows variety")
+            print("---")
+        
+        return avg_loss
+
 
 def main():
     parser = argparse.ArgumentParser(description="SplitLoRA Single File Implementation")
