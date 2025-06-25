@@ -396,7 +396,8 @@ class SplitLoRATrainer:
                 "input_ids": encoding["input_ids"],
                 "attention_mask": encoding["attention_mask"],
                 "labels": labels,
-                "human_reference": example["human_reference"]
+                "human_reference": example["human_reference"],
+                "meaning_representation": example["meaning_representation"]  # KEEP MR FOR EVALUATION!
             }
 
         
@@ -492,44 +493,25 @@ class SplitLoRATrainer:
         
         print("Training completed!")
     
-    def generate(self, prompt_ids, attention_mask, max_length=64):
-        """FIXED: Proper conditioning + causal masking + greedy decoding"""
+    def generate(self, prompt_ids, prompt_attention_mask, max_length=64):
+        """FIXED: Generate continuation from MR prompt"""
         with torch.no_grad():
             try:
-                 # Find where MR ends (look for common patterns)
-                input_text = self.tokenizer.decode(prompt_ids[0], skip_special_tokens=True)
-                
-                # Simple approach: split on "] " (end of MR attributes)
-                if "] " in input_text:
-                    mr_part = input_text.split("] ")[-1]  # Get last part after ]
-                    condition_end = len(self.tokenizer.encode(input_text.replace(mr_part, ""), add_special_tokens=False))
-                else:
-                    condition_end = len(prompt_ids[0]) // 2  # Fallback
-                
-                # Start generation from condition end
-                generated_ids = prompt_ids[:, :condition_end].clone()
+                # Start with the prompt (MR only)
+                generated_ids = prompt_ids.clone()
                 
                 for step in range(max_length):
                     current_length = generated_ids.size(1)
                     
-                    # FIXED: Create proper causal attention mask
-                    causal_mask = torch.tril(torch.ones(
-                        current_length, current_length,
-                        dtype=torch.bool, device=device
-                    ))
-                    
-                    # Convert to attention mask format
-                    current_attention_mask = causal_mask.unsqueeze(0).float()
-                    current_attention_mask = current_attention_mask.masked_fill(
-                        ~causal_mask.unsqueeze(0), -10000.0
-                    )
+                    # Create attention mask for current sequence
+                    current_attention_mask = torch.ones(1, current_length, dtype=torch.float32, device=device)
                     
                     # Forward through pipeline
-                    head_activations = self.head_client.forward(generated_ids, current_attention_mask)
-                    body_activations = self.server.forward(head_activations, current_attention_mask)
-                    logits = self.tail_client.forward(body_activations, current_attention_mask)
+                    head_activations = self.head_client.forward(generated_ids, attention_mask=current_attention_mask)
+                    body_activations = self.server.forward(head_activations, attention_mask=current_attention_mask)
+                    logits = self.tail_client.forward(body_activations, attention_mask=current_attention_mask)
                     
-                    # FIXED: Greedy decoding (deterministic)
+                    # Greedy decoding
                     next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(-1)
                     generated_ids = torch.cat([generated_ids, next_token], dim=1)
                     
@@ -539,18 +521,16 @@ class SplitLoRATrainer:
                     if next_token.item() == self.tokenizer.pad_token_id:
                         break
                 
-                # Extract only generated part (after condition)
-                if generated_ids.size(1) > condition_end:
-                    generated_part = generated_ids[0, condition_end:]
-                    generated_text = self.tokenizer.decode(generated_part, skip_special_tokens=True).strip()
-                else:
-                    generated_text = ""
+                # Extract only generated part (after prompt)
+                generated_tokens = generated_ids[0, prompt_ids.size(1):].tolist()
+                generated_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
                 
                 return generated_text if generated_text else "no output"
                 
             except Exception as e:
                 print(f"Generation error: {e}")
                 return "generation failed"
+
 
     
     def evaluate(self, test_dataset):
@@ -566,18 +546,21 @@ class SplitLoRATrainer:
             failed_generations = 0
             
             # Sample evaluation data
-            eval_samples = test_dataset.select(range(min(50, len(test_dataset))))  # Reduced for debugging
+            eval_samples = test_dataset.select(range(min(50, len(test_dataset))))
             
             for i, sample in enumerate(tqdm(eval_samples, desc="Evaluating")):
                 try:
-                    if not isinstance(sample, dict) or "input_ids" not in sample:
-                        continue
+                    # FIXED: Use only MR for generation
+                    mr_text = sample["meaning_representation"]
+                    input_text = mr_text + " "  # Format as in training
                     
-                    input_ids = torch.tensor(sample["input_ids"]).unsqueeze(0).to(device)
-                    attention_mask = torch.tensor(sample["attention_mask"]).unsqueeze(0).to(device)
+                    # Tokenize only the MR
+                    encoding = self.tokenizer(input_text, return_tensors="pt", padding=False, truncation=False)
+                    input_ids = encoding["input_ids"].to(device)
+                    attention_mask = encoding["attention_mask"].to(device)
                     
-                    # Generate prediction
-                    generated_text = self.generate(input_ids, attention_mask, max_length=32)
+                    # Generate prediction from MR only
+                    generated_text = self.generate(input_ids, attention_mask, max_length=64)
                     
                     # FIX: Check for valid generation
                     if generated_text and len(generated_text.strip()) > 0:
@@ -585,14 +568,13 @@ class SplitLoRATrainer:
                         refs.append([sample["human_reference"]])
                     else:
                         failed_generations += 1
-                        # Add placeholder to avoid empty lists
                         preds.append("empty")
                         refs.append([sample["human_reference"]])
                     
                     # Debug first few samples
                     if i < 3:
                         print(f"\nSample {i}:")
-                        print(f"Input: {self.tokenizer.decode(sample['input_ids'], skip_special_tokens=True)}")
+                        print(f"MR Input: {mr_text}")  # Show only MR
                         print(f"Reference: {sample['human_reference']}")
                         print(f"Generated: {generated_text}")
                         print("---")
