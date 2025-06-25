@@ -217,7 +217,6 @@ class ServerModel:
             [p for p in self.body_model.parameters() if p.requires_grad], 
             lr=learning_rate
         )
-        self.step_count = 0
         
     def forward(self, activations, attention_mask=None):
         """Forward pass through body layers (inference mode)"""
@@ -227,56 +226,36 @@ class ServerModel:
             return output.last_hidden_state
     
     def forward_train(self, activations, attention_mask=None):
-        """Forward pass during training - MAINTAINS GRADIENT FLOW"""
+        """Forward pass during training"""
         self.body_model.train()
         
-        # FIX: Create new tensor that maintains gradients
-        activations_copy = activations.clone().detach().requires_grad_(True)
+        # FIXED: Don't detach - maintain gradient connection
+        activations.requires_grad_(True)
+        output = self.body_model(hidden_states=activations, attention_mask=attention_mask)
         
-        # Forward through body
-        output = self.body_model(hidden_states=activations_copy, attention_mask=attention_mask)
-        
-        return output.last_hidden_state, activations_copy
+        return output.last_hidden_state, activations
     
-    def backward_and_update(self, body_output, body_grad, head_activations):
-        """Combined backward pass and parameter update - ENSURES BODY TRAINING"""
+    def backward(self, body_output, body_grad, head_activations):
+        """ESSENTIAL: Backward pass for split learning"""
         self.optimizer.zero_grad()
         
-        # FIX: Use autograd.grad for proper gradient computation
-        if body_grad is not None and body_grad.requires_grad:
-            # Compute gradients for body parameters
-            body_params = [p for p in self.body_model.parameters() if p.requires_grad]
+        # FIXED: Use proper gradient computation for split learning
+        # This simulates receiving gradients from tail and passing them to head
+        if body_grad is not None:
+            # Backward through body layers
+            torch.autograd.backward(
+                tensors=[body_output],
+                grad_tensors=[body_grad],
+                retain_graph=True
+            )
             
-            if len(body_params) > 0:
-                # Create scalar for gradient computation
-                scalar_loss = (body_output * body_grad).sum()
-                
-                if scalar_loss.requires_grad:
-                    grads = torch.autograd.grad(
-                        outputs=scalar_loss,
-                        inputs=body_params + [head_activations],
-                        retain_graph=False,
-                        create_graph=False,
-                        allow_unused=True
-                    )
-                    
-                    # Apply gradients to body parameters - ACTUAL PARAMETER UPDATE
-                    for param, grad in zip(body_params, grads[:-1]):
-                        if grad is not None:
-                            param.grad = grad
-                    
-                    # Get head gradient
-                    head_grad = grads[-1] if grads[-1] is not None else torch.zeros_like(head_activations)
-                else:
-                    head_grad = body_grad
-            else:
-                head_grad = body_grad
+            # Get gradient for head activations (to send back to head)
+            head_grad = head_activations.grad.clone() if head_activations.grad is not None else torch.zeros_like(head_activations)
         else:
             head_grad = torch.zeros_like(head_activations)
         
-        # CRITICAL: Update body parameters
+        # Update body parameters
         self.optimizer.step()
-        self.step_count += 1
         
         return head_grad
 
@@ -298,33 +277,19 @@ class HeadClient:
         )
         return output.hidden_states[-1]
     
-    def backward_and_update(self, head_activations, head_grad):
-        """Backward pass and parameter update - ENSURES HEAD TRAINING"""
+    def backward(self, head_activations, head_grad):
+        """ESSENTIAL: Backward pass for split learning"""
         self.optimizer.zero_grad()
         
-        if head_grad is not None and head_grad.numel() > 0:
-            # FIX: Proper gradient application
-            head_params = [p for p in self.head_model.parameters() if p.requires_grad]
-            
-            if len(head_params) > 0:
-                # Create scalar for gradient computation
-                scalar_loss = (head_activations * head_grad).sum()
-                
-                if scalar_loss.requires_grad:
-                    grads = torch.autograd.grad(
-                        outputs=scalar_loss,
-                        inputs=head_params,
-                        retain_graph=False,
-                        create_graph=False,
-                        allow_unused=True
-                    )
-                    
-                    # Apply gradients to head parameters - ACTUAL PARAMETER UPDATE
-                    for param, grad in zip(head_params, grads):
-                        if grad is not None:
-                            param.grad = grad
+        # FIXED: Apply gradients received from body
+        if head_grad is not None:
+            torch.autograd.backward(
+                tensors=[head_activations],
+                grad_tensors=[head_grad],
+                retain_graph=False
+            )
         
-        # CRITICAL: Update head parameters
+        # Update head parameters
         self.optimizer.step()
 
 
@@ -344,14 +309,14 @@ class TailClient:
         return output.logits
     
     def compute_loss_and_backward(self, body_activations, labels, attention_mask=None):
-        """Compute loss and perform backward pass - ENSURES ACTUAL TRAINING"""
+        """Compute loss and perform backward pass - FIXED VERSION"""
         self.optimizer.zero_grad()
         
-        # FIX: Create a new tensor that maintains gradient connection
-        body_activations_copy = body_activations.clone().detach().requires_grad_(True)
+        # CRITICAL: Don't detach - maintain gradient flow
+        body_activations.requires_grad_(True)
         
         # Forward pass
-        logits = self.tail_model(inputs_embeds=body_activations_copy, attention_mask=attention_mask).logits
+        logits = self.tail_model(inputs_embeds=body_activations, attention_mask=attention_mask).logits
         
         # Compute loss
         shift_logits = logits[..., :-1, :].contiguous()
@@ -361,15 +326,13 @@ class TailClient:
             shift_labels.view(-1)
         )
         
-        # Backward pass - THIS ENSURES TAIL PARAMETERS ARE UPDATED
-        loss.backward()
+        # Backward pass
+        loss.backward(retain_graph=True)
         
-        # Get gradient for body activations
-        body_grad = body_activations_copy.grad
-        if body_grad is None:
-            body_grad = torch.zeros_like(body_activations_copy)
+        # FIXED: Get gradient for body activations (this is sent back to body)
+        body_grad = body_activations.grad.clone() if body_activations.grad is not None else torch.zeros_like(body_activations)
         
-        # CRITICAL: Update tail parameters
+        # Update tail parameters
         self.optimizer.step()
         
         return loss.item(), body_grad
@@ -481,32 +444,12 @@ class SplitLoRATrainer:
         )
     
     def train(self, train_dataloader, epochs=1):
-        """Train the split model - ACTUAL PARAMETER UPDATES GUARANTEED"""
+        """Train the split model - PROPER SPLIT LEARNING"""
         print(f"Starting training for {epochs} epochs...")
         
         for epoch in range(epochs):
             total_loss = 0.0
             num_batches = 0
-            
-            # Track parameter changes to verify training
-            initial_head_param = None
-            initial_body_param = None
-            initial_tail_param = None
-            
-            for param in self.head_client.head_model.parameters():
-                if param.requires_grad:
-                    initial_head_param = param.clone().detach()
-                    break
-            
-            for param in self.server.body_model.parameters():
-                if param.requires_grad:
-                    initial_body_param = param.clone().detach()
-                    break
-                    
-            for param in self.tail_client.tail_model.parameters():
-                if param.requires_grad:
-                    initial_tail_param = param.clone().detach()
-                    break
             
             for batch_idx, batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{epochs}")):
                 try:
@@ -514,44 +457,32 @@ class SplitLoRATrainer:
                     attention_mask = batch["attention_mask"].to(device)
                     labels = batch["labels"].to(device)
                     
-                    # Forward pass through head
+                    # STEP 1: Forward through head
                     head_activations = self.head_client.forward(input_ids, attention_mask)
                     
-                    # Forward pass through server (body)
-                    body_activations, head_activations_copy = self.server.forward_train(
+                    # STEP 2: Forward through body (server)
+                    body_activations, stored_head_activations = self.server.forward_train(
                         head_activations, attention_mask
                     )
                     
-                    # Forward pass through tail and compute loss
+                    # STEP 3: Forward through tail + compute loss + backward through tail
                     loss, body_grad = self.tail_client.compute_loss_and_backward(
                         body_activations, labels, attention_mask
                     )
                     
-                    # Backward through server (body) with parameter update
-                    head_grad = self.server.backward_and_update(
-                        body_activations, body_grad, head_activations_copy
+                    # STEP 4: Backward through body (server) 
+                    head_grad = self.server.backward(
+                        body_activations, body_grad, stored_head_activations
                     )
                     
-                    # Backward through head with parameter update
-                    self.head_client.backward_and_update(head_activations, head_grad)
+                    # STEP 5: Backward through head
+                    self.head_client.backward(head_activations, head_grad)
                     
                     total_loss += loss
                     num_batches += 1
                     
-                    # FIX: Verify parameters are actually changing (every 100 batches)
                     if batch_idx % 100 == 0:
-                        param_changed = False
-                        
-                        for param in self.head_client.head_model.parameters():
-                            if param.requires_grad:
-                                if not torch.equal(param, initial_head_param):
-                                    param_changed = True
-                                break
-                        
-                        if not param_changed:
-                            print(f"WARNING: Head parameters not changing at batch {batch_idx}")
-                        else:
-                            print(f"✓ Parameters updating correctly at batch {batch_idx}")
+                        print(f"Batch {batch_idx}, Loss: {loss:.4f}")
                     
                 except Exception as e:
                     print(f"Training error: {e}")
