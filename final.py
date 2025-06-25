@@ -392,8 +392,8 @@ class SplitLoRATrainer:
         if debug_mode:
             print("🐛 DEBUG MODE: Using tiny dataset subset")
             print(f"   - Sequence length: 64")
-            print(f"   - Training samples: 1000 (instead of {len(train_ds):,})")
-            print(f"   - Test samples: 100 (instead of {len(test_ds):,})")
+            print(f"   - Training samples: 2000 (instead of {len(train_ds):,})")
+            print(f"   - Test samples: 200 (instead of {len(test_ds):,})")
             train_ds = train_ds.select(range(2000))  # Only 2000 samples!
             test_ds = test_ds.select(range(200))     # Only 200 samples!
         
@@ -754,6 +754,7 @@ class SplitLoRATrainer:
 
     def debug_train_and_test(self, train_dataloader, max_batches=50):
         """SUPER FAST DEBUG: Train a few batches and test generation"""
+        max_batches = 50
         print(f"🐛 DEBUG TRAINING: Max {max_batches} batches")
         
         # Test samples for consistent monitoring
