@@ -408,29 +408,35 @@ class SplitLoRATrainer:
         self.metrics = {"loss": []}
         
     def load_e2e_dataset(self):
-        """Load and preprocess E2E NLG dataset"""
         dataset = load_dataset("e2e_nlg", trust_remote_code=True)
         
         def preprocess(example):
-            text = example["meaning_representation"] + " " + example["human_reference"]
-            enc = self.tokenizer(
-                text,
-                padding="max_length",
+            # FIXED: Separate input and target
+            input_enc = self.tokenizer(
+                example["meaning_representation"],
+                max_length=64,
                 truncation=True,
-                max_length=128,
+                padding="max_length",
                 return_attention_mask=True
             )
+            target_enc = self.tokenizer(
+                example["human_reference"], 
+                max_length=64,
+                truncation=True,
+                padding="max_length"
+            )
             return {
-                "input_ids": enc["input_ids"],
-                "attention_mask": enc["attention_mask"],
-                "labels": enc["input_ids"],
+                "input_ids": input_enc["input_ids"],
+                "attention_mask": input_enc["attention_mask"],
+                "labels": target_enc["input_ids"],
                 "human_reference": example["human_reference"]
             }
         
         train_ds = dataset["train"].map(preprocess, remove_columns=dataset["train"].column_names)
-        test_ds = dataset["test"].map(preprocess, remove_columns=dataset["test"].column_names)
-        
+        test_ds = dataset["test"].map(preprocess, remove_columns=dataset["test"].column_names) 
         return train_ds, test_ds
+
+
     
     def create_dataloader(self, dataset, batch_size=8, shuffle=True):
         """Create DataLoader with proper collation"""
@@ -557,46 +563,30 @@ class SplitLoRATrainer:
         
         print("Training completed!")
     
-    def generate(self, input_ids, attention_mask, max_length=128):
-        """Generate text using the split model"""
+    def generate(self, prompt_ids, attention_mask, max_length=128):
+        """Generate from meaning representation only"""
         with torch.no_grad():
-            try:
-                if input_ids.dim() == 1:
-                    input_ids = input_ids.unsqueeze(0)
-                if attention_mask.dim() == 1:
-                    attention_mask = attention_mask.unsqueeze(0)
-                
-                generated_ids = input_ids.clone()
-                
-                for step in range(min(max_length - input_ids.size(1), 32)):
-                    current_attention_mask = torch.ones(
-                        generated_ids.size(0),
-                        generated_ids.size(1),
-                        dtype=torch.float32,
-                        device=device
-                    )
-                    
-                    # Forward through head
-                    head_activations = self.head_client.forward(generated_ids, current_attention_mask)
-                    
-                    # Forward through server
-                    body_activations = self.server.forward(head_activations, current_attention_mask)
-                    
-                    # Forward through tail
-                    logits = self.tail_client.forward(body_activations, current_attention_mask)
-                    
-                    # Get next token
-                    next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(-1)
-                    generated_ids = torch.cat([generated_ids, next_token], dim=1)
-                    
-                    if next_token.item() == self.tokenizer.eos_token_id:
-                        break
-                
-                return self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+            generated_ids = prompt_ids.clone()
             
-            except Exception as e:
-                print(f"Generation error: {e}")
-                return "Generation failed"
+            for step in range(max_length - prompt_ids.size(1)):
+                # Your split forward logic here
+                head_activations = self.head_client.forward(generated_ids, attention_mask)
+                body_activations = self.server.forward(head_activations, attention_mask) 
+                logits = self.tail_client.forward(body_activations, attention_mask)
+                
+                next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(-1)
+                generated_ids = torch.cat([generated_ids, next_token], dim=1)
+                
+                if next_token.item() == self.tokenizer.eos_token_id:
+                    break
+                    
+            # Return only the generated part (excluding prompt)
+            generated_text = self.tokenizer.decode(
+                generated_ids[0, prompt_ids.size(1):], 
+                skip_special_tokens=True
+            )
+            return generated_text
+
     
     def evaluate(self, test_dataset):
         """Evaluate model using SplitLoRA paper metrics"""
