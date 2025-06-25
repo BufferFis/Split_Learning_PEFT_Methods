@@ -319,6 +319,13 @@ class SplitLoRATrainer:
     """Main trainer class combining all components"""
     def __init__(self, model_name="gpt2", head_layers=2, tail_layers=2, learning_rate=2e-4):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.DELIM = "<|gen|>"                          # ONE token
+        if self.DELIM not in self.tokenizer.get_vocab():
+            self.tokenizer.add_special_tokens(
+                {"additional_special_tokens": [self.DELIM]}
+            )
+            full_model.resize_token_embeddings(len(self.tokenizer))
+        
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         
@@ -358,11 +365,11 @@ class SplitLoRATrainer:
             mr_text = example["meaning_representation"]
             ref_text = example["human_reference"]
             
-            delimiter = " <gen> "                               # ONE token for GPT-2
-            full_text = mr_text + delimiter + ref_text          # instead of mr + " " + ref
+                                       
+            full_text = mr_text + self.delimiter + ref_text          
             
             # Get MR length for masking
-            mr_tokens = self.tokenizer.encode(mr_text + delimiter, add_special_tokens=False)
+            mr_tokens = self.tokenizer.encode(mr_text + self.delimiter, add_special_tokens=False)
             
             
             # Tokenize full sequence
@@ -375,7 +382,9 @@ class SplitLoRATrainer:
             
             # Simple masking
             labels = encoding["input_ids"].copy()
-            labels[: len(mr_tokens)] = [-100] * len(mr_tokens)
+            mr_tokens = tokenizer.encode(mr_text + delimiter, add_special_tokens=False)
+            labels[:len(mr_tokens)] = [-100] * len(mr_tokens)
+
             
             return {
                 "input_ids": encoding["input_ids"],
@@ -580,8 +589,8 @@ class SplitLoRATrainer:
                 try:
                     mr_text = sample["meaning_representation"]
 
-                    delimiter   = " <gen> "
-                    prompt_text = mr_text + delimiter  
+                    
+                    prompt_text = mr_text + self.delimiter  
                     
                     # Tokenize only the MR
                     encoding = self.tokenizer(prompt_text, return_tensors="pt", padding=False, truncation=False)
@@ -738,8 +747,8 @@ class SplitLoRATrainer:
         with torch.no_grad():
             try:
                 # Tokenize the MR
-                delimiter = " <gen> "               # SAME delimiter as above
-                prompt = sample_mr + delimiter
+                              # SAME delimiter as above
+                prompt = sample_mr + self.delimiter
                 encoding = self.tokenizer(prompt, return_tensors="pt", padding=False, truncation=False)
                 input_ids = encoding["input_ids"].to(device)
                 attention_mask = encoding["attention_mask"].to(device)
