@@ -411,17 +411,18 @@ class SplitLoRATrainer:
         dataset = load_dataset("e2e_nlg", trust_remote_code=True)
         
         def preprocess(example):
+            SEQUENCE_LENGTH = 64
             # FIXED: Separate input and target
             input_enc = self.tokenizer(
                 example["meaning_representation"],
-                max_length=64,
+                max_length=SEQUENCE_LENGTH,
                 truncation=True,
                 padding="max_length",
                 return_attention_mask=True
             )
             target_enc = self.tokenizer(
                 example["human_reference"], 
-                max_length=64,
+                max_length=SEQUENCE_LENGTH,
                 truncation=True,
                 padding="max_length"
             )
@@ -441,7 +442,7 @@ class SplitLoRATrainer:
     def create_dataloader(self, dataset, batch_size=8, shuffle=True):
         """Create DataLoader with proper collation"""
         def collate_fn(batch):
-            FIXED_LENGTH = 128
+            FIXED_LENGTH = 64
             input_ids_batch = []
             attention_mask_batch = []
             labels_batch = []
@@ -563,44 +564,81 @@ class SplitLoRATrainer:
         
         print("Training completed!")
     
-    def generate(self, prompt_ids, attention_mask, max_length=128):
-        """Generate from meaning representation only"""
+    def generate(self, prompt_ids, attention_mask, max_length=64):
+        """Generate from meaning representation only - FIXED VERSION"""
         with torch.no_grad():
-            generated_ids = prompt_ids.clone()
-            
-            for step in range(max_length - prompt_ids.size(1)):
-                # Your split forward logic here
-                head_activations = self.head_client.forward(generated_ids, attention_mask)
-                body_activations = self.server.forward(head_activations, attention_mask) 
-                logits = self.tail_client.forward(body_activations, attention_mask)
+            try:
+                if prompt_ids.dim() == 1:
+                    prompt_ids = prompt_ids.unsqueeze(0)
                 
-                next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(-1)
-                generated_ids = torch.cat([generated_ids, next_token], dim=1)
+                generated_ids = prompt_ids.clone()
+                prompt_length = prompt_ids.size(1)
                 
-                if next_token.item() == self.tokenizer.eos_token_id:
-                    break
+                # Debug: Print input
+                input_text = self.tokenizer.decode(prompt_ids[0], skip_special_tokens=True)
+                print(f"Input: '{input_text}'")
+                
+                for step in range(max_length):
+                    current_length = generated_ids.size(1)
                     
-            # Return only the generated part (excluding prompt)
-            generated_text = self.tokenizer.decode(
-                generated_ids[0, prompt_ids.size(1):], 
-                skip_special_tokens=True
-            )
-            return generated_text
+                    # FIX: Create proper attention mask for current sequence
+                    current_attention_mask = torch.ones(
+                        generated_ids.size(0), current_length,
+                        dtype=torch.float32, device=device
+                    )
+                    
+                    # Split forward pass
+                    head_activations = self.head_client.forward(generated_ids, current_attention_mask)
+                    body_activations = self.server.forward(head_activations, current_attention_mask)
+                    logits = self.tail_client.forward(body_activations, current_attention_mask)
+                    
+                    # Get next token (use sampling for better generation)
+                    next_token_logits = logits[:, -1, :]
+                    next_token = torch.multinomial(torch.softmax(next_token_logits, dim=-1), 1)
+                    
+                    generated_ids = torch.cat([generated_ids, next_token], dim=1)
+                    
+                    # Stop conditions
+                    if next_token.item() == self.tokenizer.eos_token_id:
+                        break
+                    if next_token.item() == self.tokenizer.pad_token_id:
+                        break
+                
+                # Extract only generated part (excluding prompt)
+                if generated_ids.size(1) > prompt_length:
+                    generated_part = generated_ids[0, prompt_length:]
+                    generated_text = self.tokenizer.decode(generated_part, skip_special_tokens=True).strip()
+                else:
+                    generated_text = ""
+                
+                # Debug: Print output
+                print(f"Generated: '{generated_text}'")
+                
+                # FIX: Ensure we return something meaningful
+                if not generated_text or len(generated_text.strip()) == 0:
+                    generated_text = "no output generated"
+                
+                return generated_text
+                
+            except Exception as e:
+                print(f"Generation error: {e}")
+                return "generation failed"
 
     
     def evaluate(self, test_dataset):
-        """Evaluate model using SplitLoRA paper metrics"""
+        """Evaluate model with proper error handling"""
         print("Starting evaluation...")
         
         try:
-            # Load metrics as used in SplitLoRA paper
+            # Load metrics
             bleu_metric = load_metric("bleu")
             meteor_metric = load_metric("meteor")
             
             preds, refs = [], []
+            failed_generations = 0
             
             # Sample evaluation data
-            eval_samples = test_dataset.select(range(min(100, len(test_dataset))))
+            eval_samples = test_dataset.select(range(min(50, len(test_dataset))))  # Reduced for debugging
             
             for i, sample in enumerate(tqdm(eval_samples, desc="Evaluating")):
                 try:
@@ -611,44 +649,89 @@ class SplitLoRATrainer:
                     attention_mask = torch.tensor(sample["attention_mask"]).unsqueeze(0).to(device)
                     
                     # Generate prediction
-                    generated_text = self.generate(input_ids, attention_mask)
-                    preds.append(generated_text)
-                    refs.append([sample["human_reference"]])
+                    generated_text = self.generate(input_ids, attention_mask, max_length=32)
+                    
+                    # FIX: Check for valid generation
+                    if generated_text and len(generated_text.strip()) > 0:
+                        preds.append(generated_text.strip())
+                        refs.append([sample["human_reference"]])
+                    else:
+                        failed_generations += 1
+                        # Add placeholder to avoid empty lists
+                        preds.append("empty")
+                        refs.append([sample["human_reference"]])
+                    
+                    # Debug first few samples
+                    if i < 3:
+                        print(f"\nSample {i}:")
+                        print(f"Input: {self.tokenizer.decode(sample['input_ids'], skip_special_tokens=True)}")
+                        print(f"Reference: {sample['human_reference']}")
+                        print(f"Generated: {generated_text}")
+                        print("---")
                     
                 except Exception as e:
                     print(f"Error processing sample {i}: {e}")
+                    failed_generations += 1
                     continue
             
-            if not preds:
+            print(f"Failed generations: {failed_generations}/{len(eval_samples)}")
+            
+            if not preds or len([p for p in preds if p != "empty"]) == 0:
                 print("No valid predictions generated")
                 return {"bleu": 0.0, "meteor": 0.0, "error": "No valid samples"}
             
-            # Calculate metrics
+            # FIX: Filter out empty predictions for metric calculation
+            valid_preds = []
+            valid_refs = []
+            for pred, ref in zip(preds, refs):
+                if pred != "empty" and len(pred.strip()) > 0:
+                    valid_preds.append(pred)
+                    valid_refs.append(ref)
+            
+            if not valid_preds:
+                return {"bleu": 0.0, "meteor": 0.0, "error": "No valid predictions after filtering"}
+            
+            print(f"Computing metrics on {len(valid_preds)} valid predictions...")
+            
+            # Calculate metrics with error handling
             try:
-                bleu_score = bleu_metric.compute(predictions=preds, references=refs)
-                meteor_score = meteor_metric.compute(predictions=preds, references=[r[0] for r in refs])
-                
+                # FIX: Add smoothing for BLEU to handle edge cases
+                bleu_score = bleu_metric.compute(
+                    predictions=valid_preds, 
+                    references=valid_refs,
+                    smooth=True  # Enable smoothing
+                )
                 bleu_value = bleu_score.get('bleu', 0.0) if isinstance(bleu_score, dict) else 0.0
+            except Exception as bleu_error:
+                print(f"BLEU computation failed: {bleu_error}")
+                bleu_value = 0.0
+            
+            try:
+                meteor_score = meteor_metric.compute(
+                    predictions=valid_preds, 
+                    references=[r[0] for r in valid_refs]
+                )
                 meteor_value = meteor_score.get('meteor', 0.0) if isinstance(meteor_score, dict) else 0.0
-                
-                print(f"BLEU Score: {bleu_value:.4f}")
-                print(f"METEOR Score: {meteor_value:.4f}")
-                
-                results = {
-                    "bleu": bleu_value,
-                    "meteor": meteor_value,
-                    "num_samples": len(preds)
-                }
-                
-                return results
-                
-            except Exception as eval_error:
-                print(f"Evaluation metric error: {eval_error}")
-                return {"bleu": 0.0, "meteor": 0.0, "error": str(eval_error)}
-                
+            except Exception as meteor_error:
+                print(f"METEOR computation failed: {meteor_error}")
+                meteor_value = 0.0
+            
+            print(f"BLEU Score: {bleu_value:.4f}")
+            print(f"METEOR Score: {meteor_value:.4f}")
+            
+            results = {
+                "bleu": bleu_value,
+                "meteor": meteor_value,
+                "num_samples": len(valid_preds),
+                "failed_generations": failed_generations
+            }
+            
+            return results
+            
         except Exception as e:
             print(f"Evaluation error: {e}")
-            return None
+            traceback.print_exc()
+            return {"bleu": 0.0, "meteor": 0.0, "error": str(e)}
     
     def save_checkpoint(self, path="./splitlora_checkpoint"):
         """Save model and optimizer states"""
