@@ -860,7 +860,7 @@ def main():
         train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=True)
         
         # Create dataloader with debug settings
-        train_dl = trainer.create_dataloader(train_ds, batch_size=16, shuffle=True, debug_mode=True)
+        train_dl = trainer.create_dataloader(train_ds, batch_size=4, shuffle=True, debug_mode=True)
         
         # Debug training (10 batches only)
         avg_loss = trainer.debug_train_and_test(train_dl, max_batches=10)
