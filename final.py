@@ -367,12 +367,9 @@ class SplitLoRATrainer:
             mr_text = example["meaning_representation"]
             ref_text = example["human_reference"]
             
-            delimiter = f" {self.DELIM} "
+            space_delim = " " + self.DELIM + " "
 
-            full_text = mr_text + delimiter + ref_text          
-            
-            # Get MR length for masking
-            
+            full_text = mr_text + space_delim + ref_text          
             
             
             # Tokenize full sequence
@@ -385,7 +382,7 @@ class SplitLoRATrainer:
             
             # Simple masking
             labels = encoding["input_ids"].copy()
-            mr_tokens = self.tokenizer.encode(mr_text + delimiter, add_special_tokens=False)
+            mr_tokens = self.tokenizer.encode(mr_text + space_delim, add_special_tokens=False)
             labels[:len(mr_tokens)] = [-100] * len(mr_tokens)
 
             
@@ -592,8 +589,8 @@ class SplitLoRATrainer:
                 try:
                     mr_text = sample["meaning_representation"]
 
-                    delimiter = f" {self.DELIM} "
-                    prompt_text = mr_text + delimiter 
+                    space_delim = " " + self.DELIM + " "
+                    prompt_text = mr_text + space_delim 
                     
                     # Tokenize only the MR
                     encoding = self.tokenizer(prompt_text, return_tensors="pt", padding=False, truncation=False)
@@ -751,8 +748,8 @@ class SplitLoRATrainer:
             try:
                 # Tokenize the MR
                               # SAME delimiter as above
-                delimiter = f" {self.DELIM} "
-                prompt = sample_mr + delimiter
+                space_delim = " " + self.DELIM + " "
+                prompt = sample_mr + space_delim
                 encoding = self.tokenizer(prompt, return_tensors="pt", padding=False, truncation=False)
                 input_ids = encoding["input_ids"].to(device)
                 attention_mask = encoding["attention_mask"].to(device)
