@@ -368,10 +368,10 @@ class SplitLoRATrainer:
             ref_text = example["human_reference"]
             
                                        
-            full_text = mr_text + self.delimiter + ref_text          
+            full_text = mr_text + self.DELIM + ref_text          
             
             # Get MR length for masking
-            mr_tokens = self.tokenizer.encode(mr_text + self.delimiter, add_special_tokens=False)
+            mr_tokens = self.tokenizer.encode(mr_text + self.DELIM, add_special_tokens=False)
             
             
             # Tokenize full sequence
@@ -592,7 +592,7 @@ class SplitLoRATrainer:
                     mr_text = sample["meaning_representation"]
 
                     
-                    prompt_text = mr_text + self.delimiter  
+                    prompt_text = mr_text + self.DELIM  
                     
                     # Tokenize only the MR
                     encoding = self.tokenizer(prompt_text, return_tensors="pt", padding=False, truncation=False)
@@ -750,7 +750,7 @@ class SplitLoRATrainer:
             try:
                 # Tokenize the MR
                               # SAME delimiter as above
-                prompt = sample_mr + self.delimiter
+                prompt = sample_mr + self.DELIM
                 encoding = self.tokenizer(prompt, return_tensors="pt", padding=False, truncation=False)
                 input_ids = encoding["input_ids"].to(device)
                 attention_mask = encoding["attention_mask"].to(device)
