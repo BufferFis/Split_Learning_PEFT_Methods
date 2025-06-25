@@ -301,7 +301,7 @@ class TailClient:
             [p for p in self.tail_model.parameters() if p.requires_grad], 
             lr=learning_rate
         )
-        self.loss_fn = nn.CrossEntropyLoss()
+        self.loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
         
     def forward(self, body_activations, attention_mask=None):
         """Forward pass through tail layers"""
@@ -375,21 +375,13 @@ class SplitLoRATrainer:
         dataset = load_dataset("e2e_nlg", trust_remote_code=True)
         
         def preprocess(example):
-            SEQUENCE_LENGTH = 64  # Use consistent length everywhere
+            SEQUENCE_LENGTH = 64
+            delimiter = " >> "  # Use a simple, single-token delimiter
             
-            mr_text = example["meaning_representation"]
-            ref_text = example["human_reference"]
+            # Create full sequence with clear separation
+            full_text = example["meaning_representation"] + delimiter + example["human_reference"]
             
-            # Create input and target sequences
-            input_text = mr_text + " <|startoftext|>"  # Clear delimiter
-            target_text = ref_text + " <|endoftext|>"
-            full_text = input_text + " " + target_text
-            
-            # Tokenize separately to get proper split point
-            input_tokens = self.tokenizer.encode(input_text, add_special_tokens=False)
-            input_length = len(input_tokens)
-            
-            # Tokenize full sequence
+            # Tokenize entire sequence
             encoding = self.tokenizer(
                 full_text,
                 max_length=SEQUENCE_LENGTH,
@@ -398,16 +390,29 @@ class SplitLoRATrainer:
                 return_attention_mask=True
             )
             
-            # Create labels - mask input portion
-            labels = encoding["input_ids"].copy()
-            labels[:input_length] = [-100] * input_length  # Mask conditioning part
+            # Find delimiter position
+            delimiter_tokens = self.tokenizer.encode(delimiter, add_special_tokens=False)
+            input_ids = encoding["input_ids"]
+            
+            # Find delimiter start index
+            delimiter_start = None
+            for i in range(len(input_ids) - len(delimiter_tokens) + 1):
+                if input_ids[i:i+len(delimiter_tokens)] == delimiter_tokens:
+                    delimiter_start = i
+                    break
+            
+            # Create labels (mask everything BEFORE delimiter)
+            labels = [-100] * len(input_ids)
+            if delimiter_start is not None:
+                start_index = delimiter_start + len(delimiter_tokens)
+                labels[start_index:] = input_ids[start_index:]
             
             return {
-                "input_ids": encoding["input_ids"],
+                "input_ids": input_ids,
                 "attention_mask": encoding["attention_mask"],
                 "labels": labels,
                 "human_reference": example["human_reference"],
-                "input_length": input_length  # Store for generation
+                "delimiter_start": delimiter_start if delimiter_start else 0
             }
         
         train_ds = dataset["train"].map(preprocess, remove_columns=dataset["train"].column_names)
@@ -506,18 +511,23 @@ class SplitLoRATrainer:
         """FIXED: Proper conditioning + causal masking + greedy decoding"""
         with torch.no_grad():
             try:
-                if prompt_ids.dim() == 1:
-                    prompt_ids = prompt_ids.unsqueeze(0)
+                delimiter = " >> "
+                condition_end = self.tokenizer.encode(delimiter, add_special_tokens=False)
                 
-                # Find the conditioning boundary
-                startoftext_token = self.tokenizer.encode(" <|startoftext|>")[0]
-                try:
-                    condition_end = prompt_ids[0].tolist().index(startoftext_token) + 1
-                except ValueError:
-                    condition_end = len(prompt_ids[0]) // 2  # Fallback
+                input_ids = prompt_ids[0].tolist()
+            
+                # Find delimiter position
+                condition_end = None
+                for i in range(len(input_ids) - len(condition_end) + 1):
+                    if input_ids[i:i+len(condition_end)] == condition_end:
+                        condition_end = i + len(condition_end)
+                        break
                 
-                # Start generation from condition end
-                generated_ids = prompt_ids[:, :condition_end].clone()
+                if condition_end is None:
+                    condition_end = len(input_ids) // 2  # Fallback
+                
+                # Start generation AFTER delimiter
+                generated_ids = prompt_ids.clone()[:, :condition_end]
                 
                 for step in range(max_length):
                     current_length = generated_ids.size(1)
