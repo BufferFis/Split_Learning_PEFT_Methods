@@ -374,27 +374,44 @@ class SplitLoRATrainer:
         dataset = load_dataset("e2e_nlg", trust_remote_code=True)
         
         def preprocess(example):
-            SEQUENCE_LENGTH = 64
-            # FIXED: Separate input and target
-            input_enc = self.tokenizer(
-                example["meaning_representation"],
-                max_length=SEQUENCE_LENGTH,
+            """FIXED: Proper conditional generation preprocessing"""
+            # Concatenate MR + reference as one sequence
+            mr_text = example["meaning_representation"] 
+            ref_text = example["human_reference"]
+            
+            # Add special tokens to separate condition from generation
+            full_text = mr_text + " <|generate|> " + ref_text
+            
+            # Tokenize the full sequence
+            encoding = self.tokenizer(
+                full_text,
+                max_length=128,
                 truncation=True,
                 padding="max_length",
                 return_attention_mask=True
             )
-            target_enc = self.tokenizer(
-                example["human_reference"], 
-                max_length=SEQUENCE_LENGTH,
-                truncation=True,
-                padding="max_length"
-            )
+            
+            # Create labels with proper masking
+            input_ids = encoding["input_ids"]
+            labels = input_ids.copy()
+            
+            # Find where generation starts (after <|generate|> token)
+            generate_token = self.tokenizer.encode(" <|generate|> ")[0]
+            try:
+                gen_start = input_ids.index(generate_token) + 1
+                # Mask the condition part (don't compute loss on MR tokens)
+                labels[:gen_start] = [-100] * gen_start
+            except ValueError:
+                # If token not found, mask first half
+                labels[:len(input_ids)//2] = [-100] * (len(input_ids)//2)
+            
             return {
-                "input_ids": input_enc["input_ids"],
-                "attention_mask": input_enc["attention_mask"],
-                "labels": target_enc["input_ids"],
+                "input_ids": input_ids,
+                "attention_mask": encoding["attention_mask"], 
+                "labels": labels,
                 "human_reference": example["human_reference"]
             }
+
         
         train_ds = dataset["train"].map(preprocess, remove_columns=dataset["train"].column_names)
         test_ds = dataset["test"].map(preprocess, remove_columns=dataset["test"].column_names) 
