@@ -319,6 +319,12 @@ class SplitLoRATrainer:
     """Main trainer class combining all components"""
     def __init__(self, model_name="gpt2", head_layers=2, tail_layers=2, learning_rate=2e-4):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        
+        
+        # Load and split model
+        full_model = AutoModelForCausalLM.from_pretrained(model_name)
+        head_model, body_model, tail_model = split_gpt2(full_model, head_layers, tail_layers)
+        
         self.DELIM = "<|gen|>"                          # ONE token
         if self.DELIM not in self.tokenizer.get_vocab():
             self.tokenizer.add_special_tokens(
@@ -328,11 +334,7 @@ class SplitLoRATrainer:
         
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        
-        # Load and split model
-        full_model = AutoModelForCausalLM.from_pretrained(model_name)
-        head_model, body_model, tail_model = split_gpt2(full_model, head_layers, tail_layers)
-        
+            
         # Apply LoRA/DoRA - Now supported with Python 3.11.9!
         lora_config = LoraConfig(
             r=8,
