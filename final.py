@@ -55,7 +55,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
                         'get_output_embeddings', 'set_output_embeddings', 'resize_token_embeddings']:
                 if hasattr(original_model, attr):
                     setattr(self, attr, getattr(original_model, attr))
-            
+        
         def _prepare_inputs_for_generation(self, input_ids, **kwargs):
             """Default implementation for prepare_inputs_for_generation"""
             return {"input_ids": input_ids}
@@ -68,14 +68,32 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             hidden_states = inputs_embeds + position_embeds
             hidden_states = self.drop(hidden_states)
             
-            # Handle attention mask
-            if attention_mask is not None and attention_mask.dim() == 2:
-                batch_size, seq_len = attention_mask.shape
-                causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=attention_mask.device))
-                attention_mask = attention_mask.unsqueeze(-1).unsqueeze(-1) * causal_mask
-                attention_mask = attention_mask.unsqueeze(1).expand(-1, self.config.n_head, -1, -1)
-                attention_mask = attention_mask.float()
-                attention_mask = (1.0 - attention_mask) * -10000.0
+            # FIX: Corrected attention mask handling
+            if attention_mask is not None:
+                # Convert to proper format for transformer blocks
+                if attention_mask.dim() == 2:
+                    # attention_mask shape: [batch_size, seq_len]
+                    batch_size, seq_len = attention_mask.shape
+                    
+                    # Create causal mask
+                    causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=attention_mask.device, dtype=torch.bool))
+                    
+                    # Apply attention mask to causal mask
+                    # attention_mask: [batch_size, seq_len] -> [batch_size, 1, 1, seq_len]
+                    attention_mask_4d = attention_mask.unsqueeze(1).unsqueeze(1)
+                    
+                    # causal_mask: [seq_len, seq_len] -> [1, 1, seq_len, seq_len]  
+                    causal_mask_4d = causal_mask.unsqueeze(0).unsqueeze(0)
+                    
+                    # Combine masks: [batch_size, 1, seq_len, seq_len]
+                    combined_mask = attention_mask_4d * causal_mask_4d
+                    
+                    # Expand for all attention heads: [batch_size, num_heads, seq_len, seq_len]
+                    attention_mask = combined_mask.expand(batch_size, self.config.n_head, seq_len, seq_len)
+                    
+                    # Convert to attention scores (0 -> -inf, 1 -> 0)
+                    attention_mask = attention_mask.float()
+                    attention_mask = (1.0 - attention_mask) * -10000.0
             
             all_hidden_states = ()
             for block in self.h:
@@ -90,7 +108,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             else:
                 return type('HeadOutput', (), {'last_hidden_state': hidden_states})()
     
-    # Body Model (middle layers)
+    # Body Model (middle layers) - Apply similar fix
     class BodyModel(nn.Module):
         def __init__(self, original_model, start_layer, num_layers):
             super().__init__()
@@ -116,17 +134,18 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
                         'get_output_embeddings', 'set_output_embeddings', 'resize_token_embeddings']:
                 if hasattr(original_model, attr):
                     setattr(self, attr, getattr(original_model, attr))
-            
+        
         def _prepare_inputs_for_generation(self, input_ids, **kwargs):
             """Default implementation for prepare_inputs_for_generation"""
             return {"input_ids": input_ids}
             
         def forward(self, hidden_states=None, attention_mask=None, **kwargs):
+            # FIX: Simplified attention mask handling for body layers
             if attention_mask is not None and attention_mask.dim() == 2:
                 batch_size, seq_len = attention_mask.shape
-                num_heads = self.config.n_head
-                attention_mask = attention_mask.unsqueeze(1).unsqueeze(3)
-                attention_mask = attention_mask.expand(batch_size, num_heads, seq_len, seq_len)
+                # Convert to 4D format expected by transformer blocks
+                attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
+                attention_mask = attention_mask.expand(batch_size, self.config.n_head, seq_len, seq_len)
                 attention_mask = attention_mask.float()
                 attention_mask = (1.0 - attention_mask) * -10000.0
             
@@ -136,7 +155,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             hidden_states = self.transformer.ln_f(hidden_states)
             return type('BodyOutput', (), {'last_hidden_state': hidden_states})()
     
-    # Tail Model (last few layers + LM head)
+    # Tail Model (last few layers + LM head) - Apply similar fix
     class TailModel(nn.Module):
         def __init__(self, original_model, start_layer):
             super().__init__()
@@ -160,7 +179,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
                         'get_output_embeddings', 'set_output_embeddings', 'resize_token_embeddings']:
                 if hasattr(original_model, attr):
                     setattr(self, attr, getattr(original_model, attr))
-            
+        
         def _prepare_inputs_for_generation(self, input_ids, **kwargs):
             """Default implementation for prepare_inputs_for_generation"""
             return {"input_ids": input_ids}
@@ -168,11 +187,12 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
         def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
             hidden_states = inputs_embeds
             
+            # FIX: Simplified attention mask handling for tail layers
             if attention_mask is not None and attention_mask.dim() == 2:
                 batch_size, seq_len = attention_mask.shape
-                num_heads = self.config.n_head
-                attention_mask = attention_mask.unsqueeze(1).unsqueeze(3)
-                attention_mask = attention_mask.expand(batch_size, num_heads, seq_len, seq_len)
+                # Convert to 4D format expected by transformer blocks
+                attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
+                attention_mask = attention_mask.expand(batch_size, self.config.n_head, seq_len, seq_len)
                 attention_mask = attention_mask.float()
                 attention_mask = (1.0 - attention_mask) * -10000.0
             
@@ -187,6 +207,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
     tail_model = TailModel(model, head_layers + body_layers)
     
     return head_model, body_model, tail_model
+
 
 class ServerModel:
     """Server component handling the body layers"""
