@@ -384,7 +384,7 @@ class SplitLoRATrainer:
             
             # Simple masking
             labels = encoding["input_ids"].copy()
-            mr_tokens = tokenizer.encode(mr_text + delimiter, add_special_tokens=False)
+            mr_tokens = self.tokenizer.encode(mr_text + self.DELIM, add_special_tokens=False)
             labels[:len(mr_tokens)] = [-100] * len(mr_tokens)
 
             
