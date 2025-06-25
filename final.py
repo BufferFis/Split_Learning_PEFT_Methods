@@ -358,12 +358,12 @@ class SplitLoRATrainer:
             mr_text = example["meaning_representation"]
             ref_text = example["human_reference"]
             
-            # Use simple space separator instead of "\n\n"
-            full_text = mr_text + " " + ref_text
+            delimiter = " <gen> "                               # ONE token for GPT-2
+            full_text = mr_text + delimiter + ref_text          # instead of mr + " " + ref
             
             # Get MR length for masking
-            mr_tokens = self.tokenizer.encode(mr_text + " ", add_special_tokens=False)
-            mr_length = len(mr_tokens)
+            mr_tokens = self.tokenizer.encode(mr_text + delimiter, add_special_tokens=False)
+            
             
             # Tokenize full sequence
             encoding = self.tokenizer(
@@ -375,14 +375,14 @@ class SplitLoRATrainer:
             
             # Simple masking
             labels = encoding["input_ids"].copy()
-            labels[:mr_length] = [-100] * mr_length
+            labels[: len(mr_tokens)] = [-100] * len(mr_tokens)
             
             return {
                 "input_ids": encoding["input_ids"],
                 "attention_mask": encoding["attention_mask"],
                 "labels": labels,
                 "human_reference": example["human_reference"],
-                "meaning_representation": example["meaning_representation"]
+                "meaning_representation": mr_text
             }
         
         train_ds = dataset["train"].map(preprocess, remove_columns=dataset["train"].column_names)
@@ -391,11 +391,11 @@ class SplitLoRATrainer:
         # DEBUG MODE: Use only tiny subset
         if debug_mode:
             print("🐛 DEBUG MODE: Using tiny dataset subset")
-            print(f"   - Sequence length: 32 (instead of 64)")
-            print(f"   - Training samples: 100 (instead of {len(train_ds):,})")
-            print(f"   - Test samples: 20 (instead of {len(test_ds):,})")
-            train_ds = train_ds.select(range(1000))  # Only 100 samples!
-            test_ds = test_ds.select(range(100))     # Only 20 samples!
+            print(f"   - Sequence length: 64")
+            print(f"   - Training samples: 1000 (instead of {len(train_ds):,})")
+            print(f"   - Test samples: 100 (instead of {len(test_ds):,})")
+            train_ds = train_ds.select(range(2000))  # Only 2000 samples!
+            test_ds = test_ds.select(range(200))     # Only 200 samples!
         
         return train_ds, test_ds
 
@@ -578,12 +578,13 @@ class SplitLoRATrainer:
             
             for i, sample in enumerate(tqdm(eval_samples, desc="Evaluating")):
                 try:
-                    # FIXED: Use only MR for generation
                     mr_text = sample["meaning_representation"]
-                    input_text = mr_text + " "  # Format as in training
+
+                    delimiter   = " <gen> "
+                    prompt_text = mr_text + delimiter  
                     
                     # Tokenize only the MR
-                    encoding = self.tokenizer(input_text, return_tensors="pt", padding=False, truncation=False)
+                    encoding = self.tokenizer(prompt_text, return_tensors="pt", padding=False, truncation=False)
                     input_ids = encoding["input_ids"].to(device)
                     attention_mask = encoding["attention_mask"].to(device)
                     
@@ -737,8 +738,9 @@ class SplitLoRATrainer:
         with torch.no_grad():
             try:
                 # Tokenize the MR
-                input_text = sample_mr + " "
-                encoding = self.tokenizer(input_text, return_tensors="pt", padding=False, truncation=False)
+                delimiter = " <gen> "               # SAME delimiter as above
+                prompt = sample_mr + delimiter
+                encoding = self.tokenizer(prompt, return_tensors="pt", padding=False, truncation=False)
                 input_ids = encoding["input_ids"].to(device)
                 attention_mask = encoding["attention_mask"].to(device)
                 
@@ -750,7 +752,7 @@ class SplitLoRATrainer:
             except Exception as e:
                 return f"[ERROR: {str(e)}]"
 
-    def debug_train_and_test(self, train_dataloader, max_batches=10):
+    def debug_train_and_test(self, train_dataloader, max_batches=50):
         """SUPER FAST DEBUG: Train a few batches and test generation"""
         print(f"🐛 DEBUG TRAINING: Max {max_batches} batches")
         
@@ -864,7 +866,7 @@ def main():
         print("🐛 STARTING ULTRA-FAST DEBUG MODE")
         
         # Initialize trainer
-        trainer = SplitLoRATrainer(learning_rate=5e-6)  # Slightly higher LR for debug
+        trainer = SplitLoRATrainer(learning_rate=3e-4)  # Slightly higher LR for debug
         
         # Load tiny dataset
         train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=True)
