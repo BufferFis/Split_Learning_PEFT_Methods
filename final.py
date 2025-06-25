@@ -281,8 +281,9 @@ class TailClient:
         
         # Forward pass
         logits = self.tail_model(inputs_embeds=body_activations, attention_mask=attention_mask).logits
-        
-        # Compute loss with NaN checking
+        logits = torch.clamp(logits, -50.0, 50.0)
+
+        # Compute loss 
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
         
@@ -443,6 +444,12 @@ class SplitLoRATrainer:
             num_batches = 0
             
             for batch_idx, batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{epochs}")):
+                # DEBUG: inspect the first batch once per epoch
+                if batch_idx == 0:
+                    # decode first two label sequences (remove -100 paddings)
+                    for k in range(min(2, batch["labels"].size(0))):
+                        lbl_ids = [t for t in batch["labels"][k].tolist() if t != -100]
+                        print("   LABEL:", self.tokenizer.decode(lbl_ids))
                 try:
                     input_ids = batch["input_ids"].to(device)
                     attention_mask = batch["attention_mask"].to(device)
@@ -529,7 +536,10 @@ class SplitLoRATrainer:
                     )
                     
                     # Greedy decoding
-                    next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(-1)
+                    next_token_logits = logits[:, -1, :]                     # (bs, vocab)
+                    probs = torch.softmax(next_token_logits / 1.0, dim=-1)   # temperature=1
+                    next_token = torch.multinomial(probs, 1)    # temperature
+
                     generated_ids = torch.cat([generated_ids, next_token], dim=1)
                     
                     # Stop conditions
@@ -854,7 +864,7 @@ def main():
         print("🐛 STARTING ULTRA-FAST DEBUG MODE")
         
         # Initialize trainer
-        trainer = SplitLoRATrainer(learning_rate=1e-4)  # Slightly higher LR for debug
+        trainer = SplitLoRATrainer(learning_rate=5e-6)  # Slightly higher LR for debug
         
         # Load tiny dataset
         train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=True)
