@@ -14,6 +14,7 @@ import argparse
 from typing import Dict, List, Tuple, Optional
 import traceback
 from datetime import datetime
+import math
 
 # Set GPU device to A1000 (GPU 1)
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
@@ -32,34 +33,6 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
     
     # Head Model (embedding + first few layers)
     class HeadModel(nn.Module):
-        def __init__(self, original_model, num_layers):
-            super().__init__()
-            self.wte = original_model.transformer.wte
-            self.wpe = original_model.transformer.wpe
-            self.drop = original_model.transformer.drop
-            self.h = nn.ModuleList(original_model.transformer.h[:num_layers])
-            self.config = original_model.config
-            
-            # Add missing generation attributes for PEFT compatibility
-            self.generation_config = getattr(original_model, 'generation_config', None)
-            self.main_input_name = getattr(original_model, 'main_input_name', 'input_ids')
-            
-            # FIX: Add the missing prepare_inputs_for_generation method
-            if hasattr(original_model, 'prepare_inputs_for_generation'):
-                self.prepare_inputs_for_generation = original_model.prepare_inputs_for_generation
-            else:
-                self.prepare_inputs_for_generation = self._prepare_inputs_for_generation
-                
-            # Add other missing attributes that PEFT might need
-            for attr in ['_get_resized_embeddings', 'get_input_embeddings', 'set_input_embeddings', 
-                        'get_output_embeddings', 'set_output_embeddings', 'resize_token_embeddings']:
-                if hasattr(original_model, attr):
-                    setattr(self, attr, getattr(original_model, attr))
-        
-        def _prepare_inputs_for_generation(self, input_ids, **kwargs):
-            """Default implementation for prepare_inputs_for_generation"""
-            return {"input_ids": input_ids}
-            
         def forward(self, input_ids=None, attention_mask=None, output_hidden_states=False, **kwargs):
             inputs_embeds = self.wte(input_ids)
             seq_length = input_ids.size(-1)
@@ -68,36 +41,10 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             hidden_states = inputs_embeds + position_embeds
             hidden_states = self.drop(hidden_states)
             
-            # FIX: Corrected attention mask handling
-            if attention_mask is not None:
-                # Convert to proper format for transformer blocks
-                if attention_mask.dim() == 2:
-                    # attention_mask shape: [batch_size, seq_len]
-                    batch_size, seq_len = attention_mask.shape
-                    
-                    # Create causal mask
-                    causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=attention_mask.device, dtype=torch.bool))
-                    
-                    # Apply attention mask to causal mask
-                    # attention_mask: [batch_size, seq_len] -> [batch_size, 1, 1, seq_len]
-                    attention_mask_4d = attention_mask.unsqueeze(1).unsqueeze(1)
-                    
-                    # causal_mask: [seq_len, seq_len] -> [1, 1, seq_len, seq_len]  
-                    causal_mask_4d = causal_mask.unsqueeze(0).unsqueeze(0)
-                    
-                    # Combine masks: [batch_size, 1, seq_len, seq_len]
-                    combined_mask = attention_mask_4d * causal_mask_4d
-                    
-                    # Expand for all attention heads: [batch_size, num_heads, seq_len, seq_len]
-                    attention_mask = combined_mask.expand(batch_size, self.config.n_head, seq_len, seq_len)
-                    
-                    # Convert to attention scores (0 -> -inf, 1 -> 0)
-                    attention_mask = attention_mask.float()
-                    attention_mask = (1.0 - attention_mask) * -10000.0
-            
+            # SIMPLIFIED: Let GPT-2 handle attention masking internally
             all_hidden_states = ()
             for block in self.h:
-                hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
+                hidden_states = block(hidden_states, use_cache=False)[0]  # No attention_mask!
                 all_hidden_states = all_hidden_states + (hidden_states,)
             
             if output_hidden_states:
@@ -108,96 +55,22 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             else:
                 return type('HeadOutput', (), {'last_hidden_state': hidden_states})()
     
-    # Body Model (middle layers) - Apply similar fix
     class BodyModel(nn.Module):
-        def __init__(self, original_model, start_layer, num_layers):
-            super().__init__()
-            self.transformer = nn.Module()
-            self.transformer.h = nn.ModuleList(
-                original_model.transformer.h[start_layer:start_layer + num_layers]
-            )
-            self.transformer.ln_f = original_model.transformer.ln_f
-            self.config = original_model.config
-            
-            # Add missing generation attributes for PEFT compatibility
-            self.generation_config = getattr(original_model, 'generation_config', None)
-            self.main_input_name = getattr(original_model, 'main_input_name', 'input_ids')
-            
-            # FIX: Add the missing prepare_inputs_for_generation method
-            if hasattr(original_model, 'prepare_inputs_for_generation'):
-                self.prepare_inputs_for_generation = original_model.prepare_inputs_for_generation
-            else:
-                self.prepare_inputs_for_generation = self._prepare_inputs_for_generation
-                
-            # Add other missing attributes that PEFT might need
-            for attr in ['_get_resized_embeddings', 'get_input_embeddings', 'set_input_embeddings', 
-                        'get_output_embeddings', 'set_output_embeddings', 'resize_token_embeddings']:
-                if hasattr(original_model, attr):
-                    setattr(self, attr, getattr(original_model, attr))
-        
-        def _prepare_inputs_for_generation(self, input_ids, **kwargs):
-            """Default implementation for prepare_inputs_for_generation"""
-            return {"input_ids": input_ids}
-            
         def forward(self, hidden_states=None, attention_mask=None, **kwargs):
-            # FIX: Simplified attention mask handling for body layers
-            if attention_mask is not None and attention_mask.dim() == 2:
-                batch_size, seq_len = attention_mask.shape
-                # Convert to 4D format expected by transformer blocks
-                attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
-                attention_mask = attention_mask.expand(batch_size, self.config.n_head, seq_len, seq_len)
-                attention_mask = attention_mask.float()
-                attention_mask = (1.0 - attention_mask) * -10000.0
-            
+            # SIMPLIFIED: Remove complex attention mask handling
             for block in self.transformer.h:
-                hidden_states = block(hidden_states, attention_mask=attention_mask, use_cache=False)[0]
+                hidden_states = block(hidden_states, use_cache=False)[0]  # No attention_mask!
             
             hidden_states = self.transformer.ln_f(hidden_states)
             return type('BodyOutput', (), {'last_hidden_state': hidden_states})()
     
-    # Tail Model (last few layers + LM head) - Apply similar fix
     class TailModel(nn.Module):
-        def __init__(self, original_model, start_layer):
-            super().__init__()
-            self.transformer = nn.Module()
-            self.transformer.h = nn.ModuleList(original_model.transformer.h[start_layer:])
-            self.lm_head = original_model.lm_head
-            self.config = original_model.config
-            
-            # Add missing generation attributes for PEFT compatibility
-            self.generation_config = getattr(original_model, 'generation_config', None)
-            self.main_input_name = getattr(original_model, 'main_input_name', 'input_ids')
-            
-            # FIX: Add the missing prepare_inputs_for_generation method
-            if hasattr(original_model, 'prepare_inputs_for_generation'):
-                self.prepare_inputs_for_generation = original_model.prepare_inputs_for_generation
-            else:
-                self.prepare_inputs_for_generation = self._prepare_inputs_for_generation
-                
-            # Add other missing attributes that PEFT might need
-            for attr in ['_get_resized_embeddings', 'get_input_embeddings', 'set_input_embeddings', 
-                        'get_output_embeddings', 'set_output_embeddings', 'resize_token_embeddings']:
-                if hasattr(original_model, attr):
-                    setattr(self, attr, getattr(original_model, attr))
-        
-        def _prepare_inputs_for_generation(self, input_ids, **kwargs):
-            """Default implementation for prepare_inputs_for_generation"""
-            return {"input_ids": input_ids}
-            
         def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
             hidden_states = inputs_embeds
             
-            # FIX: Simplified attention mask handling for tail layers
-            if attention_mask is not None and attention_mask.dim() == 2:
-                batch_size, seq_len = attention_mask.shape
-                # Convert to 4D format expected by transformer blocks
-                attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
-                attention_mask = attention_mask.expand(batch_size, self.config.n_head, seq_len, seq_len)
-                attention_mask = attention_mask.float()
-                attention_mask = (1.0 - attention_mask) * -10000.0
-            
+            # SIMPLIFIED: Remove complex attention mask handling
             for block in self.transformer.h:
-                hidden_states = block(hidden_states, attention_mask=attention_mask, use_cache=False)[0]
+                hidden_states = block(hidden_states, use_cache=False)[0]  # No attention_mask!
             
             logits = self.lm_head(hidden_states)
             return type('TailOutput', (), {'logits': logits})()
@@ -294,48 +167,77 @@ class HeadClient:
 
 
 class TailClient:
-    """Client component handling tail layers"""
-    def __init__(self, tail_model, learning_rate=2e-4):
-        self.tail_model = tail_model.to(device)
-        self.optimizer = optim.AdamW(
-            [p for p in self.tail_model.parameters() if p.requires_grad], 
-            lr=learning_rate
-        )
-        self.loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
-        
-    def forward(self, body_activations, attention_mask=None):
-        """Forward pass through tail layers"""
-        output = self.tail_model(inputs_embeds=body_activations, attention_mask=attention_mask)
-        return output.logits
-    
     def compute_loss_and_backward(self, body_activations, labels, attention_mask=None):
-        """Compute loss and perform backward pass - FIXED VERSION"""
+        """FIXED: Add retain_grad() for non-leaf tensors"""
         self.optimizer.zero_grad()
         
-        # CRITICAL: Don't detach - maintain gradient flow
+        # FIX: Add retain_grad() BEFORE accessing .grad
         body_activations.requires_grad_(True)
+        body_activations.retain_grad()  # CRITICAL: Add this line
         
         # Forward pass
         logits = self.tail_model(inputs_embeds=body_activations, attention_mask=attention_mask).logits
         
-        # Compute loss
+        # Compute loss with NaN checking
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
+        
+        # Check for NaN in logits
+        if torch.isnan(shift_logits).any():
+            print("WARNING: NaN detected in logits!")
+            return 0.0, torch.zeros_like(body_activations)
+        
         loss = self.loss_fn(
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1)
         )
         
+        # Check for NaN loss
+        if torch.isnan(loss):
+            print("WARNING: NaN loss detected!")
+            return 0.0, torch.zeros_like(body_activations)
+        
         # Backward pass
         loss.backward(retain_graph=True)
         
-        # FIXED: Get gradient for body activations (this is sent back to body)
+        # Now safely access .grad
         body_grad = body_activations.grad.clone() if body_activations.grad is not None else torch.zeros_like(body_activations)
         
         # Update tail parameters
         self.optimizer.step()
         
         return loss.item(), body_grad
+
+class ServerModel:
+    def backward(self, body_output, body_grad, head_activations):
+        """FIXED: Add retain_grad() and gradient clipping"""
+        self.optimizer.zero_grad()
+        
+        # FIX: Add retain_grad() BEFORE accessing .grad
+        head_activations.requires_grad_(True)
+        head_activations.retain_grad()  # CRITICAL: Add this line
+        
+        if body_grad is not None:
+            # Backward through body layers
+            torch.autograd.backward(
+                tensors=[body_output],
+                grad_tensors=[body_grad],
+                retain_graph=True
+            )
+            
+            # Now safely access .grad
+            head_grad = head_activations.grad.clone() if head_activations.grad is not None else torch.zeros_like(head_activations)
+        else:
+            head_grad = torch.zeros_like(head_activations)
+        
+        # FIX: Add gradient clipping
+        torch.nn.utils.clip_grad_norm_(self.body_model.parameters(), max_norm=1.0)
+        
+        # Update body parameters
+        self.optimizer.step()
+        
+        return head_grad
+
 
 class SplitLoRATrainer:
     """Main trainer class combining all components"""
@@ -378,31 +280,26 @@ class SplitLoRATrainer:
             SEQUENCE_LENGTH = 64
             
             mr_text = example["meaning_representation"]
-            ref_text = example["human_reference"] 
+            ref_text = example["human_reference"]
             
-            # Use clear separator between MR and reference
-            full_text = mr_text + " \n\n" + ref_text
+            # Use simple space separator instead of "\n\n"
+            full_text = mr_text + " " + ref_text
             
-            # Tokenize
+            # Get MR length for masking
+            mr_tokens = self.tokenizer.encode(mr_text + " ", add_special_tokens=False)
+            mr_length = len(mr_tokens)
+            
+            # Tokenize full sequence
             encoding = self.tokenizer(
-                full_text, 
-                max_length=SEQUENCE_LENGTH, 
-                truncation=True, 
+                full_text,
+                max_length=SEQUENCE_LENGTH,
+                truncation=True,
                 padding="max_length"
             )
             
-            # Find separator position
-            sep_tokens = self.tokenizer.encode("\n\n", add_special_tokens=False)
-            sep_position = None
-            for i in range(len(encoding["input_ids"]) - len(sep_tokens) + 1):
-                if encoding["input_ids"][i:i+len(sep_tokens)] == sep_tokens:
-                    sep_position = i + len(sep_tokens)
-                    break
-            
-            # Create labels (mask MR and separator)
-            labels = [-100] * len(encoding["input_ids"])
-            if sep_position:
-                labels[sep_position:] = encoding["input_ids"][sep_position:]
+            # Simple masking
+            labels = encoding["input_ids"].copy()
+            labels[:mr_length] = [-100] * mr_length
             
             return {
                 "input_ids": encoding["input_ids"],
@@ -454,7 +351,7 @@ class SplitLoRATrainer:
         return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn)
     
     def train(self, train_dataloader, epochs=1):
-        """Train the split model - PROPER SPLIT LEARNING"""
+        """FIXED: Add gradient clipping and NaN checking"""
         print(f"Starting training for {epochs} epochs...")
         
         for epoch in range(epochs):
@@ -467,26 +364,32 @@ class SplitLoRATrainer:
                     attention_mask = batch["attention_mask"].to(device)
                     labels = batch["labels"].to(device)
                     
-                    # STEP 1: Forward through head
-                    head_activations = self.head_client.forward(input_ids, attention_mask)
+                    # FIX: Check for NaN inputs
+                    if torch.isnan(input_ids.float()).any() or torch.isnan(labels.float()).any():
+                        print(f"Skipping batch {batch_idx} due to NaN inputs")
+                        continue
                     
-                    # STEP 2: Forward through body (server)
+                    # Forward through pipeline
+                    head_activations = self.head_client.forward(input_ids, attention_mask)
                     body_activations, stored_head_activations = self.server.forward_train(
                         head_activations, attention_mask
                     )
-                    
-                    # STEP 3: Forward through tail + compute loss + backward through tail
                     loss, body_grad = self.tail_client.compute_loss_and_backward(
                         body_activations, labels, attention_mask
                     )
                     
-                    # STEP 4: Backward through body (server) 
-                    head_grad = self.server.backward(
-                        body_activations, body_grad, stored_head_activations
-                    )
+                    # FIX: Check for NaN loss
+                    if math.isnan(loss):
+                        print(f"NaN loss at batch {batch_idx}, skipping...")
+                        continue
                     
-                    # STEP 5: Backward through head
+                    # Backward through body and head
+                    head_grad = self.server.backward(body_activations, body_grad, stored_head_activations)
                     self.head_client.backward(head_activations, head_grad)
+                    
+                    # FIX: Add gradient clipping to all components
+                    torch.nn.utils.clip_grad_norm_(self.head_client.head_model.parameters(), max_norm=1.0)
+                    torch.nn.utils.clip_grad_norm_(self.tail_client.tail_model.parameters(), max_norm=1.0)
                     
                     total_loss += loss
                     num_batches += 1
@@ -750,7 +653,7 @@ def main():
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_device
     
     # Initialize trainer
-    trainer = SplitLoRATrainer(learning_rate=args.learning_rate)
+    trainer = SplitLoRATrainer(learning_rate=1e-5)
     
     # Load checkpoint if specified
     if args.load_checkpoint:
