@@ -188,19 +188,19 @@ class ServerModel:
     def forward_train(self, activations, attention_mask=None):
         """Forward pass during training"""
         self.body_model.train()
-        
-        # FIXED: Don't detach - maintain gradient connection
+        # Don't detach - maintain gradient connection
         activations.requires_grad_(True)
         output = self.body_model(hidden_states=activations, attention_mask=attention_mask)
-        
         return output.last_hidden_state, activations
     
     def backward(self, body_output, body_grad, head_activations):
-        """ESSENTIAL: Backward pass for split learning"""
+        """FIXED: Add retain_grad() and gradient clipping"""
         self.optimizer.zero_grad()
         
-        # FIXED: Use proper gradient computation for split learning
-        # This simulates receiving gradients from tail and passing them to head
+        # FIX: Add retain_grad() BEFORE accessing .grad
+        head_activations.requires_grad_(True)
+        head_activations.retain_grad()  # CRITICAL: Add this line
+        
         if body_grad is not None:
             # Backward through body layers
             torch.autograd.backward(
@@ -209,10 +209,13 @@ class ServerModel:
                 retain_graph=True
             )
             
-            # Get gradient for head activations (to send back to head)
+            # Now safely access .grad
             head_grad = head_activations.grad.clone() if head_activations.grad is not None else torch.zeros_like(head_activations)
         else:
             head_grad = torch.zeros_like(head_activations)
+        
+        # FIX: Add gradient clipping
+        torch.nn.utils.clip_grad_norm_(self.body_model.parameters(), max_norm=1.0)
         
         # Update body parameters
         self.optimizer.step()
@@ -241,7 +244,7 @@ class HeadClient:
         """ESSENTIAL: Backward pass for split learning"""
         self.optimizer.zero_grad()
         
-        # FIXED: Apply gradients received from body
+        # Apply gradients received from body
         if head_grad is not None:
             torch.autograd.backward(
                 tensors=[head_activations],
@@ -254,6 +257,20 @@ class HeadClient:
 
 
 class TailClient:
+    """Client component handling tail layers"""
+    def __init__(self, tail_model, learning_rate=2e-4):
+        self.tail_model = tail_model.to(device)
+        self.optimizer = optim.AdamW(
+            [p for p in self.tail_model.parameters() if p.requires_grad], 
+            lr=learning_rate
+        )
+        self.loss_fn = nn.CrossEntropyLoss()
+        
+    def forward(self, body_activations, attention_mask=None):
+        """Forward pass through tail layers"""
+        output = self.tail_model(inputs_embeds=body_activations, attention_mask=attention_mask)
+        return output.logits
+    
     def compute_loss_and_backward(self, body_activations, labels, attention_mask=None):
         """FIXED: Add retain_grad() for non-leaf tensors"""
         self.optimizer.zero_grad()
@@ -295,35 +312,6 @@ class TailClient:
         
         return loss.item(), body_grad
 
-class ServerModel:
-    def backward(self, body_output, body_grad, head_activations):
-        """FIXED: Add retain_grad() and gradient clipping"""
-        self.optimizer.zero_grad()
-        
-        # FIX: Add retain_grad() BEFORE accessing .grad
-        head_activations.requires_grad_(True)
-        head_activations.retain_grad()  # CRITICAL: Add this line
-        
-        if body_grad is not None:
-            # Backward through body layers
-            torch.autograd.backward(
-                tensors=[body_output],
-                grad_tensors=[body_grad],
-                retain_graph=True
-            )
-            
-            # Now safely access .grad
-            head_grad = head_activations.grad.clone() if head_activations.grad is not None else torch.zeros_like(head_activations)
-        else:
-            head_grad = torch.zeros_like(head_activations)
-        
-        # FIX: Add gradient clipping
-        torch.nn.utils.clip_grad_norm_(self.body_model.parameters(), max_norm=1.0)
-        
-        # Update body parameters
-        self.optimizer.step()
-        
-        return head_grad
 
 
 class SplitLoRATrainer:
