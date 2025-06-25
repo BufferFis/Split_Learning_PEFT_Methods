@@ -375,7 +375,7 @@ class SplitLoRATrainer:
         dataset = load_dataset("e2e_nlg", trust_remote_code=True)
         
         def preprocess(example):
-            SEQUENCE_LENGTH = 128  # Use consistent length everywhere
+            SEQUENCE_LENGTH = 64  # Use consistent length everywhere
             
             mr_text = example["meaning_representation"]
             ref_text = example["human_reference"]
@@ -419,7 +419,7 @@ class SplitLoRATrainer:
     def create_dataloader(self, dataset, batch_size=8, shuffle=True):
         """FIXED: Consistent sequence length"""
         def collate_fn(batch):
-            FIXED_LENGTH = 128  # Match preprocessing length!
+            FIXED_LENGTH = 64  # Match preprocessing length!
             
             input_ids_batch = []
             attention_mask_batch = []
