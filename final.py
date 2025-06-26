@@ -927,59 +927,50 @@ class SplitLoRATrainer:
         return avg_loss
 
 
+# ──────────────────────────────────────────────────────────────
+#  ONE helper = bullet-proof way to build a fused GPT-2 that
+#  already contains the three Split-LoRA (+DoRA) adapters
+# ──────────────────────────────────────────────────────────────
+
+
 def build_fused_splitlora(model_name: str,
-                          adapter_paths: list[str],
+                          ckpt_root: str,
                           tokenizer,
                           device=torch.device("cpu")):
     """
-    1. Loads the base GPT-2
-    2. Ensures the embedding matrix is resized for <|gen|> and <|pad|>
-    3. Sequentially loads each adapter directory
-    4. Calls merge_and_unload()  →  returns a plain GPT-2 with LoRA+DoRA fused
+    1. Load base GPT-2
+    2. Resize wte/lm_head if <|gen|>, <|pad|> were added
+    3. Attach head, body, tail adapters one after another
+    4. merge_and_unload()  →  plain GPT-2 with LoRA+DoRA fused
     """
-
-    # 1️⃣  base model
     base = AutoModelForCausalLM.from_pretrained(model_name).to(device)
 
-    # 2️⃣  resize if tokenizer is bigger (prevents CUDA index error) [5]
     if len(tokenizer) != base.get_input_embeddings().num_embeddings:
-        base.resize_token_embeddings(len(tokenizer))     # [5]
+        base.resize_token_embeddings(len(tokenizer))      # <- CUDA safe
 
-    # 3️⃣  load EACH adapter; no “missing keys” because every path supplies
-    #      only the weights it owns
-    for p in adapter_paths:
-        base = PeftModel.from_pretrained(base, p, is_trainable=False)
+    for sub in ("head_model", "body_model", "tail_model"):
+        path = os.path.join(ckpt_root, sub)
+        base = PeftModel.from_pretrained(base, path, is_trainable=False)
 
-    # 4️⃣  fuse LoRA+DoRA into the base weights; after this call the model
-    #      no longer contains any PEFT modules, so inference is fast
-    fused = base.merge_and_unload().eval()
-
+    fused = base.merge_and_unload().eval()    # no PEFT modules remain
     return fused
 
-
-def beam_generate_full(model_name: str,
-                       ckpt_root: str,
-                       tokenizer,
-                       prompt_ids: torch.Tensor,
-                       max_new: int = 80):
-
-    paths = [f"{ckpt_root}/head_model",
-             f"{ckpt_root}/body_model",
-             f"{ckpt_root}/tail_model"]
-
-    model = build_fused_splitlora(model_name, paths,
-                                  tokenizer, device)
-
+def beam_generate_full(tokenizer, prompt_ids, ckpt_root, max_new=80):
+    model = build_fused_splitlora("gpt2", ckpt_root, tokenizer, device)
     with torch.no_grad():
-        return model.generate(
-                prompt_ids,
-                max_new_tokens=max_new,
-                num_beams=10,
-                length_penalty=0.8,
-                no_repeat_ngram_size=4,
-                repetition_penalty=1.0,
-                early_stopping=True,
-                eos_token_id=model.config.eos_token_id)
+        out = model.generate(
+                 prompt_ids,
+                 max_new_tokens=max_new,
+                 num_beams=10,
+                 length_penalty=0.8,
+                 no_repeat_ngram_size=4,
+                 repetition_penalty=1.0,
+                 early_stopping=True,
+                 eos_token_id=model.config.eos_token_id)
+    return out
+
+
+
 
 
 
@@ -1036,23 +1027,16 @@ def main():
     train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
     
     if args.eval_only:
-        print("Beam search")
         mr = "name[Blue Spice], eatType[coffee shop], area[city centre]"
-        space_delim = " " + trainer.DELIM + " "
-        prompt = mr + space_delim
+        prompt = mr + " " + trainer.DELIM + " "
         ids = trainer.tokenizer(prompt, return_tensors="pt").input_ids.to(device)
 
-        out = beam_generate_full(
-                "gpt2",
-                args.load_checkpoint,        # e.g. ./splitlora_checkpoint
-                trainer.tokenizer,
-                ids,                         # prompt ids
-                max_new=80)
+        out = beam_generate_full(trainer.tokenizer, ids,
+                                args.load_checkpoint, max_new=80)
 
-
-        print("\nBeam-10 output:")
-        print(trainer.tokenizer.decode(out[0, ids.size(1):],
-                                    skip_special_tokens=True))
+        gen = trainer.tokenizer.decode(out[0, ids.size(1):],
+                                    skip_special_tokens=True).strip()
+        print("Beam-10 output:\n", gen)
         return
 
     if not args.eval_only:
