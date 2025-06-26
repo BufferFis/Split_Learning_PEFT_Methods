@@ -1006,8 +1006,7 @@ def main():
                     length_penalty        = 0.8,    # --length_penalty
                     early_stopping        = True,   # end once all beams hit <eos>
                     no_repeat_ngram_size  = 4,      # --no_repeat_ngram_size
-                    repetition_penalty    = 1.0,    # --repetition_penalty (= neutral)
-                    repetition_penalty      = 1.2,
+                    repetition_penalty    = 1.2,    # --repetition_penalty (= neutral)
                     diversity_penalty   = 0.3,
                     num_beam_groups     = 5,   # must divide num_beams (10)
 
