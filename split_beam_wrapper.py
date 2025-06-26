@@ -1,11 +1,11 @@
 # split_beam_wrapper.py
 import torch
 import torch.nn as nn
-from transformers import PreTrainedModel
+from transformers import GenerationMixin, PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutput
 from typing import Optional
 
-class SplitGPT2ForGeneration(PreTrainedModel):
+class SplitGPT2ForGeneration(PreTrainedModel, GenerationMixin):
     """
     Thin façade that turns (HeadClient, ServerModel, TailClient)
     into a regular Causal-LM usable by HF `generate()`.
