@@ -1063,26 +1063,26 @@ def main():
     
     if args.eval_only:
         mr_text = "name[Blue Spice], eatType[coffee shop], area[city centre]"
-        prompt  = mr_text + " " + trainer.DELIM + " "
-        enc     = trainer.tokenizer(prompt, return_tensors="pt")
-        ids, mask = enc["input_ids"].to(device), enc["attention_mask"].to(device)
+    prompt  = mr_text + " " + trainer.DELIM + " "
+    enc     = trainer.tokenizer(prompt, return_tensors="pt")
+    ids, mask = enc["input_ids"].to(device), enc["attention_mask"].to(device)
 
-        with torch.no_grad():
-            out = wrapper.generate(
-                    ids,
-                    attention_mask        = mask,
-                    max_new_tokens        = 64,
-                    num_beams             = 10,
-                    length_penalty        = 0.8,
-                    no_repeat_ngram_size  = 4,
-                    early_stopping        = True,
-                    eos_token_id          = trainer.tokenizer.eos_token_id,
-                    pad_token_id          = trainer.tokenizer.pad_token_id
-                )
+    with torch.no_grad():
+        out = wrapper.generate(
+                ids,
+                attention_mask        = mask,
+                max_new_tokens        = 64,
+                num_beams             = 10,
+                length_penalty        = 0.8,
+                no_repeat_ngram_size  = 4,
+                early_stopping        = True,
+                eos_token_id          = trainer.tokenizer.eos_token_id,
+                pad_token_id          = trainer.tokenizer.pad_token_id
+              )
 
-        print("Beam-10 output:",
-            trainer.tokenizer.decode(out[0, ids.size(1):], skip_special_tokens=True).strip())
-        return
+    print("Beam-10 output:",
+          trainer.tokenizer.decode(out[0, ids.size(1):], skip_special_tokens=True).strip())
+    return
 
 
     if not args.eval_only:
