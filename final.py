@@ -539,24 +539,34 @@ class SplitLoRATrainer:
 
                     # ----- 3. pick next token ------------------------------------
                     next_token_logits = logits[:, -1, :]                   # (1, vocab)
+                    NO_REPEAT_N = 3          # size of n-gram ban
+                    MAX_GREEDY_LEN = 70      # hard stop (GPT-2 tokens)
                     if greedy:
                         bs, cur_len = generated_ids.size()
-                        # 3-gram ban but keep EOS
+
+                        # ------ 3-gram ban but keep EOS ‑----------------------------
                         if cur_len >= NO_REPEAT_N - 1:
-                            prefix = tuple(generated_ids[0, -(NO_REPEAT_N-1):].tolist())
-                            blocked = {
-                                generated_ids[0, i+NO_REPEAT_N-1].item()
-                                for i in range(len(generated_ids[0]) - NO_REPEAT_N + 1)
-                                if tuple(generated_ids[0, i:i+NO_REPEAT_N-1].tolist()) == prefix
-                            }
-                            blocked.discard(self.tokenizer.eos_token_id)
-                            next_token_logits[0, list(blocked)] = -float("inf")
+                            for b in range(bs):
+                                prefix = tuple(generated_ids[b, -(NO_REPEAT_N-1):].tolist())
+                                blocked = {
+                                    generated_ids[b, i+NO_REPEAT_N-1].item()
+                                    for i in range(len(generated_ids[b]) - NO_REPEAT_N + 1)
+                                    if tuple(generated_ids[b, i:i+NO_REPEAT_N-1].tolist()) == prefix
+                                }
+                                blocked.discard(self.tokenizer.eos_token_id)        # allow EOS
+                                if blocked:
+                                    next_token_logits[b, list(blocked)] = -float("inf")
 
-                        # ONE presence penalty only for the *last* token
-                        last_tok = generated_ids[0, -1]
-                        next_token_logits[0, last_tok] -= 1.0
+                        # ------ one-shot presence penalty (last token only) ---------
+                        last_tok = generated_ids[:, -1]                              # (bs,)
+                        next_token_logits[torch.arange(bs), last_tok] -= 1.0
 
-                        next_token = torch.argmax(next_token_logits, -1, keepdim=True)
+                        # ------ pick next token  -----------------------------------
+                        next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+
+                        # ------ length cap *before* we append ----------------------
+                        if cur_len >= MAX_GREEDY_LEN:
+                            break
                     else:
                         # ---------------------------------------------------------
                         #  A. global repetition-penalty  (1.3 works well for GPT-2)
