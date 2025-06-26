@@ -519,60 +519,42 @@ class SplitLoRATrainer:
         """FIXED: Generate continuation from MR prompt with proper causal masking"""
         with torch.no_grad():
             try:
+                # ----- 1.  start with the prompt ---------------------------------
                 # Start with the prompt (MR only)
                 generated_ids = prompt_ids.clone()
                 
                 # Initialize attention mask with causal structure
-                current_attention_mask = torch.ones_like(prompt_attention_mask)
+                attention_mask = torch.ones_like(prompt_ids) 
                 
                 for step in range(max_length):
-                    current_length = generated_ids.size(1)
-                    
-                    # Create causal attention mask for current sequence
-                    causal_mask = torch.tril(
-                        torch.ones(current_length, current_length, device=device, dtype=torch.bool)
-                    ).unsqueeze(0)  # Add batch dimension
-                    
-                    # Convert to attention scores format
-                    attention_mask_4d = causal_mask.float()
-                    attention_mask_4d = (1.0 - attention_mask_4d) * -10000.0
-                    
-                    # Forward through pipeline
-                    head_activations = self.head_client.forward(
-                        generated_ids, 
-                        attention_mask=attention_mask_4d
-                    )
-                    body_activations = self.server.forward(
-                        head_activations, 
-                        attention_mask=attention_mask_4d
-                    )
-                    logits = self.tail_client.forward(
-                        body_activations, 
-                        attention_mask=attention_mask_4d
-                    )
-                    
-                    # Greedy decoding
-                    next_token_logits = logits[:, -1, :]                     # (bs, vocab)
-                    probs = torch.softmax(next_token_logits / 1.0, dim=-1)   # temperature=1
+                    # ----- 2. forward through split pipeline ---------------------
+                    head_acts = self.head_client.forward(generated_ids, attention_mask)
+                    body_acts = self.server.forward(head_acts, attention_mask)
+                    logits    = self.tail_client.forward(body_acts, attention_mask)
+
+                    # ----- 3. pick next token ------------------------------------
+                    next_token_logits = logits[:, -1, :]                   # (1, vocab)
                     if greedy:
                         next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
                     else:
-                        probs = torch.softmax(next_token_logits, dim=-1)
+                        probs      = torch.softmax(next_token_logits, dim=-1)
                         next_token = torch.multinomial(probs, 1)
 
-                    generated_ids = torch.cat([generated_ids, next_token], dim=1)
-                    
-                    # Stop conditions
-                    if next_token.item() == self.tokenizer.eos_token_id:
+                    generated_ids  = torch.cat([generated_ids,  next_token], dim=1)
+
+                    # ----- 4. extend the 2-D mask by one position ----------------
+                    pad = torch.ones(1, 1, dtype=attention_mask.dtype, device=attention_mask.device)
+                    attention_mask = torch.cat([attention_mask, pad], dim=1)
+
+                    # ----- 5. stop conditions ------------------------------------
+                    if next_token.item() in {self.tokenizer.eos_token_id,
+                                            self.tokenizer.pad_token_id}:
                         break
-                    if next_token.item() == self.tokenizer.pad_token_id:
-                        break
-                    
-                # Extract only generated part (after prompt)
+
                 generated_tokens = generated_ids[0, prompt_ids.size(1):].tolist()
-                generated_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+                return self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
                 
-                return generated_text if generated_text else "no output"
+                    
                 
             except Exception as e:
                 print(f"Generation error: {e}")
