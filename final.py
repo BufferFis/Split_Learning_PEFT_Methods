@@ -332,8 +332,11 @@ class SplitLoRATrainer:
             )
             full_model.resize_token_embeddings(len(self.tokenizer))
         
+        self.PAD = "<|pad|>"
         if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.add_special_tokens({"pad_token": self.PAD})
+            full_model.resize_token_embeddings(len(self.tokenizer))
+
             
         # Apply LoRA/DoRA - Now supported with Python 3.11.9!
         lora_config = LoraConfig(
@@ -384,6 +387,8 @@ class SplitLoRATrainer:
             labels = encoding["input_ids"].copy()
             mr_tokens = self.tokenizer.encode(mr_text + space_delim, add_special_tokens=False)
             labels[:len(mr_tokens)] = [-100] * len(mr_tokens)
+            labels = [ -100 if tok == self.tokenizer.pad_token_id else tok
+                        for tok in labels ]                       # NEW
 
             
             return {
@@ -878,9 +883,7 @@ def main():
         
         # Initialize trainer
         trainer = SplitLoRATrainer(learning_rate=3e-4)  # Slightly higher LR for debug
-        ids = trainer.tokenizer.encode(" " + trainer.DELIM + " ",
-                               add_special_tokens=False)
-        print(ids, len(ids))          # must print ONE integer and “1”
+       
 
         # Load tiny dataset
         train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=True)
