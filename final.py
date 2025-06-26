@@ -969,6 +969,11 @@ def main():
     parser.add_argument("--debug", action="store_true", help="Ultra-fast debug mode")  # NEW
     
     args = parser.parse_args()
+     # 1️⃣  build the trainer first
+    trainer = SplitLoRATrainer(learning_rate=args.learning_rate)
+
+    if args.load_checkpoint:
+        trainer.load_checkpoint(args.load_checkpoint)
     
     if args.eval_only:
         print("Beam search")
