@@ -541,25 +541,22 @@ class SplitLoRATrainer:
                     next_token_logits = logits[:, -1, :]                   # (1, vocab)
                     if greedy:
                         bs, cur_len = generated_ids.size()
-                        for b in range(bs):
-                            if cur_len >= NO_REPEAT_N - 1:
-                                prefix   = tuple(generated_ids[b, -(NO_REPEAT_N-1):].tolist())
-                                blocked  = set()
-                                hist     = generated_ids[b].tolist()
-                                for i in range(len(hist) - NO_REPEAT_N + 1):
-                                    if tuple(hist[i:i+NO_REPEAT_N-1]) == prefix:
-                                        blocked.add(hist[i+NO_REPEAT_N-1])
+                        # 3-gram ban but keep EOS
+                        if cur_len >= NO_REPEAT_N - 1:
+                            prefix = tuple(generated_ids[0, -(NO_REPEAT_N-1):].tolist())
+                            blocked = {
+                                generated_ids[0, i+NO_REPEAT_N-1].item()
+                                for i in range(len(generated_ids[0]) - NO_REPEAT_N + 1)
+                                if tuple(generated_ids[0, i:i+NO_REPEAT_N-1].tolist()) == prefix
+                            }
+                            blocked.discard(self.tokenizer.eos_token_id)
+                            next_token_logits[0, list(blocked)] = -float("inf")
 
-                                # ➊  allow EOS in the candidate list
-                                blocked.discard(self.tokenizer.eos_token_id)
+                        # ONE presence penalty only for the *last* token
+                        last_tok = generated_ids[0, -1]
+                        next_token_logits[0, last_tok] -= 1.0
 
-                                if blocked:
-                                    next_token_logits[b, list(blocked)] = -float("inf")
-
-                            # ➋  one-shot presence penalty (subtract once, don’t divide)
-                            next_token_logits[b, generated_ids[b]] -= 1.0
-
-                        next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+                        next_token = torch.argmax(next_token_logits, -1, keepdim=True)
                     else:
                         # ---------------------------------------------------------
                         #  A. global repetition-penalty  (1.3 works well for GPT-2)
