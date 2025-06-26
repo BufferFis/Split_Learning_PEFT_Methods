@@ -1,5 +1,6 @@
 # splitlora_single.py
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -16,8 +17,8 @@ import traceback
 from datetime import datetime
 import math
 
-# Set GPU device to A1000 (GPU 1)
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+# Set GPU device to A100 (GPU 1)
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
