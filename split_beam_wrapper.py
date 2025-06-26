@@ -21,8 +21,9 @@ class SplitGPT2ForGeneration(PreTrainedModel, GenerationMixin):
         self.server      = server
         self.tail_client = tail_client
         # expose pad/eos so that generate() can build causal masks
-        self.config.pad_token_id = tokenizer.pad_token_id
-        self.config.eos_token_id = tokenizer.eos_token_id
+        self.config.pad_token_id  = tokenizer.pad_token_id
+        self.config.eos_token_id  = tokenizer.eos_token_id
+        self.config.vocab_size    = tokenizer.vocab_size
 
     # -------- GenerationMixin hooks -----------------------------
     def prepare_inputs_for_generation(self,
