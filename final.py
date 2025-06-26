@@ -515,7 +515,7 @@ class SplitLoRATrainer:
         
         print("Training completed!")
     
-    def generate(self, prompt_ids, prompt_attention_mask, max_length=64):
+    def generate(self, prompt_ids, prompt_attention_mask, max_length=64, greedy=False):
         """FIXED: Generate continuation from MR prompt with proper causal masking"""
         with torch.no_grad():
             try:
@@ -554,7 +554,11 @@ class SplitLoRATrainer:
                     # Greedy decoding
                     next_token_logits = logits[:, -1, :]                     # (bs, vocab)
                     probs = torch.softmax(next_token_logits / 1.0, dim=-1)   # temperature=1
-                    next_token = torch.multinomial(probs, 1)    # temperature
+                    if greedy:
+                        next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+                    else:
+                        probs = torch.softmax(next_token_logits, dim=-1)
+                        next_token = torch.multinomial(probs, 1)
 
                     generated_ids = torch.cat([generated_ids, next_token], dim=1)
                     
@@ -605,7 +609,7 @@ class SplitLoRATrainer:
                     attention_mask = encoding["attention_mask"].to(device)
                     
                     # Generate prediction from MR only
-                    generated_text = self.generate(input_ids, attention_mask, max_length=64)
+                    generated_text = self.generate(input_ids, attention_mask, max_length=64, greedy=True)
                     
                     # FIX: Check for valid generation
                     if generated_text and len(generated_text.strip()) > 0:
