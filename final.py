@@ -940,64 +940,56 @@ class SplitLoRATrainer:
 # -----------------------------------------------------------------
 #  bullet-proof loader for the three SplitLoRA slices
 # -----------------------------------------------------------------
-from peft import PeftModel
-from transformers import AutoModelForCausalLM
+
 
 def build_fused_splitlora(model_name: str,
-                          ckpt_root: str,
+                          ckpt_root : str,
                           tokenizer,
-                          device):
+                          device     ):
 
-    base = AutoModelForCausalLM.from_pretrained(model_name).to(device)
+    model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
 
-    # ① resize once → no CUDA assert when <|gen|> / <|pad|> appear
-    if len(tokenizer) != base.get_input_embeddings().num_embeddings:
-        base.resize_token_embeddings(len(tokenizer))
+    # resize once so <|gen|> / <|pad|> never overflow the embedding
+    if len(tokenizer) != model.get_input_embeddings().num_embeddings:
+        model.resize_token_embeddings(len(tokenizer))
 
-    # ② load the HEAD adapter, which creates the first PEFT wrapper
+    # ― add HEAD adapter  → creates the first PEFT wrapper
     model = PeftModel.from_pretrained(
-                base,
-                os.path.join(ckpt_root, "head_model"),
-                is_trainable=False)
+        model,
+        os.path.join(ckpt_root, "head_model"),
+        is_trainable=False,
+        output_loading_info=False)
 
-    # ③ attach BODY and TAIL with load_adapter (no re-wrapping)
+    # ― add BODY and TAIL without re-wrapping
     for name in ("body_model", "tail_model"):
-        model.load_adapter(
-            os.path.join(ckpt_root, name),
-            adapter_name=name,
-            is_trainable=False)
+        model.load_adapter(os.path.join(ckpt_root, name),
+                           adapter_name=name,
+                           is_trainable=False)
 
-    # ④ fuse LoRA + DoRA weights → plain GPT-2, no PEFT layers inside
+    # fuse low-rank + DoRA magnitudes into the base weights
     model = model.merge_and_unload().eval()
+
+    # fix pad / eos ids so HF can build the attention mask
+    model.config.pad_token_id = tokenizer.pad_token_id
+    model.config.eos_token_id = tokenizer.eos_token_id
     return model
 
+def beam_generate_from_mr(mr        : str,
+                          tokenizer,
+                          ckpt_root : str,
+                          max_new   : int = 64):
 
-
-def beam_generate_from_mr(mr, tokenizer, ckpt_root, max_new=64):
     prompt = mr + " " + "<|gen|>" + " "
-    ids    = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+    enc    = tokenizer(prompt, return_tensors="pt")
+    ids    = enc["input_ids"].to(device)
+    mask   = enc["attention_mask"].to(device)
 
-    model = build_fused_splitlora("gpt2", ckpt_root, tokenizer, device)
+    model  = build_fused_splitlora("gpt2", ckpt_root, tokenizer, device)
 
     with torch.no_grad():
         out = model.generate(
                 ids,
-                max_new_tokens=max_new,
-                num_beams=10,
-                length_penalty=0.8,
-                no_repeat_ngram_size=4,
-                repetition_penalty=1.0,
-                early_stopping=True,
-                eos_token_id=tokenizer.eos_token_id,
-                pad_token_id=tokenizer.eos_token_id)
-
-    return tokenizer.decode(out[0, ids.size(1):],
-                            skip_special_tokens=True).strip()
-
-
-    with torch.no_grad():
-        out = model.generate(
-                input_ids,
+                attention_mask      = mask,            # ← avoids warning
                 max_new_tokens      = max_new,
                 num_beams           = 10,
                 length_penalty      = 0.8,
@@ -1005,17 +997,10 @@ def beam_generate_from_mr(mr, tokenizer, ckpt_root, max_new=64):
                 repetition_penalty  = 1.0,
                 early_stopping      = True,
                 eos_token_id        = tokenizer.eos_token_id,
-                pad_token_id        = tokenizer.eos_token_id)
+                pad_token_id        = tokenizer.pad_token_id)
 
-    return tokenizer.decode(out[0, input_ids.size(1):],
-                            skip_special_tokens=True).strip()
-
-
-
-
-
-
-
+    return tokenizer.decode(
+             out[0, ids.size(1):], skip_special_tokens=True).strip()
 
 def main():
     parser = argparse.ArgumentParser(description="SplitLoRA Single File Implementation")
