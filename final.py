@@ -981,9 +981,10 @@ def main():
             head_client = trainer.head_client,
             server      = trainer.server,
             tail_client = trainer.tail_client,
-            base_config = copy.deepcopy(trainer.head_client.head_model.config)
+            base_config = trainer.head_client.head_model.config
          ).to(device).eval()
-    wrapper.config.vocab_size = wrapper.generation_config.vocab_size = trainer.tokenizer.vocab_size
+
+    
     
     # Load dataset (regular mode)
     train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
