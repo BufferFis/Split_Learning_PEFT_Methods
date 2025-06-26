@@ -325,7 +325,7 @@ class SplitLoRATrainer:
         
         # Load and split model
         full_model = AutoModelForCausalLM.from_pretrained(model_name)
-        
+        added = 0
         
         self.DELIM = "<|gen|>"                          # ONE token
         if self.DELIM not in self.tokenizer.get_vocab():
@@ -704,6 +704,7 @@ class SplitLoRATrainer:
             return False
         
         try:
+            added = 0
             if "<|gen|>" not in self.tokenizer.get_vocab():
                 added += self.tokenizer.add_special_tokens(
                     {"additional_special_tokens": ["<|gen|>"]})
