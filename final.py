@@ -539,15 +539,37 @@ class SplitLoRATrainer:
                     if greedy:
                         next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
                     else:
-                        # ───────────────────────────────────────────────────────────────
-                        # 1-token repetition penalty (no-repeat-ngram-size = 1)
-                        # subtract 1.2 from the logit of every token that is already in the
-                        # partial sequence so it is less likely to be picked again
-                        for b in range(generated_ids.size(0)):          # usually bs = 1
-                            next_token_logits[b, generated_ids[b]] -= 1.2
-                        # ───────────────────────────────────────────────────────────────
-                        probs      = torch.softmax(next_token_logits / 1.0, dim=-1)
+                        # ---------------------------------------------------------
+                        #  A. global repetition-penalty  (1.3 works well for GPT-2)
+                        # ---------------------------------------------------------
+                        REP_PENALTY = 1.3
+                        for b in range(generated_ids.size(0)):               # bs is 1 here
+                            prev_tokens = generated_ids[b]
+                            next_token_logits[b, prev_tokens] /= REP_PENALTY
+
+                        # ---------------------------------------------------------
+                        #  B. no-repeat n-gram  (n = 3)
+                        #     block any token that would form an already-seen trigram
+                        # ---------------------------------------------------------
+                        N = 3
+                        for b in range(generated_ids.size(0)):
+                            if generated_ids.size(1) >= N - 1:
+                                prefix = tuple(generated_ids[b, - (N - 1):].tolist())
+                                # collect all tokens that have followed this prefix before
+                                blocked = set()
+                                history = generated_ids[b].tolist()
+                                for i in range(len(history) - N + 1):
+                                    if tuple(history[i : i + N - 1]) == prefix:
+                                        blocked.add(history[i + N - 1])
+                                if blocked:
+                                    next_token_logits[b, list(blocked)] = -float("inf")
+                        
+                        # ---------------------------------------------------------
+                        #  final sampling step
+                        # ---------------------------------------------------------
+                        probs      = torch.softmax(next_token_logits, dim=-1)
                         next_token = torch.multinomial(probs, 1)
+
 
                     generated_ids  = torch.cat([generated_ids,  next_token], dim=1)
 
