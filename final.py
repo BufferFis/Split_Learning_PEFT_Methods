@@ -285,7 +285,9 @@ class TailClient:
 
         # Compute loss 
         shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
+        shift_labels = labels[..., 1:].contiguous()               # existing
+        shift_labels[shift_labels == -100] = self.loss_fn.ignore_index
+
         
         # Check for NaN in logits
         if torch.isnan(shift_logits).any():
@@ -903,7 +905,7 @@ def main():
     
     # REGULAR MODE (existing code)
     # Initialize trainer
-    trainer = SplitLoRATrainer(learning_rate=1e-5)
+    trainer = SplitLoRATrainer(learning_rate=1e-4)
     
     # Load checkpoint if specified
     if args.load_checkpoint:
