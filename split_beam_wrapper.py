@@ -15,6 +15,7 @@ class SplitGPT2ForGeneration(PreTrainedModel, GenerationMixin):
                  head_client, server, tail_client,
                  base_config):
         super().__init__(base_config)
+        self.dummy = nn.Parameter(torch.empty(0), requires_grad=False)
         self.tokenizer = tokenizer
         self.head_client = head_client
         self.server      = server
