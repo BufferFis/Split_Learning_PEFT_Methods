@@ -20,7 +20,7 @@ import math
 from peft import PeftModel
 # after the other imports in final.py
 from split_beam_wrapper import SplitGPT2ForGeneration   # NEW
-
+import copy
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -981,7 +981,7 @@ def main():
             head_client = trainer.head_client,
             server      = trainer.server,
             tail_client = trainer.tail_client,
-            base_config = AutoModelForCausalLM.from_pretrained("gpt2").config
+            base_config = copy.deepcopy(trainer.head_client.head_model.config)
          ).to(device).eval()
     
     # Load dataset (regular mode)
