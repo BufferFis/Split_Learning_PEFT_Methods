@@ -704,19 +704,17 @@ class SplitLoRATrainer:
             return False
         
         try:
-            added = 0
+            added = 0                                                     # NEW
             if "<|gen|>" not in self.tokenizer.get_vocab():
                 added += self.tokenizer.add_special_tokens(
                     {"additional_special_tokens": ["<|gen|>"]})
             if self.tokenizer.pad_token is None:
                 added += self.tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
 
-            full_model = AutoModelForCausalLM.from_pretrained("gpt2")
+            full_model = AutoModelForCausalLM.from_pretrained("gpt2")     # ONE load only
             if added:
-                full_model.resize_token_embeddings(len(self.tokenizer))
-            # Recreate base models
-            full_model = AutoModelForCausalLM.from_pretrained("gpt2")
-            full_model.resize_token_embeddings(len(self.tokenizer))
+                full_model.resize_token_embeddings(len(self.tokenizer))   # resize once
+
             head_model, body_model, tail_model = split_gpt2(full_model, 2, 2)
             
             # Load PEFT models
