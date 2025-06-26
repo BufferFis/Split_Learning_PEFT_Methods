@@ -17,7 +17,7 @@ import traceback
 from datetime import datetime
 import math
 
-# Set GPU device to A100 (GPU 1)
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -905,8 +905,7 @@ def main():
     
     args = parser.parse_args()
     
-    # Set GPU device
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_device
+    
     
     # DEBUG MODE
     if args.debug:
