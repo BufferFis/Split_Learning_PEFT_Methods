@@ -18,8 +18,8 @@ import traceback
 from datetime import datetime
 import math
 from peft import PeftModel
-
-
+# after the other imports in final.py
+from split_beam_wrapper import SplitGPT2ForGeneration   # NEW
 
 
 
@@ -1050,16 +1050,38 @@ def main():
     if args.load_checkpoint:
         trainer.load_checkpoint(args.load_checkpoint)
     
+    wrapper = SplitGPT2ForGeneration(
+            tokenizer   = trainer.tokenizer,
+            head_client = trainer.head_client,
+            server      = trainer.server,
+            tail_client = trainer.tail_client,
+            base_config = AutoModelForCausalLM.from_pretrained("gpt2").config
+         ).to(device).eval()
+    
     # Load dataset (regular mode)
     train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
     
     if args.eval_only:
-        mr = "name[Blue Spice], eatType[coffee shop], area[city centre]"
-        output = beam_generate_from_mr(mr,
-                                    trainer.tokenizer,
-                                    args.load_checkpoint,
-                                    max_new=64)
-        print("Beam-10 output:", output)
+        mr_text = "name[Blue Spice], eatType[coffee shop], area[city centre]"
+        prompt  = mr_text + " " + trainer.DELIM + " "
+        enc     = trainer.tokenizer(prompt, return_tensors="pt")
+        ids, mask = enc["input_ids"].to(device), enc["attention_mask"].to(device)
+
+        with torch.no_grad():
+            out = wrapper.generate(
+                    ids,
+                    attention_mask        = mask,
+                    max_new_tokens        = 64,
+                    num_beams             = 10,
+                    length_penalty        = 0.8,
+                    no_repeat_ngram_size  = 4,
+                    early_stopping        = True,
+                    eos_token_id          = trainer.tokenizer.eos_token_id,
+                    pad_token_id          = trainer.tokenizer.pad_token_id
+                )
+
+        print("Beam-10 output:",
+            trainer.tokenizer.decode(out[0, ids.size(1):], skip_special_tokens=True).strip())
         return
 
 
