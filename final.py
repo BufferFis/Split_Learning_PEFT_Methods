@@ -1,9 +1,7 @@
 # splitlora_single.py
 import os
-import os
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"     # or the bus-id / UUID of AF:00.0
-import torch
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -521,7 +519,7 @@ class SplitLoRATrainer:
         
         print("Training completed!")
     
-    def generate(self, prompt_ids, prompt_attention_mask, max_length=64, greedy=False):
+    def generate(self, prompt_ids, prompt_attention_mask, max_length=128, greedy=False):
         """FIXED: Generate continuation from MR prompt with proper causal masking"""
         with torch.no_grad():
             try:
@@ -537,10 +535,30 @@ class SplitLoRATrainer:
                     head_acts = self.head_client.forward(generated_ids, attention_mask)
                     body_acts = self.server.forward(head_acts, attention_mask)
                     logits    = self.tail_client.forward(body_acts, attention_mask)
+                    NO_REPEAT_N = 3 
 
                     # ----- 3. pick next token ------------------------------------
                     next_token_logits = logits[:, -1, :]                   # (1, vocab)
                     if greedy:
+                        bs, cur_len = generated_ids.size()           # (batch, seq_len)
+
+                        # ── for every sequence in the batch ─────────────────────────────
+                        for b in range(bs):
+                            if cur_len >= NO_REPEAT_N - 1:
+                                # the (n-1)-gram prefix we are about to extend
+                                prefix = tuple(generated_ids[b, -(NO_REPEAT_N - 1):].tolist())
+
+                                # collect every token that has *already* followed this prefix
+                                blocked = set()
+                                history = generated_ids[b].tolist()
+                                for i in range(len(history) - NO_REPEAT_N + 1):
+                                    if tuple(history[i : i + NO_REPEAT_N - 1]) == prefix:
+                                        blocked.add(history[i + NO_REPEAT_N - 1])
+
+                                if blocked:                          # ban them in the logits
+                                    next_token_logits[b, list(blocked)] = -float("inf")
+
+                        # pick the highest remaining log-prob
                         next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
                     else:
                         # ---------------------------------------------------------
@@ -626,7 +644,7 @@ class SplitLoRATrainer:
                     attention_mask = encoding["attention_mask"].to(device)
                     
                     # Generate prediction from MR only
-                    generated_text = self.generate(input_ids, attention_mask, max_length=64, greedy=False)
+                    generated_text = self.generate(input_ids, attention_mask, max_length=128, greedy=True)
                     
                     # FIX: Check for valid generation
                     if generated_text and len(generated_text.strip()) > 0:
