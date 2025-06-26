@@ -704,17 +704,20 @@ class SplitLoRATrainer:
             return False
         
         try:
-            added = 0                                                     # NEW
+            # 1. be sure the tokenizer already contains the two tokens
             if "<|gen|>" not in self.tokenizer.get_vocab():
-                added += self.tokenizer.add_special_tokens(
-                    {"additional_special_tokens": ["<|gen|>"]})
+                self.tokenizer.add_special_tokens({"additional_special_tokens": ["<|gen|>"]})
             if self.tokenizer.pad_token is None:
-                added += self.tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+                self.tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
 
-            full_model = AutoModelForCausalLM.from_pretrained("gpt2")     # ONE load only
-            if added:
-                full_model.resize_token_embeddings(len(self.tokenizer))   # resize once
+            # 2. load base model once
+            full_model = AutoModelForCausalLM.from_pretrained("gpt2")
 
+            # 3. ALWAYS resize if sizes differ
+            if len(self.tokenizer) != full_model.get_input_embeddings().num_embeddings:
+                full_model.resize_token_embeddings(len(self.tokenizer))
+            
+            # 4. now split and load LoRA weights
             head_model, body_model, tail_model = split_gpt2(full_model, 2, 2)
             
             # Load PEFT models
