@@ -1,6 +1,9 @@
 # splitlora_single.py
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+import os
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"     # or the bus-id / UUID of AF:00.0
+import torch
 import torch
 import torch.nn as nn
 import torch.optim as optim
