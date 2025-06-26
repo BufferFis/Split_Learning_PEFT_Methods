@@ -23,6 +23,43 @@ import math
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
+def beam_generate_full(model_name: str,
+                       adapter_path: str,
+                       prompt_ids: torch.Tensor,
+                       max_new: int = 80) -> torch.Tensor:
+    """
+    Load a *single* GPT-2, apply the merged LoRA+DoRA adapter,
+    fuse it with merge_and_unload(), then run 10-beam search.
+
+    Returns a tensor of generated ids (incl. prompt).
+    """
+    from peft import PeftModel
+
+    # 1. base model
+    base = AutoModelForCausalLM.from_pretrained(model_name).to(device)
+
+    # 2. load ALL adapters that live in adapter_path
+    model = PeftModel.from_pretrained(base,
+                                      adapter_path,
+                                      is_trainable=False)
+
+    # 3. fuse LoRA+DoRA into the base weights (fast inference)
+    model = model.merge_and_unload().eval()
+
+    with torch.no_grad():
+        out = model.generate(
+                prompt_ids,
+                max_new_tokens=max_new,
+                num_beams=10,
+                length_penalty=0.8,
+                no_repeat_ngram_size=4,
+                repetition_penalty=1.0,
+                early_stopping=True,
+                eos_token_id=model.config.eos_token_id,
+            )
+    return out
+
+
 def split_gpt2(model, head_layers=2, tail_layers=2):
     """Split GPT2 model into head, body, and tail parts"""
     total_layers = len(model.transformer.h)
@@ -933,7 +970,20 @@ def main():
     
     args = parser.parse_args()
     
-    
+    if args.eval_only:
+        mr = "name[Blue Spice], eatType[coffee shop], area[city centre]"
+        space_delim = " " + trainer.DELIM + " "
+        prompt = mr + space_delim
+        ids = trainer.tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+
+        out = beam_generate_full("gpt2",
+                                "./merged_adapter",
+                                ids,
+                                max_new=80)
+
+        print("\nBeam-10 output:")
+        print(trainer.tokenizer.decode(out[0, ids.size(1):],
+                                    skip_special_tokens=True))
     
     # DEBUG MODE
     if args.debug:
