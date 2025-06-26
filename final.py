@@ -933,41 +933,65 @@ class SplitLoRATrainer:
 # ──────────────────────────────────────────────────────────────
 
 
+# ─── helper: build a single GPT-2 that already contains the
+#             three LoRA + DoRA slices  ─────────────────────────
+
+
 def build_fused_splitlora(model_name: str,
                           ckpt_root: str,
                           tokenizer,
-                          device=torch.device("cpu")):
+                          device):
     """
-    1. Load base GPT-2
-    2. Resize wte/lm_head if <|gen|>, <|pad|> were added
-    3. Attach head, body, tail adapters one after another
-    4. merge_and_unload()  →  plain GPT-2 with LoRA+DoRA fused
+    • loads plain GPT-2
+    • resizes its embedding matrix to fit <|gen|>, <|pad|>
+    • successively attaches head / body / tail adapters
+    • fuse them in-place → returns a plain GPT-2 ready for beam search
     """
     base = AutoModelForCausalLM.from_pretrained(model_name).to(device)
 
+    # ① make sure the two extra tokens fit → no indexSelectLargeIndex assert
     if len(tokenizer) != base.get_input_embeddings().num_embeddings:
-        base.resize_token_embeddings(len(tokenizer))      # <- CUDA safe
+        base.resize_token_embeddings(len(tokenizer))
 
+    # ② attach each adapter – no “missing keys” because every sub-dir
     for sub in ("head_model", "body_model", "tail_model"):
-        path = os.path.join(ckpt_root, sub)
-        base = PeftModel.from_pretrained(base, path, is_trainable=False)
+        base = PeftModel.from_pretrained(base,
+                                         os.path.join(ckpt_root, sub),
+                                         is_trainable=False,
+                                         output_loading_info=False)
 
-    fused = base.merge_and_unload().eval()    # no PEFT modules remain
-    return fused
+    # ③ fuse LoRA+DoRA weights → plain GPT-2 (fast inference)
+    base = base.merge_and_unload().eval()
+    return base
 
-def beam_generate_full(tokenizer, prompt_ids, ckpt_root, max_new=80):
+
+def beam_generate_from_mr(mr: str,
+                          tokenizer,
+                          ckpt_root: str,
+                          max_new: int = 64):
+    """Return the model’s best beam as text."""
+    # build prompt  (MR  +  delimiter)
+    prompt = mr + " " + "<|gen|>" + " "
+    enc    = tokenizer(prompt, return_tensors="pt")
+    input_ids = enc["input_ids"].to(device)
+
     model = build_fused_splitlora("gpt2", ckpt_root, tokenizer, device)
+
     with torch.no_grad():
         out = model.generate(
-                 prompt_ids,
-                 max_new_tokens=max_new,
-                 num_beams=10,
-                 length_penalty=0.8,
-                 no_repeat_ngram_size=4,
-                 repetition_penalty=1.0,
-                 early_stopping=True,
-                 eos_token_id=model.config.eos_token_id)
-    return out
+                input_ids,
+                max_new_tokens      = max_new,
+                num_beams           = 10,
+                length_penalty      = 0.8,
+                no_repeat_ngram_size= 4,
+                repetition_penalty  = 1.0,
+                early_stopping      = True,
+                eos_token_id        = tokenizer.eos_token_id,
+                pad_token_id        = tokenizer.eos_token_id)
+
+    return tokenizer.decode(out[0, input_ids.size(1):],
+                            skip_special_tokens=True).strip()
+
 
 
 
@@ -1026,6 +1050,15 @@ def main():
     # Load dataset (regular mode)
     train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
     
+    if args.eval_only:
+        mr = "name[Blue Spice], eatType[coffee shop], area[city centre]"
+        output = beam_generate_from_mr(mr,
+                                    trainer.tokenizer,
+                                    args.load_checkpoint,
+                                    max_new=64)
+        print("Beam-10 output:", output)
+        return
+
 
     if not args.eval_only:
         # Create dataloader and train
