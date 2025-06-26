@@ -1,16 +1,18 @@
 # fuse_splitlora.py  –  run once
-import os, torch
+import os
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 
-import types, torch
-if not hasattr(torch.distributed, "tensor"):
-    torch.distributed.tensor = types.ModuleType("tensor")
-try:
-    from torch.distributed._tensor import DTensor          # PT ≤ 2.4
-    torch.distributed.tensor.DTensor = DTensor
-except ImportError:
-    pass   # PT ≥ 2.5 already has the correct path
+# --- compatibility shim: make DTensor resolvable on PT 2.4 -------------
+import types, sys, torch
+if "torch.distributed.tensor" not in sys.modules:          # PT < 2.5
+    stub = types.ModuleType("torch.distributed.tensor")
+    class _FakeDTensor(torch.Tensor):                      # dummy class
+        pass
+    stub.DTensor = _FakeDTensor
+    sys.modules["torch.distributed.tensor"] = stub
+# -----------------------------------------------------------------------
+
 
 device = "cuda"
 
