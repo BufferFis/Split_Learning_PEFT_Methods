@@ -540,25 +540,25 @@ class SplitLoRATrainer:
                     # ----- 3. pick next token ------------------------------------
                     next_token_logits = logits[:, -1, :]                   # (1, vocab)
                     if greedy:
-                        bs, cur_len = generated_ids.size()           # (batch, seq_len)
-
-                        # ── for every sequence in the batch ─────────────────────────────
+                        bs, cur_len = generated_ids.size()
                         for b in range(bs):
                             if cur_len >= NO_REPEAT_N - 1:
-                                # the (n-1)-gram prefix we are about to extend
-                                prefix = tuple(generated_ids[b, -(NO_REPEAT_N - 1):].tolist())
+                                prefix   = tuple(generated_ids[b, -(NO_REPEAT_N-1):].tolist())
+                                blocked  = set()
+                                hist     = generated_ids[b].tolist()
+                                for i in range(len(hist) - NO_REPEAT_N + 1):
+                                    if tuple(hist[i:i+NO_REPEAT_N-1]) == prefix:
+                                        blocked.add(hist[i+NO_REPEAT_N-1])
 
-                                # collect every token that has *already* followed this prefix
-                                blocked = set()
-                                history = generated_ids[b].tolist()
-                                for i in range(len(history) - NO_REPEAT_N + 1):
-                                    if tuple(history[i : i + NO_REPEAT_N - 1]) == prefix:
-                                        blocked.add(history[i + NO_REPEAT_N - 1])
+                                # ➊  allow EOS in the candidate list
+                                blocked.discard(self.tokenizer.eos_token_id)
 
-                                if blocked:                          # ban them in the logits
+                                if blocked:
                                     next_token_logits[b, list(blocked)] = -float("inf")
 
-                        # pick the highest remaining log-prob
+                            # ➋  one-shot presence penalty (subtract once, don’t divide)
+                            next_token_logits[b, generated_ids[b]] -= 1.0
+
                         next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
                     else:
                         # ---------------------------------------------------------
@@ -644,7 +644,7 @@ class SplitLoRATrainer:
                     attention_mask = encoding["attention_mask"].to(device)
                     
                     # Generate prediction from MR only
-                    generated_text = self.generate(input_ids, attention_mask, max_length=128, greedy=True)
+                    generated_text = self.generate(input_ids, attention_mask, max_length=80, greedy=True)
                     
                     # FIX: Check for valid generation
                     if generated_text and len(generated_text.strip()) > 0:
