@@ -998,15 +998,27 @@ def main():
         with torch.no_grad():
             out = wrapper.generate(
                     ids,
-                    attention_mask        = mask,
-                    max_new_tokens        = 64,
-                    num_beams             = 10,
-                    length_penalty        = 0.8,
-                    no_repeat_ngram_size  = 4,
-                    early_stopping        = True,
-                    eos_token_id          = trainer.tokenizer.eos_token_id,
-                    pad_token_id          = trainer.tokenizer.pad_token_id
-                )
+                    attention_mask = mask,
+
+                    # ---------------- SplitFM beam-search settings -----------------
+                    max_new_tokens        = 64,     # --eval_len
+                    num_beams             = 10,     # --beam
+                    length_penalty        = 0.8,    # --length_penalty
+                    early_stopping        = True,   # end once all beams hit <eos>
+                    no_repeat_ngram_size  = 4,      # --no_repeat_ngram_size
+                    repetition_penalty    = 1.0,    # --repetition_penalty (= neutral)
+                    # ----------------------------------------------------------------
+
+                    # no diversity groups in SplitFM; leave defaults
+                    # diversity_penalty   = 0.0
+                    # num_beam_groups     = 1
+
+                    # housekeeping
+                    remove_invalid_values = True,   # robust against any NaNs
+                    eos_token_id          = trainer.tokenizer.eos_token_id,  # SplitFM passes 628
+                    pad_token_id          = trainer.tokenizer.pad_token_id,
+                    return_dict_in_generate = False # SplitFM just wants the ids
+            )
 
         print("Beam-10 output:",
             trainer.tokenizer.decode(out[0, ids.size(1):], skip_special_tokens=True).strip())
