@@ -539,7 +539,14 @@ class SplitLoRATrainer:
                     if greedy:
                         next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
                     else:
-                        probs      = torch.softmax(next_token_logits, dim=-1)
+                        # ───────────────────────────────────────────────────────────────
+                        # 1-token repetition penalty (no-repeat-ngram-size = 1)
+                        # subtract 1.2 from the logit of every token that is already in the
+                        # partial sequence so it is less likely to be picked again
+                        for b in range(generated_ids.size(0)):          # usually bs = 1
+                            next_token_logits[b, generated_ids[b]] -= 1.2
+                        # ───────────────────────────────────────────────────────────────
+                        probs      = torch.softmax(next_token_logits / 1.0, dim=-1)
                         next_token = torch.multinomial(probs, 1)
 
                     generated_ids  = torch.cat([generated_ids,  next_token], dim=1)
@@ -578,7 +585,7 @@ class SplitLoRATrainer:
             failed_generations = 0
             
             # Sample evaluation data
-            eval_samples = test_dataset.select(range(min(50, len(test_dataset))))
+            eval_samples = test_dataset
             
             for i, sample in enumerate(tqdm(eval_samples, desc="Evaluating")):
                 try:
@@ -593,7 +600,7 @@ class SplitLoRATrainer:
                     attention_mask = encoding["attention_mask"].to(device)
                     
                     # Generate prediction from MR only
-                    generated_text = self.generate(input_ids, attention_mask, max_length=64, greedy=True)
+                    generated_text = self.generate(input_ids, attention_mask, max_length=64, greedy=False)
                     
                     # FIX: Check for valid generation
                     if generated_text and len(generated_text.strip()) > 0:
@@ -719,7 +726,7 @@ class SplitLoRATrainer:
             
             # 4. now split and load LoRA weights
             head_model, body_model, tail_model = split_gpt2(full_model, 2, 2)
-            
+
             # Load PEFT models
             head_model = PeftModel.from_pretrained(head_model, os.path.join(path, "head_model"), is_trainable=True)
             body_model = PeftModel.from_pretrained(body_model, os.path.join(path, "body_model"), is_trainable=True)
