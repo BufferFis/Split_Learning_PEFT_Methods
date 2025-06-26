@@ -937,45 +937,63 @@ class SplitLoRATrainer:
 #             three LoRA + DoRA slices  ─────────────────────────
 
 
+# -----------------------------------------------------------------
+#  bullet-proof loader for the three SplitLoRA slices
+# -----------------------------------------------------------------
+from peft import PeftModel
+from transformers import AutoModelForCausalLM
+
 def build_fused_splitlora(model_name: str,
                           ckpt_root: str,
                           tokenizer,
                           device):
-    """
-    • loads plain GPT-2
-    • resizes its embedding matrix to fit <|gen|>, <|pad|>
-    • successively attaches head / body / tail adapters
-    • fuse them in-place → returns a plain GPT-2 ready for beam search
-    """
+
     base = AutoModelForCausalLM.from_pretrained(model_name).to(device)
 
-    # ① make sure the two extra tokens fit → no indexSelectLargeIndex assert
+    # ① resize once → no CUDA assert when <|gen|> / <|pad|> appear
     if len(tokenizer) != base.get_input_embeddings().num_embeddings:
         base.resize_token_embeddings(len(tokenizer))
 
-    # ② attach each adapter – no “missing keys” because every sub-dir
-    for sub in ("head_model", "body_model", "tail_model"):
-        base = PeftModel.from_pretrained(base,
-                                         os.path.join(ckpt_root, sub),
-                                         is_trainable=False,
-                                         output_loading_info=False)
+    # ② load the HEAD adapter, which creates the first PEFT wrapper
+    model = PeftModel.from_pretrained(
+                base,
+                os.path.join(ckpt_root, "head_model"),
+                is_trainable=False)
 
-    # ③ fuse LoRA+DoRA weights → plain GPT-2 (fast inference)
-    base = base.merge_and_unload().eval()
-    return base
+    # ③ attach BODY and TAIL with load_adapter (no re-wrapping)
+    for name in ("body_model", "tail_model"):
+        model.load_adapter(
+            os.path.join(ckpt_root, name),
+            adapter_name=name,
+            is_trainable=False)
+
+    # ④ fuse LoRA + DoRA weights → plain GPT-2, no PEFT layers inside
+    model = model.merge_and_unload().eval()
+    return model
 
 
-def beam_generate_from_mr(mr: str,
-                          tokenizer,
-                          ckpt_root: str,
-                          max_new: int = 64):
-    """Return the model’s best beam as text."""
-    # build prompt  (MR  +  delimiter)
+
+def beam_generate_from_mr(mr, tokenizer, ckpt_root, max_new=64):
     prompt = mr + " " + "<|gen|>" + " "
-    enc    = tokenizer(prompt, return_tensors="pt")
-    input_ids = enc["input_ids"].to(device)
+    ids    = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
 
     model = build_fused_splitlora("gpt2", ckpt_root, tokenizer, device)
+
+    with torch.no_grad():
+        out = model.generate(
+                ids,
+                max_new_tokens=max_new,
+                num_beams=10,
+                length_penalty=0.8,
+                no_repeat_ngram_size=4,
+                repetition_penalty=1.0,
+                early_stopping=True,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.eos_token_id)
+
+    return tokenizer.decode(out[0, ids.size(1):],
+                            skip_special_tokens=True).strip()
+
 
     with torch.no_grad():
         out = model.generate(
