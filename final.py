@@ -878,7 +878,10 @@ def main():
         
         # Initialize trainer
         trainer = SplitLoRATrainer(learning_rate=3e-4)  # Slightly higher LR for debug
-        
+        ids = trainer.tokenizer.encode(" " + trainer.DELIM + " ",
+                               add_special_tokens=False)
+        print(ids, len(ids))          # must print ONE integer and “1”
+
         # Load tiny dataset
         train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=True)
         
