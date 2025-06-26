@@ -325,7 +325,7 @@ class SplitLoRATrainer:
         
         # Load and split model
         full_model = AutoModelForCausalLM.from_pretrained(model_name)
-        head_model, body_model, tail_model = split_gpt2(full_model, head_layers, tail_layers)
+        
         
         self.DELIM = "<|gen|>"                          # ONE token
         if self.DELIM not in self.tokenizer.get_vocab():
@@ -338,6 +338,8 @@ class SplitLoRATrainer:
         if self.tokenizer.pad_token is None:
             self.tokenizer.add_special_tokens({"pad_token": self.PAD})
             full_model.resize_token_embeddings(len(self.tokenizer))
+        
+        head_model, body_model, tail_model = split_gpt2(full_model, head_layers, tail_layers)
 
             
         # Apply LoRA/DoRA - Now supported with Python 3.11.9!
@@ -702,9 +704,18 @@ class SplitLoRATrainer:
             return False
         
         try:
-            # Load models
+            if "<|gen|>" not in self.tokenizer.get_vocab():
+                added += self.tokenizer.add_special_tokens(
+                    {"additional_special_tokens": ["<|gen|>"]})
+            if self.tokenizer.pad_token is None:
+                added += self.tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+
+            full_model = AutoModelForCausalLM.from_pretrained("gpt2")
+            if added:
+                full_model.resize_token_embeddings(len(self.tokenizer))
             # Recreate base models
             full_model = AutoModelForCausalLM.from_pretrained("gpt2")
+            full_model.resize_token_embeddings(len(self.tokenizer))
             head_model, body_model, tail_model = split_gpt2(full_model, 2, 2)
             
             # Load PEFT models
