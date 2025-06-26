@@ -971,6 +971,7 @@ def main():
     args = parser.parse_args()
     
     if args.eval_only:
+        print("Beam search")
         mr = "name[Blue Spice], eatType[coffee shop], area[city centre]"
         space_delim = " " + trainer.DELIM + " "
         prompt = mr + space_delim
