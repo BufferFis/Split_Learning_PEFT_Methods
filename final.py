@@ -1003,10 +1003,10 @@ def main():
                     # ---------------- SplitFM beam-search settings -----------------
                     max_new_tokens        = 64,     # --eval_len
                     num_beams             = 10,     # --beam
-                    length_penalty        = 0.8,    # --length_penalty
+                    length_penalty        = 0.6,    # --length_penalty
                     early_stopping        = True,   # end once all beams hit <eos>
-                    no_repeat_ngram_size  = 4,      # --no_repeat_ngram_size
-                    repetition_penalty    = 1.2,    # --repetition_penalty (= neutral)
+                    no_repeat_ngram_size  = 3,      # --no_repeat_ngram_size
+                    repetition_penalty    = 1.4,    # --repetition_penalty (= neutral)
                     diversity_penalty   = 0.3,
                     num_beam_groups     = 5,   # must divide num_beams (10)
 
