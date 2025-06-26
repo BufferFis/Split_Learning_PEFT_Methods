@@ -3,6 +3,15 @@ import os, torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 
+import types, torch
+if not hasattr(torch.distributed, "tensor"):
+    torch.distributed.tensor = types.ModuleType("tensor")
+try:
+    from torch.distributed._tensor import DTensor          # PT ≤ 2.4
+    torch.distributed.tensor.DTensor = DTensor
+except ImportError:
+    pass   # PT ≥ 2.5 already has the correct path
+
 device = "cuda"
 
 def fuse_splitlora(split_root: str,
