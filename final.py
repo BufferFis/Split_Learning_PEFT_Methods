@@ -585,7 +585,7 @@ class SplitLoRATrainer:
             failed_generations = 0
             
             # Sample evaluation data
-            eval_samples = test_dataset
+            eval_samples = test_dataset.select(range(100))
             
             for i, sample in enumerate(tqdm(eval_samples, desc="Evaluating")):
                 try:
