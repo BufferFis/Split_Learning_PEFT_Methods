@@ -1026,18 +1026,6 @@ def main():
     # Load dataset (regular mode)
     train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
     
-    if args.eval_only:
-        mr = "name[Blue Spice], eatType[coffee shop], area[city centre]"
-        prompt = mr + " " + trainer.DELIM + " "
-        ids = trainer.tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-
-        out = beam_generate_full(trainer.tokenizer, ids,
-                                args.load_checkpoint, max_new=80)
-
-        gen = trainer.tokenizer.decode(out[0, ids.size(1):],
-                                    skip_special_tokens=True).strip()
-        print("Beam-10 output:\n", gen)
-        return
 
     if not args.eval_only:
         # Create dataloader and train
