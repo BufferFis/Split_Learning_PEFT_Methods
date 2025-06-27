@@ -350,8 +350,18 @@ class SplitLoRATrainer:
             self.tokenizer.add_special_tokens({"pad_token": self.PAD})
             full_model.resize_token_embeddings(len(self.tokenizer))
         
+        # --- keep every config in sync with the enlarged vocabulary ------------
+        vocab = len(self.tokenizer)           # e.g. 50_259
+        full_model.config.vocab_size = vocab
+        full_model.generation_config.vocab_size = vocab          # HF ≥4.39
+
+
         head_model, body_model, tail_model = split_gpt2(full_model, head_layers, tail_layers)
 
+        for part in (head_model, body_model, tail_model):
+            part.config.vocab_size = vocab
+            if hasattr(part, "generation_config"):
+                part.generation_config.vocab_size = vocab
             
         # Apply LoRA/DoRA - Now supported with Python 3.11.9!
         lora_config = LoraConfig(
@@ -367,6 +377,11 @@ class SplitLoRATrainer:
         head_model = get_peft_model(head_model, lora_config)
         body_model = get_peft_model(body_model, lora_config)
         tail_model = get_peft_model(tail_model, lora_config)
+
+        for wrapped in (head_model, body_model, tail_model):
+            wrapped.base_model.config.vocab_size = vocab
+            if hasattr(wrapped.base_model, "generation_config"):
+                wrapped.base_model.generation_config.vocab_size = vocab
         
         # Initialize components
         self.server = ServerModel(body_model, learning_rate)
@@ -559,27 +574,48 @@ class SplitLoRATrainer:
             return False
         
         try:
-            # 1. be sure the tokenizer already contains the two tokens
-            if "<|gen|>" not in self.tokenizer.get_vocab():
-                self.tokenizer.add_special_tokens({"additional_special_tokens": ["<|gen|>"]})
-            if self.tokenizer.pad_token is None:
-                self.tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+            # # 1. be sure the tokenizer already contains the two tokens
+            # if "<|gen|>" not in self.tokenizer.get_vocab():
+            #     self.tokenizer.add_special_tokens({"additional_special_tokens": ["<|gen|>"]})
+            # if self.tokenizer.pad_token is None:
+            #     self.tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
 
             # 2. load base model once
             full_model = AutoModelForCausalLM.from_pretrained("gpt2")
+
+            self.tokenizer.add_special_tokens({"additional_special_tokens": [self.DELIM]})
+            full_model.resize_token_embeddings(len(self.tokenizer))
+
+            # later …
+            self.tokenizer.add_special_tokens({"pad_token": self.PAD})
+            full_model.resize_token_embeddings(len(self.tokenizer))
 
             # 3. ALWAYS resize if sizes differ
             if len(self.tokenizer) != full_model.get_input_embeddings().num_embeddings:
                 full_model.resize_token_embeddings(len(self.tokenizer))
             
+            vocab = len(self.tokenizer)           # e.g. 50_259
+            full_model.config.vocab_size = vocab
+            full_model.generation_config.vocab_size = vocab          # HF ≥4.39
+
             # 4. now split and load LoRA weights
             head_model, body_model, tail_model = split_gpt2(full_model, 2, 2)
+            
+            for part in (head_model, body_model, tail_model):
+                part.config.vocab_size = vocab
+                if hasattr(part, "generation_config"):
+                    part.generation_config.vocab_size = vocab
 
             # Load PEFT models
             head_model = PeftModel.from_pretrained(head_model, os.path.join(path, "head_model"), is_trainable=True)
             body_model = PeftModel.from_pretrained(body_model, os.path.join(path, "body_model"), is_trainable=True)
             tail_model = PeftModel.from_pretrained(tail_model, os.path.join(path, "tail_model"), is_trainable=True)
             
+            for wrapped in (head_model, body_model, tail_model):
+                wrapped.base_model.config.vocab_size = vocab
+                if hasattr(wrapped.base_model, "generation_config"):
+                    wrapped.base_model.generation_config.vocab_size = vocab
+
             # Update components
             self.head_client.head_model = head_model.to(device)
             self.server.body_model = body_model.to(device)
