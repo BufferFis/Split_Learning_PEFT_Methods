@@ -22,6 +22,7 @@ from peft import PeftModel
 from split_beam_wrapper import SplitGPT2ForGeneration   # NEW
 import copy
 from transformers import LogitsProcessorList, MinLengthLogitsProcessor
+import numpy as np
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -698,7 +699,7 @@ def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
 
     for sample in eval_split:
         try:
-            gen = generate_with_beam(trainer, wrapper, sample["meaning_representation"])
+            gen = generate_with_beam_mbr(trainer, wrapper, sample["meaning_representation"])
         except Exception as e:
             print("❌ generation failed:", e); gen = ""
         if gen:
@@ -719,6 +720,43 @@ def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
     return {"bleu": bleu_score, "meteor": meteor_score, "failed": fails}
 # ─────────────────────────────────────────────────────────────────────
 
+# ─── MBR beam search ────────────────────────────────────────────────
+def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text,
+                           max_new_tokens=64, k=10):
+    """
+    Return the BLEU-best candidate among the top-k beams (MBR reranking).
+    """
+    prompt = mr_text + " " + trainer.DELIM + " "
+    enc    = trainer.tokenizer(prompt, return_tensors="pt")
+    ids, m = enc["input_ids"].to(device), enc["attention_mask"].to(device)
+
+    with torch.no_grad():
+        beams = wrapper.generate(
+            ids, attention_mask=m,
+            max_new_tokens=max_new_tokens,
+            num_beams        = k,
+            num_return_sequences = k,   # <-- all beams back
+            length_penalty   = 0.7,
+            early_stopping   = True,
+            no_repeat_ngram_size = 4,
+            repetition_penalty   = 1.2,
+            diversity_penalty    = 0.0, # classic beam, like SplitFM
+            remove_invalid_values = True,
+            eos_token_id = trainer.tokenizer.eos_token_id,
+            pad_token_id = trainer.tokenizer.pad_token_id,
+        )
+
+    # decode beams to strings
+    cand_txt = [trainer.tokenizer.decode(
+                    seq[0, ids.size(1):], skip_special_tokens=True).strip()
+                for seq in beams]
+
+    bleu = load_metric("bleu")            # already imported in final.py
+    scores = [bleu.compute(predictions=[c], references=[[ref_text]])["bleu"]
+              for c in cand_txt]
+
+    best = cand_txt[int(np.argmax(scores))]
+    return best
 
 
 def main():
