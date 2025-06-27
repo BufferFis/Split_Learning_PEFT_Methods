@@ -21,8 +21,10 @@ class SplitGPT2ForGeneration(PreTrainedModel, GenerationMixin):
 
         # --- 2.  make HF aware of the LM-head / embeddings -------------
         # 2-a  expose the lm_head itself
-        self.lm_head = tail_client.tail_model.lm_head                 
-        self.lm_head.weight = head_client.head_model.base_model.wte.weight
+        self.lm_head = tail_client.tail_model.lm_head
+        self.lm_head.weight = (
+            head_client.head_model.base_model.wte.weight
+        )
         # 2-b  tie vocab-size to the actual weight matrix
         vocab = self.lm_head.weight.size(0)
         self.config.vocab_size              = vocab                   

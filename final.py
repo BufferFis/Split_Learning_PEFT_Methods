@@ -21,7 +21,7 @@ from peft import PeftModel
 # after the other imports in final.py
 from split_beam_wrapper import SplitGPT2ForGeneration   # NEW
 import copy
-
+from transformers import LogitsProcessorList, MinLengthLogitsProcessor
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -651,6 +651,11 @@ def generate_with_beam(trainer, wrapper, mr_text, max_new_tokens=64):
     enc    = trainer.tokenizer(prompt, return_tensors="pt")
     ids, m = enc["input_ids"].to(device), enc["attention_mask"].to(device)
     
+    procs = LogitsProcessorList([
+            # block anything ≥ len(tokenizer)
+            MinLengthLogitsProcessor(min_length=-1, eos_token_id=len(trainer.tokenizer))
+        ])
+
     with torch.no_grad():
         out = wrapper.generate(
                         ids,
