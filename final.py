@@ -927,6 +927,79 @@ class SplitLoRATrainer:
         return avg_loss
 
 
+# ─── Beam-search helpers ──────────────────────────────────────────────
+from evaluate import load as load_metric
+
+def generate_with_beam(trainer, wrapper, mr_text, max_new_tokens=64):
+    """Return one realisation for a single MR using SplitFM-style beam search."""
+    prompt = mr_text + " " + trainer.DELIM + " "
+    enc    = trainer.tokenizer(prompt, return_tensors="pt")
+    ids, m = enc["input_ids"].to(device), enc["attention_mask"].to(device)
+    
+    with torch.no_grad():
+        out = wrapper.generate(
+                        ids,
+                        attention_mask = m,
+
+                        # ---------------- SplitFM beam-search settings -----------------
+                        max_new_tokens        = 64,     # --eval_len
+                        num_beams             = 10,     # --beam
+                        length_penalty        = 0.7,    # --length_penalty
+                        early_stopping        = True,   # end once all beams hit <eos>
+                        no_repeat_ngram_size  = 4,      # --no_repeat_ngram_size
+                        repetition_penalty    = 1.2,    # --repetition_penalty (= neutral)
+                        diversity_penalty   = 0.35,
+                        num_beam_groups     = 5,   # must divide num_beams (10)
+
+                        # ----------------------------------------------------------------
+
+                        # no diversity groups in SplitFM; leave defaults
+                        # diversity_penalty   = 0.0
+                        # num_beam_groups     = 1
+
+                        # housekeeping
+                        remove_invalid_values = True,   # robust against any NaNs
+                        #eos_token_id          = trainer.tokenizer.eos_token_id,  # SplitFM passes 628
+                        eos_token_id = 628,
+                        pad_token_id          = trainer.tokenizer.pad_token_id,
+                        return_dict_in_generate = False # SplitFM just wants the ids
+                )
+    
+    return trainer.tokenizer.decode(out[0, ids.size(1):],
+                                    skip_special_tokens=True).strip()
+
+def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
+    """Compute BLEU & METEOR on `n_samples` examples using beam search."""
+    bleu   = load_metric("bleu")
+    meteor = load_metric("meteor")
+
+    preds, refs, fails = [], [], 0
+    eval_split = dataset.select(range(min(n_samples, len(dataset))))
+
+    for sample in eval_split:
+        try:
+            gen = generate_with_beam(trainer, wrapper, sample["meaning_representation"])
+        except Exception as e:
+            print("❌ generation failed:", e); gen = ""
+        if gen:
+            preds.append(gen); refs.append([sample["human_reference"]])
+        else:
+            preds.append("empty"); refs.append([sample["human_reference"]]); fails += 1
+
+    # filter empties
+    valid = [(p, r) for p, r in zip(preds, refs) if p != "empty"]
+    if not valid:
+        return {"bleu": 0.0, "meteor": 0.0, "failed": len(eval_split)}
+
+    v_pred, v_ref = zip(*valid)
+    bleu_score   = bleu.compute(predictions=v_pred, references=v_ref, smooth=True)["bleu"]
+    meteor_score = meteor.compute(predictions=v_pred,
+                                  references=[r[0] for r in v_ref])["meteor"]
+    print(f"BLEU  : {bleu_score:.4f}  •  METEOR: {meteor_score:.4f}  •  failed {fails}/{len(eval_split)}")
+    return {"bleu": bleu_score, "meteor": meteor_score, "failed": fails}
+# ─────────────────────────────────────────────────────────────────────
+
+
 
 def main():
     parser = argparse.ArgumentParser(description="SplitLoRA Single File Implementation")
@@ -990,43 +1063,19 @@ def main():
     train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
     
     if args.eval_only:
-        mr_text = "name[Blue Spice], eatType[coffee shop], area[city centre]"
-        prompt  = mr_text + " " + trainer.DELIM + " "
-        enc     = trainer.tokenizer(prompt, return_tensors="pt")
-        ids, mask = enc["input_ids"].to(device), enc["attention_mask"].to(device)
+        # quick manual check on one MR
+        example = "name[Blue Spice], eatType[coffee shop], area[city centre]"
+        print("Beam-10 output:", generate_with_beam(trainer, wrapper, example))
 
-        with torch.no_grad():
-            out = wrapper.generate(
-                    ids,
-                    attention_mask = mask,
-
-                    # ---------------- SplitFM beam-search settings -----------------
-                    max_new_tokens        = 64,     # --eval_len
-                    num_beams             = 10,     # --beam
-                    length_penalty        = 0.7,    # --length_penalty
-                    early_stopping        = True,   # end once all beams hit <eos>
-                    no_repeat_ngram_size  = 4,      # --no_repeat_ngram_size
-                    repetition_penalty    = 1.3,    # --repetition_penalty (= neutral)
-                    diversity_penalty   = 0.3,
-                    num_beam_groups     = 5,   # must divide num_beams (10)
-
-                    # ----------------------------------------------------------------
-
-                    # no diversity groups in SplitFM; leave defaults
-                    # diversity_penalty   = 0.0
-                    # num_beam_groups     = 1
-
-                    # housekeeping
-                    remove_invalid_values = True,   # robust against any NaNs
-                    #eos_token_id          = trainer.tokenizer.eos_token_id,  # SplitFM passes 628
-                    eos_token_id = 628,
-                    pad_token_id          = trainer.tokenizer.pad_token_id,
-                    return_dict_in_generate = False # SplitFM just wants the ids
-            )
-
-        print("Beam-10 output:",
-            trainer.tokenizer.decode(out[0, ids.size(1):], skip_special_tokens=True).strip())
+        # full dev-set evaluation (first 100 samples)
+        train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
+        results = evaluate_beam(trainer, wrapper, test_ds, n_samples=100)
+        # Save evaluation results
+        with open(os.path.join(args.save_path, "evaluation_results.json"), "w") as f:
+            json.dump(results, f, indent=2)
         return
+
+        
 
 
     if not args.eval_only:
@@ -1036,15 +1085,7 @@ def main():
         
         # Save checkpoint
         trainer.save_checkpoint(args.save_path)
-    
-    # Evaluate
-    results = trainer.evaluate(test_ds)
-    if results:
-        print(f"Final Results: BLEU={results['bleu']:.4f}, METEOR={results['meteor']:.4f}")
-        
-        # Save evaluation results
-        with open(os.path.join(args.save_path, "evaluation_results.json"), "w") as f:
-            json.dump(results, f, indent=2)
+
 
 if __name__ == "__main__":
     main()
