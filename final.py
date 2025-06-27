@@ -653,7 +653,7 @@ def generate_with_beam(trainer, wrapper, mr_text, max_new_tokens=64):
     
     procs = LogitsProcessorList([
             # block anything ≥ len(tokenizer)
-            MinLengthLogitsProcessor(min_length=-1, eos_token_id=len(trainer.tokenizer))
+            MinLengthLogitsProcessor(min_length=1, eos_token_id=len(trainer.tokenizer))
         ])
 
     with torch.no_grad():
