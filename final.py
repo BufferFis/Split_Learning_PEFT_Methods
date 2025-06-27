@@ -126,8 +126,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             # SIMPLIFIED: Remove complex attention mask handling
             for block in self.transformer.h:
                 hidden_states = block(hidden_states, use_cache=False)[0]  # No attention_mask!
-            
-            hidden_states = self.transformer.ln_f(hidden_states)
+        
             return type('BodyOutput', (), {'last_hidden_state': hidden_states})()
     
     # Tail Model (last few layers + LM head)
