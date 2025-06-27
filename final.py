@@ -673,7 +673,7 @@ def generate_with_beam(trainer, wrapper, mr_text, max_new_tokens=64):
                         # housekeeping
                         remove_invalid_values = True,   # robust against any NaNs
                         #eos_token_id          = trainer.tokenizer.eos_token_id,  # SplitFM passes 628
-                        eos_token_id = 628,
+                        eos_token_id = trainer.tokenizer.eos_token_id,
                         pad_token_id          = trainer.tokenizer.pad_token_id,
                         return_dict_in_generate = False # SplitFM just wants the ids
                 )
@@ -740,7 +740,9 @@ def main():
             base_config = trainer.head_client.head_model.config
          ).to(device).eval()
 
-    
+    wrapper.config.vocab_size = len(trainer.tokenizer)          # 50 259
+    if hasattr(wrapper, "generation_config"):
+        wrapper.generation_config.vocab_size = len(trainer.tokenizer)
     
     # Load dataset (regular mode)
     train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
