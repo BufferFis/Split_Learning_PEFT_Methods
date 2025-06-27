@@ -691,7 +691,7 @@ def main():
 
     args = parser.parse_args()
     
-    trainer = SplitLoRATrainer(args.learning_rate)
+    trainer = SplitLoRATrainer("model_" ,args.learning_rate)
     
     # Load checkpoint if specified
     if args.load_checkpoint:
