@@ -691,7 +691,7 @@ def main():
 
     args = parser.parse_args()
     
-    trainer = SplitLoRATrainer("model_" ,args.learning_rate)
+    trainer = SplitLoRATrainer(model_name="gpt2" ,head_layers=2, tail_layers=2,learning_rate=args.learning_rate)
     
     # Load checkpoint if specified
     if args.load_checkpoint:
