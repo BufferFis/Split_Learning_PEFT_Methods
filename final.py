@@ -378,6 +378,7 @@ class SplitLoRATrainer:
         body_model = get_peft_model(body_model, lora_config)
         tail_model = get_peft_model(tail_model, lora_config)
 
+        tail_model.base_model.lm_head.weight = head_model.base_model.wte.weight
         for wrapped in (head_model, body_model, tail_model):
             wrapped.base_model.config.vocab_size = vocab
             if hasattr(wrapped.base_model, "generation_config"):
@@ -610,6 +611,7 @@ class SplitLoRATrainer:
             head_model = PeftModel.from_pretrained(head_model, os.path.join(path, "head_model"), is_trainable=True)
             body_model = PeftModel.from_pretrained(body_model, os.path.join(path, "body_model"), is_trainable=True)
             tail_model = PeftModel.from_pretrained(tail_model, os.path.join(path, "tail_model"), is_trainable=True)
+            tail_model.base_model.lm_head.weight = head_model.base_model.wte.weight
             
             for wrapped in (head_model, body_model, tail_model):
                 wrapped.base_model.config.vocab_size = vocab
