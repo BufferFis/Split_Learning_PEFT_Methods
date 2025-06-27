@@ -100,7 +100,6 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             self.transformer.h = nn.ModuleList(
                 original_model.transformer.h[start_layer:start_layer + num_layers]
             )
-            self.transformer.ln_f = original_model.transformer.ln_f
             self.config = original_model.config
             
             # Add missing generation attributes for PEFT compatibility
@@ -137,6 +136,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             super().__init__()  # CRITICAL: Call parent constructor
             self.transformer = nn.Module()
             self.transformer.h = nn.ModuleList(original_model.transformer.h[start_layer:])
+            self.transformer.ln_f = original_model.transformer.ln_f
             self.lm_head = original_model.lm_head
             self.config = original_model.config
             
@@ -166,13 +166,16 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             # SIMPLIFIED: Remove complex attention mask handling
             for block in self.transformer.h:
                 hidden_states = block(hidden_states, use_cache=False)[0]  # No attention_mask!
-            
+            hidden_states = self.transformer.ln_f(hidden_states)
+
             logits = self.lm_head(hidden_states)
             return type('TailOutput', (), {'logits': logits})()
     
     head_model = HeadModel(model, head_layers)
     body_model = BodyModel(model, head_layers, body_layers)
     tail_model = TailModel(model, head_layers + body_layers)
+
+    tail_model.lm_head.weight = head_model.wte.weight
     
     return head_model, body_model, tail_model
 
@@ -680,7 +683,7 @@ def main():
     parser = argparse.ArgumentParser(description="SplitLoRA Single File Implementation")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for training")
     parser.add_argument("--epochs", type=int, default=1, help="Number of training epochs")
-    parser.add_argument("--learning_rate", type=float, default=2e-4, help="Learning rate")
+    parser.add_argument("--learning_rate", type=float, default=2e-5, help="Learning rate")
     parser.add_argument("--eval_only", action="store_true", help="Only run evaluation")
     parser.add_argument("--load_checkpoint", type=str, default=None, help="Path to checkpoint to load")
     parser.add_argument("--save_path", type=str, default="./splitlora_checkpoint", help="Path to save checkpoint")
