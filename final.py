@@ -23,6 +23,7 @@ from split_beam_wrapper import SplitGPT2ForGeneration   # NEW
 import copy
 from transformers import LogitsProcessorList, MinLengthLogitsProcessor
 import numpy as np
+from sacrebleu.metrics import BLEU as SBLEU 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -726,6 +727,11 @@ def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
 
     if not preds:
         return {"bleu": 0.0, "meteor": 0.0, "failed": len(store)}
+    
+    ref_sets = list(map(list, zip(*refs)))      # shape: n_refs × n_sents
+
+    sb = SBLEU(tokenize="13a")                  # leaderboard tokeniser   [2]
+    sbleu_score = sb.corpus_score(preds, ref_sets).score / 100.0
 
     # ------------- corpus-level multi-reference BLEU -----------------
     bleu_score = bleu.compute(predictions=preds,
@@ -735,7 +741,7 @@ def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
     meteor_score = meteor.compute(predictions=preds,
                                 references=[r[0] for r in refs])["meteor"]
 
-    print(f"BLEU  : {bleu_score:.4f}  •  METEOR: {meteor_score:.4f}  •  failed {fails}/{len(store)}")
+    print(f"BLEU  : {bleu_score:.4f}  •  METEOR: {meteor_score:.4f}  •  SBLUE {sbleu_score:.4f}  • failed {fails}/{len(store)}")
     return {"bleu": bleu_score, "meteor": meteor_score, "failed": fails}
 
 # ─── MBR beam search ────────────────────────────────────────────────
@@ -820,7 +826,7 @@ def main():
 
         # full dev-set evaluation (first 100 samples)
         train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
-        results = evaluate_beam(trainer, wrapper, test_ds, n_samples=200)
+        results = evaluate_beam(trainer, wrapper, test_ds, n_samples=len(test_ds))
         # Save evaluation results
         with open(os.path.join(args.save_path, "evaluation_results.json"), "w") as f:
             json.dump(results, f, indent=2)
