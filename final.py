@@ -747,8 +747,10 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text,
         )
 
     # decode beams to strings
+    prompt_len = ids.size(1)              # tokens that belong to the MR
     cand_txt = [trainer.tokenizer.decode(
-                    seq[0, ids.size(1):], skip_special_tokens=True).strip()
+                seq[prompt_len:],       # keep everything *after* the prompt
+                skip_special_tokens=True).strip()
                 for seq in beams]
 
     bleu = load_metric("bleu")            # already imported in final.py
