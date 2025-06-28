@@ -699,7 +699,7 @@ def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
 
     for sample in eval_split:
         try:
-            gen = generate_with_beam_mbr(trainer, wrapper, sample["meaning_representation"])
+            gen = generate_with_beam_mbr(trainer, wrapper, sample["meaning_representation"], sample["human_reference"])
         except Exception as e:
             print("❌ generation failed:", e); gen = ""
         if gen:
@@ -794,12 +794,13 @@ def main():
     
     if args.eval_only:
         # quick manual check on one MR
-        example = "name[Blue Spice], eatType[coffee shop], area[city centre]"
-        print("Beam-10 output:", generate_with_beam(trainer, wrapper, example))
+        example_mr = "name[Blue Spice], eatType[coffee shop], area[city centre]"
+        example_ref = "Blue Spice is a coffee shop in the city centre."
+        print("Beam-10 output:", generate_with_beam_mbr(trainer, wrapper, example_mr, example_ref))
 
         # full dev-set evaluation (first 100 samples)
         train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
-        results = evaluate_beam(trainer, wrapper, test_ds, n_samples=100)
+        results = evaluate_beam(trainer, wrapper, test_ds, n_samples=200)
         # Save evaluation results
         with open(os.path.join(args.save_path, "evaluation_results.json"), "w") as f:
             json.dump(results, f, indent=2)
