@@ -665,12 +665,12 @@ def generate_with_beam(trainer, wrapper, mr_text, max_new_tokens=64):
                         # ---------------- SplitFM beam-search settings -----------------
                         max_new_tokens        = 64,     # --eval_len
                         num_beams             = 10,     # --beam
-                        length_penalty        = 0.7,    # --length_penalty
+                        length_penalty        = 1.0,    # --length_penalty
                         early_stopping        = True,   # end once all beams hit <eos>
                         no_repeat_ngram_size  = 4,      # --no_repeat_ngram_size
                         repetition_penalty    = 1.2,    # --repetition_penalty (= neutral)
-                        diversity_penalty   = 0.35,
-                        num_beam_groups     = 5,   # must divide num_beams (10)
+                        #diversity_penalty   = 0.35,
+                        #num_beam_groups     = 5,   # must divide num_beams (10)
 
                         # ----------------------------------------------------------------
 
@@ -693,32 +693,50 @@ def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
     """Compute BLEU & METEOR on `n_samples` examples using beam search."""
     bleu   = load_metric("bleu")
     meteor = load_metric("meteor")
-
-    preds, refs, fails = [], [], 0
     eval_split = dataset.select(range(min(n_samples, len(dataset))))
 
+    # ------------- generate once per MR, collect refs ----------------
+    store = {}                                   # mr → {"pred": str, "refs": [str]}
     for sample in eval_split:
-        try:
-            gen = generate_with_beam_mbr(trainer, wrapper, sample["meaning_representation"], sample["human_reference"])
-        except Exception as e:
-            print("❌ generation failed:", e); gen = ""
-        if gen:
-            preds.append(gen); refs.append([sample["human_reference"]])
+        mr   = sample["meaning_representation"]
+        ref  = sample["human_reference"]         # singular in the dataset
+        # generate only the first time we meet this MR
+        if mr not in store:
+            try:
+                pred = generate_with_beam_mbr(
+                           trainer, wrapper, mr, ref)      # any ref is fine
+            except Exception as e:
+                print("❌ generation failed:", e)
+                pred = "empty"
+            store[mr] = {"pred": pred, "refs": [ref]}
         else:
-            preds.append("empty"); refs.append([sample["human_reference"]]); fails += 1
+            store[mr]["refs"].append(ref)
 
-    # filter empties
-    valid = [(p, r) for p, r in zip(preds, refs) if p != "empty"]
-    if not valid:
-        return {"bleu": 0.0, "meteor": 0.0, "failed": len(eval_split)}
+    # ------------- prepare lists for evaluate.compute ----------------
 
-    v_pred, v_ref = zip(*valid)
-    bleu_score   = bleu.compute(predictions=v_pred, references=v_ref, smooth=True)["bleu"]
-    meteor_score = meteor.compute(predictions=v_pred,
-                                  references=[r[0] for r in v_ref])["meteor"]
-    print(f"BLEU  : {bleu_score:.4f}  •  METEOR: {meteor_score:.4f}  •  failed {fails}/{len(eval_split)}")
-    return {"bleu": bleu_score, "meteor": meteor_score, "failed": fails}
-# ─────────────────────────────────────────────────────────────────────
+    preds, refs, fails = [], [], 0
+    
+
+    for mr, bundle in store.items():
+            if bundle["pred"] == "empty":
+                fails += 1
+                continue
+            preds.append(bundle["pred"])
+            refs.append(bundle["refs"])          # list-of-refs for this MR
+
+        if not preds:
+            return {"bleu": 0.0, "meteor": 0.0, "failed": len(store)}
+
+        # ------------- corpus-level multi-reference BLEU -----------------
+        bleu_score = bleu.compute(predictions=preds,
+                                references=refs,   # <-- list-of-lists
+                                smooth=True)["bleu"]
+
+        meteor_score = meteor.compute(predictions=preds,
+                                    references=[r[0] for r in refs])["meteor"]
+
+        print(f"BLEU  : {bleu_score:.4f}  •  METEOR: {meteor_score:.4f}  •  failed {fails}/{len(store)}")
+        return {"bleu": bleu_score, "meteor": meteor_score, "failed": fails}
 
 # ─── MBR beam search ────────────────────────────────────────────────
 def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text,
