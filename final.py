@@ -26,12 +26,16 @@ import numpy as np
 from sacrebleu.metrics import BLEU as SBLEU 
 from itertools import zip_longest
 # --- add the repo root to sys.path -----------------------------------
-import sys, pathlib
+import sys, pathlib, importlib
+
 repo_root = pathlib.Path(__file__).resolve().parent / "e2e-metrics"
-sys.path.insert(0, str(repo_root))        # parent of the *metrics* folder
+sys.path.insert(0, str(repo_root))        # ① make repo visible **first**
+sys.modules.pop("metrics", None)          # ② drop any pre-imported package
+from metrics.e2e import Metrics           # ③ now resolves to the repo code
+
 
 # --- import the scorer ----------------------------------------------
-from metrics.e2e import Metrics           #  ←  works
+
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
