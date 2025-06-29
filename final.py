@@ -278,7 +278,7 @@ class TailClient:
             [p for p in self.tail_model.parameters() if p.requires_grad], 
             lr=learning_rate
         )
-        self.loss_fn = nn.CrossEntropyLoss()
+        self.loss_fn = nn.CrossEntropyLoss(label_smoothing=0.1)
         
     def forward(self, body_activations, attention_mask=None):
         """Forward pass through tail layers"""
@@ -370,7 +370,7 @@ class SplitLoRATrainer:
         lora_config = LoraConfig(
             r=8,
             lora_alpha=16,
-            lora_dropout=0.05,
+            lora_dropout=0.1,
             bias="none",
             use_dora=True,  # DoRA is now fully supported!
             task_type="CAUSAL_LM",
