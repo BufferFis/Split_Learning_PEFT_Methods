@@ -25,20 +25,7 @@ from transformers import LogitsProcessorList, MinLengthLogitsProcessor
 import numpy as np
 from sacrebleu.metrics import BLEU as SBLEU 
 from itertools import zip_longest
-# --- add the repo root to sys.path -----------------------------------
-import importlib.util, pathlib
-
-e2e_path = pathlib.Path(__file__).resolve().parent / "e2e-metrics" / "metrics" / "e2e.py"
-spec = importlib.util.spec_from_file_location("e2e_chal", e2e_path)
-e2e   = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(e2e)
-
-Metrics = e2e.Metrics
-
-
-# --- import the scorer ----------------------------------------------
-
-
+import subprocess, tempfile, pathlib, json
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -707,14 +694,19 @@ def generate_with_beam(trainer, wrapper, mr_text, max_new_tokens=64):
 
 
 def evaluate_official(preds, ref_dir="references/e2e_test"):
-    """
-    preds : list[str]  – system outputs (one per MR, *same order*
-                         as files business1.txt … business9.txt)
-    ref_dir             – folder that contains the 9 reference files
-    returns dict with keys: bleu, nist, meteor, rouge_l, cider
-    """
-    scorer = Metrics(references_dir=ref_dir, sys_sents=preds)
-    return scorer.get_scores()          # BLEU etc. already ×100
+    with tempfile.NamedTemporaryFile('w', delete=False) as f:
+        f.write("\n".join(preds) + "\n")
+        sys_file = f.name
+
+    repo = pathlib.Path(__file__).resolve().parent / "e2e-metrics"
+    out  = subprocess.check_output(
+        ["python", str(repo / "measure_scores.py"),
+         sys_file, ref_dir, "--quiet"],
+        text=True
+    )
+
+    # the script prints a JSON block at the end
+    return json.loads(out.splitlines()[-1])
 
 
 def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
