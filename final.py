@@ -694,25 +694,35 @@ def generate_with_beam(trainer, wrapper, mr_text, max_new_tokens=64):
                                     skip_special_tokens=True).strip()
 
 
-def evaluate_official(preds, ref_dir="references/e2e_test"):
+def evaluate_official(preds, ref_file="references/e2e_combined_refs.txt"):
     with tempfile.NamedTemporaryFile('w', delete=False) as f:
         f.write("\n".join(preds) + "\n")
         sys_file = f.name
 
     repo = pathlib.Path(__file__).resolve().parent / "e2e-metrics"
     
-    # FIX: Make ref_dir absolute relative to the e2e-metrics directory
-    if not os.path.isabs(ref_dir):
-        ref_dir = str(repo / ref_dir)
+    # Use the combined reference file
+    ref_path = str(repo / ref_file)
     
-    out = subprocess.check_output(
-        ["python", str(repo / "measure_scores.py"),
-         sys_file, ref_dir],
-        text=True
-    )
+    try:
+        out = subprocess.check_output(
+            ["python", str(repo / "measure_scores.py"),
+             ref_path, sys_file],  # Note: ref_file comes FIRST, sys_file comes SECOND
+            text=True
+        )
 
-    # the script prints a JSON block at the end
-    return json.loads(out.splitlines()[-1])
+        # Clean up temporary file
+        os.unlink(sys_file)
+        
+        # the script prints a JSON block at the end
+        return json.loads(out.splitlines()[-1])
+        
+    except subprocess.CalledProcessError as e:
+        print(f"Error running measure_scores.py: {e}")
+        print(f"Command: python {repo / 'measure_scores.py'} {ref_path} {sys_file}")
+        os.unlink(sys_file)
+        raise
+
 
 
 def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
