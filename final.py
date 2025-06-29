@@ -24,6 +24,7 @@ import copy
 from transformers import LogitsProcessorList, MinLengthLogitsProcessor
 import numpy as np
 from sacrebleu.metrics import BLEU as SBLEU 
+from itertools import zip_longest
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -730,8 +731,19 @@ def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
     
     ref_sets = list(map(list, zip(*refs)))      # shape: n_refs × n_sents
 
-    sb = SBLEU(tokenize="13a")                  # leaderboard tokeniser   [2]
-    sbleu_score = sb.corpus_score(preds, ref_sets).score / 100.0
+    max_refs = max(len(r) for r in refs)
+    ref_sets = [
+        [sent_refs[i] if i < len(sent_refs) else ""          # fillvalue=""
+        for sent_refs in refs]                              # traverse sentences
+        for i in range(max_refs)                             # traverse ref indices
+    ]
+
+    sb = SBLEU(tokenize="13a",             # WMT / leaderboard tokeniser
+            smooth_method="exp",        # same smoothing as HF metric
+            smooth_value=0.0,
+            effective_order=True)       # ignore higher n if sent < n words
+
+    sacre_score = sb.corpus_score(preds, ref_sets).score / 100
 
     # ------------- corpus-level multi-reference BLEU -----------------
     bleu_score = bleu.compute(predictions=preds,
@@ -741,7 +753,7 @@ def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
     meteor_score = meteor.compute(predictions=preds,
                                 references=[r[0] for r in refs])["meteor"]
 
-    print(f"BLEU  : {bleu_score:.4f}  •  METEOR: {meteor_score:.4f}  •  SBLUE {sbleu_score:.4f}  • failed {fails}/{len(store)}")
+    print(f"BLEU  : {bleu_score:.4f}  •  METEOR: {meteor_score:.4f}  •  SBLUE {sacre_score:.4f}  • failed {fails}/{len(store)}")
     return {"bleu": bleu_score, "meteor": meteor_score, "failed": fails}
 
 # ─── MBR beam search ────────────────────────────────────────────────
@@ -794,7 +806,6 @@ def main():
     parser.add_argument("--load_checkpoint", type=str, default=None, help="Path to checkpoint to load")
     parser.add_argument("--save_path", type=str, default="./splitlora_checkpoint", help="Path to save checkpoint")
     parser.add_argument("--gpu_device", type=str, default="1", help="GPU device to use")
-
     args = parser.parse_args()
     
     trainer = SplitLoRATrainer(model_name="gpt2" ,head_layers=2, tail_layers=2, learning_rate=args.learning_rate)
@@ -826,7 +837,8 @@ def main():
 
         # full dev-set evaluation (first 100 samples)
         train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
-        results = evaluate_beam(trainer, wrapper, test_ds, n_samples=len(test_ds))
+        
+        results = evaluate_beam(trainer, wrapper, test_ds, n_samples=100)
         # Save evaluation results
         with open(os.path.join(args.save_path, "evaluation_results.json"), "w") as f:
             json.dump(results, f, indent=2)
