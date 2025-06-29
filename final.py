@@ -1,5 +1,6 @@
 # splitlora_single.py
 import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"     # or the bus-id / UUID of AF:00.0
 import torch
@@ -701,7 +702,7 @@ def evaluate_official(preds, ref_dir="references/e2e_test"):
     repo = pathlib.Path(__file__).resolve().parent / "e2e-metrics"
     out  = subprocess.check_output(
         ["python", str(repo / "measure_scores.py"),
-         sys_file, ref_dir, "--quiet"],
+         sys_file, ref_dir],
         text=True
     )
 
@@ -866,7 +867,7 @@ def main():
         # full dev-set evaluation (first 100 samples)
         train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
         
-        results = evaluate_beam(trainer, wrapper, test_ds, n_samples=len(test_ds))
+        results = evaluate_beam(trainer, wrapper, test_ds, n_samples=len(200))
         # Save evaluation results
         with open(os.path.join(args.save_path, "evaluation_results.json"), "w") as f:
             json.dump(results, f, indent=2)
