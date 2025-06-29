@@ -667,7 +667,7 @@ def generate_with_beam(trainer, wrapper, mr_text, max_new_tokens=64):
                         # ---------------- SplitFM beam-search settings -----------------
                         max_new_tokens        = 64,     # --eval_len
                         num_beams             = 10,     # --beam
-                        length_penalty        = 1.0,    # --length_penalty
+                        length_penalty        = 0.7,    # --length_penalty
                         early_stopping        = True,   # end once all beams hit <eos>
                         no_repeat_ngram_size  = 4,      # --no_repeat_ngram_size
                         repetition_penalty    = 1.2,    # --repetition_penalty (= neutral)
@@ -690,6 +690,18 @@ def generate_with_beam(trainer, wrapper, mr_text, max_new_tokens=64):
     
     return trainer.tokenizer.decode(out[0, ids.size(1):],
                                     skip_special_tokens=True).strip()
+
+
+def evaluate_official(preds, ref_dir="references/e2e_test"):
+    """
+    preds : list[str]  – system outputs (one per MR, *same order*
+                         as files business1.txt … business9.txt)
+    ref_dir             – folder that contains the 9 reference files
+    returns dict with keys: bleu, nist, meteor, rouge_l, cider
+    """
+    scorer = Metrics(references_dir=ref_dir, sys_sents=preds)
+    return scorer.get_scores()          # BLEU etc. already ×100
+
 
 def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
     """Compute BLEU & METEOR on `n_samples` examples using beam search."""
@@ -738,6 +750,12 @@ def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
         for i in range(max_refs)                             # traverse ref indices
     ]
 
+    official = evaluate_official(preds)           # uses the 9 refs
+    print(f"OFFICIAL BLEU: {official['bleu']:.2f} • "
+        f"NIST {official['nist']:.4f} • "
+        f"ROUGE-L {official['rouge_l']:.2f}")
+
+
     sb = SBLEU(tokenize="13a",             # WMT / leaderboard tokeniser
             smooth_method="exp",        # same smoothing as HF metric
             smooth_value=0.0,
@@ -754,7 +772,7 @@ def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
                                 references=[r[0] for r in refs])["meteor"]
 
     print(f"BLEU  : {bleu_score:.4f}  •  METEOR: {meteor_score:.4f}  •  SBLUE {sacre_score:.4f}  • failed {fails}/{len(store)}")
-    return {"bleu": bleu_score, "meteor": meteor_score, "failed": fails}
+    return {"bleu": bleu_score, "meteor": meteor_score, "failed": fails, "sacrebleu": sacre_score, **official}
 
 # ─── MBR beam search ────────────────────────────────────────────────
 def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text,
@@ -795,6 +813,10 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text,
 
     best = cand_txt[int(np.argmax(scores))]
     return best
+
+from e2e_metrics.e2e import Metrics     # type: ignore # new import
+
+
 
 
 def main():
