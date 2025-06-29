@@ -700,7 +700,12 @@ def evaluate_official(preds, ref_dir="references/e2e_test"):
         sys_file = f.name
 
     repo = pathlib.Path(__file__).resolve().parent / "e2e-metrics"
-    out  = subprocess.check_output(
+    
+    # FIX: Make ref_dir absolute relative to the e2e-metrics directory
+    if not os.path.isabs(ref_dir):
+        ref_dir = str(repo / ref_dir)
+    
+    out = subprocess.check_output(
         ["python", str(repo / "measure_scores.py"),
          sys_file, ref_dir],
         text=True
