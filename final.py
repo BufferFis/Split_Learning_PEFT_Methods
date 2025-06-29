@@ -26,12 +26,14 @@ import numpy as np
 from sacrebleu.metrics import BLEU as SBLEU 
 from itertools import zip_longest
 # --- add the repo root to sys.path -----------------------------------
-import sys, pathlib, importlib
+import importlib.util, pathlib
 
-repo_root = pathlib.Path(__file__).resolve().parent / "e2e-metrics"
-sys.path.insert(0, str(repo_root))        # ① make repo visible **first**
-sys.modules.pop("metrics", None)          # ② drop any pre-imported package
-from metrics.e2e import Metrics           # ③ now resolves to the repo code
+e2e_path = pathlib.Path(__file__).resolve().parent / "e2e-metrics" / "metrics" / "e2e.py"
+spec = importlib.util.spec_from_file_location("e2e_chal", e2e_path)
+e2e   = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(e2e)
+
+Metrics = e2e.Metrics
 
 
 # --- import the scorer ----------------------------------------------
