@@ -25,6 +25,14 @@ from transformers import LogitsProcessorList, MinLengthLogitsProcessor
 import numpy as np
 from sacrebleu.metrics import BLEU as SBLEU 
 from itertools import zip_longest
+# --- add the repo root to sys.path -----------------------------------
+import sys, pathlib
+repo_root = pathlib.Path(__file__).resolve().parent / "e2e-metrics"
+sys.path.insert(0, str(repo_root))        # parent of the *metrics* folder
+
+# --- import the scorer ----------------------------------------------
+from metrics.e2e import Metrics           #  ←  works
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -814,7 +822,7 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text,
     best = cand_txt[int(np.argmax(scores))]
     return best
 
-from e2e_metrics.e2e import Metrics     # type: ignore # new import
+
 
 
 
