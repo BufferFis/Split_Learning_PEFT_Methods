@@ -694,7 +694,7 @@ def generate_with_beam(trainer, wrapper, mr_text, max_new_tokens=64):
                                     skip_special_tokens=True).strip()
 
 
-def evaluate_official(preds, ref_file="references/e2e_combined_refs.txt"):
+def evaluate_official(preds, ref_file="references/e2e_refs.tsv"):
     with tempfile.NamedTemporaryFile('w', delete=False) as f:
         f.write("\n".join(preds) + "\n")
         sys_file = f.name
@@ -882,7 +882,7 @@ def main():
         # full dev-set evaluation (first 100 samples)
         train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
         
-        results = evaluate_beam(trainer, wrapper, test_ds, n_samples=200)
+        results = evaluate_beam(trainer, wrapper, test_ds, n_samples=100)
         # Save evaluation results
         with open(os.path.join(args.save_path, "evaluation_results.json"), "w") as f:
             json.dump(results, f, indent=2)
