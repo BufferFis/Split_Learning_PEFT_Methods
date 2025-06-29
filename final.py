@@ -694,7 +694,7 @@ def generate_with_beam(trainer, wrapper, mr_text, max_new_tokens=64):
                                     skip_special_tokens=True).strip()
 
 
-def evaluate_official(preds, ref_file="references/e2e_refs.tsv"):
+def evaluate_official(preds, ref_file="references/e2e_refs_100.tsv"):
     with tempfile.NamedTemporaryFile('w', delete=False) as f:
         f.write("\n".join(preds) + "\n")
         sys_file = f.name
