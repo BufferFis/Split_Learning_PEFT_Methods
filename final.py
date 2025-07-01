@@ -706,11 +706,12 @@ def evaluate_official(preds, ref_file="references/e2e_refs_100.tsv"):
     
     try:
         out = subprocess.check_output(
-            ["python", str(repo / "measure_scores.py"),
-             ref_path, sys_file],  # Note: ref_file comes FIRST, sys_file comes SECOND
-            text=True
-        )
-
+            ["python",
+            str(repo / "measure_scores.py"),
+            "--python",          # <-- use pure-Python scorer
+            ref_path,
+            sys_file],
+            text=True)
         # Clean up temporary file
         os.unlink(sys_file)
         
