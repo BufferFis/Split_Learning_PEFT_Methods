@@ -694,36 +694,40 @@ def generate_with_beam(trainer, wrapper, mr_text, max_new_tokens=64):
                                     skip_special_tokens=True).strip()
 
 
-def evaluate_official(preds, ref_file="references/e2e_refs_100.tsv"):
+def evaluate_official(preds,
+                      ref_file="references/e2e_refs_100.tsv"):
+    # 1) write system outputs to a temp file
     with tempfile.NamedTemporaryFile('w', delete=False) as f:
         f.write("\n".join(preds) + "\n")
         sys_file = f.name
 
     repo = pathlib.Path(__file__).resolve().parent / "e2e-metrics"
-    
-    # Use the combined reference file
-    ref_path = str(repo / ref_file)
-    
+    ref_path = repo / ref_file
+
     try:
         out = subprocess.check_output(
             ["python",
-            str(repo / "measure_scores.py"),
-            "--python",          # <-- use pure-Python scorer
-             "--json",            # <-- emit results as one JSON line
-            ref_path,
-            sys_file],
-            text=True)
-        # Clean up temporary file
+             str(repo / "measure_scores.py"),
+             "--python",          # pure-Python BLEU/NIST
+             "-t",                # TSV one-line output
+             str(ref_path),
+             sys_file],
+            text=True
+        )
+    finally:
         os.unlink(sys_file)
-        
-        # the script prints a JSON block at the end
-        return json.loads(out.splitlines()[-1])
-        
-    except subprocess.CalledProcessError as e:
-        print(f"Error running measure_scores.py: {e}")
-        print(f"Command: python {repo / 'measure_scores.py'} {ref_path} {sys_file}")
-        os.unlink(sys_file)
-        raise
+
+    # 2) take the last non-empty line
+    last = [l for l in out.splitlines() if l.strip()][-1]
+    fields = last.split("\t")          # 0 = sys name, 1..5 = scores
+
+    return {
+        "bleu":     float(fields[1]),
+        "nist":     float(fields[2]),
+        "meteor":   float(fields[3]),
+        "rouge_l":  float(fields[4]),
+        "cider":    float(fields[5])
+    }
 
 
 
