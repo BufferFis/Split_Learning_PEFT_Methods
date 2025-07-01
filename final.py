@@ -737,7 +737,7 @@ def evaluate_official(preds,
             ["python",
              str(repo / "measure_scores.py"),
              "--python",          # pure-Python BLEU/NIST
-             "-t", "-H",               # TSV one-line output
+             "-t",               # TSV one-line output
              str(ref_path),
              sys_file],
             text=True
