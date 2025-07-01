@@ -27,6 +27,7 @@ import numpy as np
 from sacrebleu.metrics import BLEU as SBLEU 
 from itertools import zip_longest
 import subprocess, tempfile, pathlib, json
+from transformers import get_linear_schedule_with_warmup
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -335,7 +336,13 @@ class TailClient:
 
 class SplitLoRATrainer:
     """Main trainer class combining all components"""
-    def __init__(self, model_name="gpt2", head_layers=2, tail_layers=2, learning_rate=2e-4):
+    def __init__(self,
+                model_name="gpt2",
+                head_layers=2,
+                tail_layers=2,
+                learning_rate=2e-4,
+                warmup_steps=500,
+                max_epochs=5):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         
         
@@ -395,6 +402,11 @@ class SplitLoRATrainer:
         self.tail_client = TailClient(tail_model, learning_rate)
         
         self.metrics = {"loss": []}
+
+        self._sched_steps = None
+        self.warmup_steps = warmup_steps
+        self.max_epochs   = max_epochs
+        self.schedulers   = []     
         
     def load_e2e_dataset(self, debug_mode=False):
         """Improved preprocessing with optional debug mode"""
@@ -485,6 +497,20 @@ class SplitLoRATrainer:
         
         return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn)
     
+    def attach_schedulers(self, train_dataloader):
+        if self._sched_steps is None:
+            total_steps = len(train_dataloader) * self.max_epochs
+            self._sched_steps = total_steps
+            for opt in (self.head_client.optimizer,
+                        self.server.optimizer,
+                        self.tail_client.optimizer):
+                sched = get_linear_schedule_with_warmup(
+                            opt,
+                            num_warmup_steps=self.warmup_steps,
+                            num_training_steps=total_steps)
+                self.schedulers.append(sched)
+
+
     def train(self, train_dataloader, epochs=1):
         """FIXED: Add gradient clipping and NaN checking"""
         print(f"Starting training for {epochs} epochs...")
@@ -527,6 +553,8 @@ class SplitLoRATrainer:
                     # Backward through body and head
                     head_grad = self.server.backward(body_activations, body_grad, stored_head_activations)
                     self.head_client.backward(head_activations, head_grad)
+                    for sched in self.schedulers:
+                        sched.step()
                     
                     # FIX: Add gradient clipping to all components
                     torch.nn.utils.clip_grad_norm_(self.head_client.head_model.parameters(), max_norm=1.0)
@@ -781,7 +809,8 @@ def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
     official = evaluate_official(preds)           # uses the 9 refs
     print(f"OFFICIAL BLEU: {official['bleu']:.2f} • "
         f"NIST {official['nist']:.4f} • "
-        f"ROUGE-L {official['rouge_l']:.2f}")
+        f"ROUGE-L {official['rouge_l']:.2f}  •"
+        f"Meteor {official['meteor']:.2f} • ")
 
 
     sb = SBLEU(tokenize="13a",             # WMT / leaderboard tokeniser
@@ -852,13 +881,20 @@ def main():
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for training")
     parser.add_argument("--epochs", type=int, default=1, help="Number of training epochs")
     parser.add_argument("--learning_rate", type=float, default=2e-5, help="Learning rate")
+    parser.add_argument("--warmup_steps", type=int, default=500)
+    parser.add_argument("--max_epochs",  type=int, default=5)
     parser.add_argument("--eval_only", action="store_true", help="Only run evaluation")
     parser.add_argument("--load_checkpoint", type=str, default=None, help="Path to checkpoint to load")
     parser.add_argument("--save_path", type=str, default="./splitlora_checkpoint", help="Path to save checkpoint")
     parser.add_argument("--gpu_device", type=str, default="1", help="GPU device to use")
     args = parser.parse_args()
     
-    trainer = SplitLoRATrainer(model_name="gpt2" ,head_layers=2, tail_layers=2, learning_rate=args.learning_rate)
+    trainer = SplitLoRATrainer(model_name="gpt2",
+                           head_layers=2,
+                           tail_layers=2,
+                           learning_rate=args.learning_rate,
+                           warmup_steps=args.warmup_steps,
+                           max_epochs=args.max_epochs)
     
     # Load checkpoint if specified
     if args.load_checkpoint:
@@ -900,6 +936,7 @@ def main():
     if not args.eval_only:
         # Create dataloader and train
         train_dl = trainer.create_dataloader(train_ds, batch_size=args.batch_size, shuffle=True, debug_mode=False)
+        trainer.attach_schedulers(train_dl) 
         trainer.train(train_dl, epochs=args.epochs)
         
         # Save checkpoint
