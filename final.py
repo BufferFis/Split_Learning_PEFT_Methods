@@ -709,6 +709,7 @@ def evaluate_official(preds, ref_file="references/e2e_refs_100.tsv"):
             ["python",
             str(repo / "measure_scores.py"),
             "--python",          # <-- use pure-Python scorer
+             "--json",            # <-- emit results as one JSON line
             ref_path,
             sys_file],
             text=True)
