@@ -744,7 +744,7 @@ def evaluate_official(preds,
         )
     finally:
         #os.unlink(sys_file)
-        continue  # keep the temp file for debugging
+        pass  # keep the temp file for debugging
 
     # 2) take the last non-empty line
     last = [l for l in out.splitlines() if l.strip()][-1]
