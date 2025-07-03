@@ -91,7 +91,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
                 if attention_mask is not None:
                     # GPT-2 uses 4D attention mask: [batch, 1, seq_len, seq_len]
                     extended_attention_mask = attention_mask[:, None, None, :]
-                    extended_attention_mask = extended_attention_mask.to(dtype=self.dtype)
+                    extended_attention_mask = extended_attention_mask.to(dtype=self.wte.weight.dtype)
                     extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
                 else:
                     extended_attention_mask = None
