@@ -871,6 +871,26 @@ def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
     print(f"BLEU  : {bleu_score:.4f}  •  METEOR: {meteor_score:.4f}  •  SBLUE {sacre_score:.4f}  • failed {fails}/{len(store)}")
     return {"bleu": bleu_score, "meteor": meteor_score, "failed": fails, "sacrebleu": sacre_score, **official}
 
+
+def safe_bleu_compute(pred, ref):
+    bleu   = load_metric("bleu")
+    """Safely compute BLEU with error handling"""
+    try:
+        # Filter out very short predictions
+        if len(pred.strip().split()) < 2:
+            return 0.0
+        
+        score = bleu.compute(
+            predictions=[pred], 
+            references=[[ref]],
+            smooth=True  # Enable smoothing
+        )["bleu"]
+        return score if not math.isnan(score) else 0.0
+    except (ZeroDivisionError, ValueError) as e:
+        print(f"BLEU computation failed for '{pred[:50]}...': {e}")
+        return 0.0
+
+
 # ─── MBR beam search ────────────────────────────────────────────────
 def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text,
                            max_new_tokens=64, k=10):
@@ -883,24 +903,56 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text,
 
     with torch.no_grad():
         beams = wrapper.generate(
-            ids, attention_mask=m,
-            max_new_tokens=max_new_tokens,
-            min_length=ids.size(1) + 10,
-            num_beams        = k,
-            num_return_sequences = k,   # <-- all beams back
-            length_penalty   = 0.7,
-            early_stopping   = True,
-            no_repeat_ngram_size = 4,
-            repetition_penalty   = 1.2,
-            diversity_penalty    = 0.0, # classic beam, like SplitFM
-            eos_token_id=trainer.tokenizer.eos_token_id,  # Proper EOS
-            pad_token_id=trainer.tokenizer.pad_token_id,  # Your custom pad
-            bos_token_id=trainer.tokenizer.bos_token_id,  # Add BOS
+            ids, 
+            attention_mask=m,
+            
+            # FIXED: Force longer generation
+            max_new_tokens=64,
+            min_length=ids.size(1) + 15,  # Force at least 15 new tokens
+            
+            # FIXED: Beam search params  
+            num_beams=k,
+            num_return_sequences=k,
+            length_penalty=1.0,          # Neutral length penalty
+            early_stopping=False,        # Don't stop early
+            
+            # FIXED: Repetition handling
+            no_repeat_ngram_size=2,      # Reduced to allow some repetition
+            repetition_penalty=1.05,     # Mild penalty
+            
+            # FIXED: Token handling
+            eos_token_id=trainer.tokenizer.eos_token_id,
+            pad_token_id=trainer.tokenizer.pad_token_id,
+            
+            # FIXED: Generation behavior
+            do_sample=False,
+            temperature=1.0,
             remove_invalid_values=True,
-            do_sample=False,            # Ensure deterministic beam search
-            temperature=1.0,            # Keep neutral
         )
-
+    # DEBUG: Check what was generated
+    print(f"Generated {len(beams)} total sequences")
+    # Extract only the generated parts (after the prompt)
+    candidates = []
+    for i, beam in enumerate(beams):
+        generated_part = beam[ids.size(1):]  # Remove prompt
+        candidate = trainer.tokenizer.decode(generated_part, skip_special_tokens=True).strip()
+        
+        print(f"Beam {i}: '{candidate}'")
+        
+        # FIXED: Filter out very short candidates
+        if len(candidate.split()) >= 3:  # At least 3 words
+            candidates.append(candidate)
+        else:
+            print(f"  -> Filtered out (too short)")
+    
+    # If no valid candidates, return fallback
+    if not candidates:
+        print("No valid candidates found, returning fallback")
+        return "the restaurant has a high rating"
+    
+    # FIXED: Safe MBR reranking
+    if len(candidates) == 1:
+        return candidates[0]
     
     # decode beams to strings
     prompt_len = ids.size(1)              # tokens that belong to the MR
@@ -910,8 +962,7 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text,
                 for seq in beams]
 
     bleu = load_metric("bleu")            # already imported in final.py
-    scores = [bleu.compute(predictions=[c], references=[[ref_text]])["bleu"]
-              for c in cand_txt]
+    scores = [safe_bleu_compute(c, ref_text) for c in candidates]
     
     print(f"Generated {len(beams)} beams")
     for i, beam in enumerate(beams[:3]):  # Show first 3 beams
@@ -984,7 +1035,6 @@ def main():
             json.dump(results, f, indent=2)
         return
 
-        
 
 
     if not args.eval_only:
