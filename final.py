@@ -722,14 +722,11 @@ def generate_with_beam(trainer, wrapper, mr_text, max_new_tokens=64):
                                     skip_special_tokens=True).strip()
 
 
-import re, tempfile, subprocess, pathlib, json, os
-
-def evaluate_official(preds, ref_file="references/e2e_refs.tsv"):
-    # collapse all whitespace incl. TAB and NL to a single space
-    clean_preds = [re.sub(r'\s+', ' ', p).strip() for p in preds]
-
+def evaluate_official(preds,
+                      ref_file="references/e2e_refs.tsv"):
+    # 1) write system outputs to a temp file
     with tempfile.NamedTemporaryFile('w', delete=False) as f:
-        f.write("\n".join(clean_preds) + "\n")    # now always 630 lines
+        f.write("\n".join(preds) + "\n")
         sys_file = f.name
 
     repo = pathlib.Path(__file__).resolve().parent / "e2e-metrics"
@@ -739,18 +736,27 @@ def evaluate_official(preds, ref_file="references/e2e_refs.tsv"):
         out = subprocess.check_output(
             ["python",
              str(repo / "measure_scores.py"),
-             "--python", "-t",
+             "--python",          # pure-Python BLEU/NIST
+             "-t",               # TSV one-line output
              str(ref_path),
              sys_file],
             text=True
         )
     finally:
-        os.unlink(sys_file)          # you can re-enable cleanup again
+        #os.unlink(sys_file)
+        pass  # keep the temp file for debugging
 
+    # 2) take the last non-empty line
     last = [l for l in out.splitlines() if l.strip()][-1]
-    b, n, m, r, c = map(float, last.split("\t")[1:6])
-    return dict(bleu=b, nist=n, meteor=m, rouge_l=r, cider=c)
+    fields = last.split("\t")          # 0 = sys name, 1..5 = scores
 
+    return {
+        "bleu":     float(fields[1]),
+        "nist":     float(fields[2]),
+        "meteor":   float(fields[3]),
+        "rouge_l":  float(fields[4]),
+        "cider":    float(fields[5])
+    }
 
 
 
