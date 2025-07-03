@@ -76,7 +76,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             """Default implementation for prepare_inputs_for_generation"""
             return {"input_ids": input_ids}
             
-        def forward(self, input_ids=None, attention_mask=None, output_hidden_states=False, **kwargs):
+        def forward(self, input_ids=None, attention_mask=None, **kwargs):
             inputs_embeds = self.wte(input_ids)
             seq_length = input_ids.size(-1)
             position_ids = torch.arange(0, seq_length, dtype=torch.long, device=input_ids.device)
@@ -84,19 +84,22 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             hidden_states = inputs_embeds + position_embeds
             hidden_states = self.drop(hidden_states)
             
-            # SIMPLIFIED: Let GPT-2 handle attention masking internally
             all_hidden_states = ()
             for block in self.h:
-                hidden_states = block(hidden_states, use_cache=False)[0]  # No attention_mask!
+                # FIXED: Pass attention_mask properly
+                hidden_states = block(
+                    hidden_states, 
+                    attention_mask=attention_mask,
+                    use_cache=False
+                )[0]
                 all_hidden_states = all_hidden_states + (hidden_states,)
             
-            if output_hidden_states:
-                return type('HeadOutput', (), {
-                    'last_hidden_state': hidden_states,
-                    'hidden_states': all_hidden_states
-                })()
-            else:
-                return type('HeadOutput', (), {'last_hidden_state': hidden_states})()
+            # Return both hidden states and attention_mask for next component
+            return type('HeadOutput', (), {
+                'last_hidden_state': hidden_states,
+                'attention_mask': attention_mask
+            })()
+            
     
     # Body Model (middle layers)
     class BodyModel(nn.Module):
@@ -129,12 +132,19 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             return {"input_ids": input_ids}
             
         def forward(self, hidden_states=None, attention_mask=None, **kwargs):
-            # SIMPLIFIED: Remove complex attention mask handling
             for block in self.transformer.h:
-                hidden_states = block(hidden_states, use_cache=False)[0]  # No attention_mask!
-        
-            return type('BodyOutput', (), {'last_hidden_state': hidden_states})()
-    
+                # FIXED: Use attention_mask
+                hidden_states = block(
+                    hidden_states, 
+                    attention_mask=attention_mask,
+                    use_cache=False
+                )[0]
+            
+            return type('BodyOutput', (), {
+                'last_hidden_state': hidden_states,
+                'attention_mask': attention_mask
+            })()
+
     # Tail Model (last few layers + LM head)
     class TailModel(nn.Module):
         def __init__(self, original_model, start_layer):
@@ -168,12 +178,17 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
         def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
             hidden_states = inputs_embeds
             
-            # SIMPLIFIED: Remove complex attention mask handling
             for block in self.transformer.h:
-                hidden_states = block(hidden_states, use_cache=False)[0]  # No attention_mask!
+                # FIXED: Use attention_mask
+                hidden_states = block(
+                    hidden_states, 
+                    attention_mask=attention_mask,
+                    use_cache=False
+                )[0]
+            
             hidden_states = self.transformer.ln_f(hidden_states)
-
             logits = self.lm_head(hidden_states)
+            
             return type('TailOutput', (), {'logits': logits})()
     
     head_model = HeadModel(model, head_layers)
@@ -362,6 +377,9 @@ class SplitLoRATrainer:
             self.tokenizer.add_special_tokens({"pad_token": self.PAD})
             full_model.resize_token_embeddings(len(self.tokenizer))
         
+        self.tokenizer.padding_side = "right"  # For generation
+        full_model.config.pad_token_id = self.tokenizer.pad_token_id
+        
         # --- keep every config in sync with the enlarged vocabulary ------------
         vocab = len(self.tokenizer)           # e.g. 50_259
         full_model.config.vocab_size = vocab
@@ -414,31 +432,24 @@ class SplitLoRATrainer:
         
         def preprocess(example):
             SEQUENCE_LENGTH = 256
-            
             mr_text = example["meaning_representation"]
             ref_text = example["human_reference"]
-            
             space_delim = " " + self.DELIM + " "
-
             full_text = mr_text + space_delim + ref_text          
-            
-            
             # Tokenize full sequence
             encoding = self.tokenizer(
                 full_text,
                 max_length=SEQUENCE_LENGTH,
                 truncation=True,
-                padding="max_length"
+                padding="max_length",
+                return_attention_mask=True
             )
-            
             # Simple masking
             labels = encoding["input_ids"].copy()
             mr_tokens = self.tokenizer.encode(mr_text + space_delim, add_special_tokens=False)
             labels[:len(mr_tokens)] = [-100] * len(mr_tokens)
             labels = [ -100 if tok == self.tokenizer.pad_token_id else tok
-                        for tok in labels ]                       # NEW
-
-            
+                        for tok in labels ]        
             return {
                 "input_ids": encoding["input_ids"],
                 "attention_mask": encoding["attention_mask"],
@@ -530,6 +541,11 @@ class SplitLoRATrainer:
                     input_ids = batch["input_ids"].to(device)
                     attention_mask = batch["attention_mask"].to(device)
                     labels = batch["labels"].to(device)
+
+                    print(f"Input attention mask sum: {attention_mask.sum()}")
+                    print(f"Attention mask shape: {attention_mask.shape}")
+                    print(f"Pad token positions: {(input_ids == self.tokenizer.pad_token_id).sum()}")
+
                     
                     # FIX: Check for NaN inputs
                     if torch.isnan(input_ids.float()).any() or torch.isnan(labels.float()).any():
@@ -538,12 +554,14 @@ class SplitLoRATrainer:
                     
                     # Forward through pipeline
                     head_activations = self.head_client.forward(input_ids, attention_mask)
-                    body_activations, stored_head_activations = self.server.forward_train(
+                    body_activations, head_activations_stored = self.server.forward_train(
                         head_activations, attention_mask
                     )
+
                     loss, body_grad = self.tail_client.compute_loss_and_backward(
                         body_activations, labels, attention_mask
                     )
+
                     
                     # FIX: Check for NaN loss
                     if math.isnan(loss):
@@ -551,7 +569,10 @@ class SplitLoRATrainer:
                         continue
                     
                     # Backward through body and head
-                    head_grad = self.server.backward(body_activations, body_grad, stored_head_activations)
+                    
+                    # FIXED: Use the correct variable name
+                    head_grad = self.server.backward(body_activations, body_grad, head_activations_stored)
+
                     self.head_client.backward(head_activations, head_grad)
                     for sched in self.schedulers:
                         sched.step()
@@ -562,6 +583,7 @@ class SplitLoRATrainer:
                     
                     total_loss += loss
                     num_batches += 1
+                    
                     
                     if batch_idx % 100 == 0:
                         print(f"Batch {batch_idx}, Loss: {loss:.4f}")
