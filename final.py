@@ -76,29 +76,36 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             """Default implementation for prepare_inputs_for_generation"""
             return {"input_ids": input_ids}
             
-        def forward(self, input_ids=None, attention_mask=None, **kwargs):
+        def forward(self, input_ids=None, attention_mask=None, output_hidden_states=False, **kwargs):
             inputs_embeds = self.wte(input_ids)
             seq_length = input_ids.size(-1)
             position_ids = torch.arange(0, seq_length, dtype=torch.long, device=input_ids.device)
             position_embeds = self.wpe(position_ids)
             hidden_states = inputs_embeds + position_embeds
             hidden_states = self.drop(hidden_states)
-            
+
+            # FIXED: Pass attention_mask to each block
             all_hidden_states = ()
             for block in self.h:
-                # FIXED: Pass attention_mask properly
-                hidden_states = block(
-                    hidden_states, 
-                    attention_mask=attention_mask,
-                    use_cache=False
-                )[0]
+                # Convert attention_mask to the format GPT-2 blocks expect
+                if attention_mask is not None:
+                    # GPT-2 uses 4D attention mask: [batch, 1, seq_len, seq_len]
+                    extended_attention_mask = attention_mask[:, None, None, :]
+                    extended_attention_mask = extended_attention_mask.to(dtype=self.dtype)
+                    extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+                else:
+                    extended_attention_mask = None
+                    
+                hidden_states = block(hidden_states, attention_mask=extended_attention_mask, use_cache=False)[0]
                 all_hidden_states = all_hidden_states + (hidden_states,)
-            
-            # Return both hidden states and attention_mask for next component
-            return type('HeadOutput', (), {
-                'last_hidden_state': hidden_states,
-                'attention_mask': attention_mask
-            })()
+
+            if output_hidden_states:
+                return type('HeadOutput', (), {
+                    'last_hidden_state': hidden_states,
+                    'hidden_states': all_hidden_states
+                })()
+            else:
+                return type('HeadOutput', (), {'last_hidden_state': hidden_states})()
             
     
     # Body Model (middle layers)
@@ -132,18 +139,18 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             return {"input_ids": input_ids}
             
         def forward(self, hidden_states=None, attention_mask=None, **kwargs):
+            # FIXED: Pass attention_mask to each block
             for block in self.transformer.h:
-                # FIXED: Use attention_mask
-                hidden_states = block(
-                    hidden_states, 
-                    attention_mask=attention_mask,
-                    use_cache=False
-                )[0]
-            
-            return type('BodyOutput', (), {
-                'last_hidden_state': hidden_states,
-                'attention_mask': attention_mask
-            })()
+                if attention_mask is not None:
+                    # GPT-2 uses 4D attention mask: [batch, 1, seq_len, seq_len]
+                    extended_attention_mask = attention_mask[:, None, None, :]
+                    extended_attention_mask = extended_attention_mask.to(dtype=hidden_states.dtype)
+                    extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+                else:
+                    extended_attention_mask = None
+                    
+                hidden_states = block(hidden_states, attention_mask=extended_attention_mask, use_cache=False)[0]
+            return type('BodyOutput', (), {'last_hidden_state': hidden_states})()
 
     # Tail Model (last few layers + LM head)
     class TailModel(nn.Module):
@@ -177,19 +184,24 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             
         def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
             hidden_states = inputs_embeds
-            
+
+            # FIXED: Pass attention_mask to each block
             for block in self.transformer.h:
-                # FIXED: Use attention_mask
-                hidden_states = block(
-                    hidden_states, 
-                    attention_mask=attention_mask,
-                    use_cache=False
-                )[0]
-            
+                if attention_mask is not None:
+                    # GPT-2 uses 4D attention mask: [batch, 1, seq_len, seq_len]
+                    extended_attention_mask = attention_mask[:, None, None, :]
+                    extended_attention_mask = extended_attention_mask.to(dtype=hidden_states.dtype)
+                    extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+                else:
+                    extended_attention_mask = None
+                    
+                hidden_states = block(hidden_states, attention_mask=extended_attention_mask, use_cache=False)[0]
+
             hidden_states = self.transformer.ln_f(hidden_states)
             logits = self.lm_head(hidden_states)
-            
+
             return type('TailOutput', (), {'logits': logits})()
+
     
     head_model = HeadModel(model, head_layers)
     body_model = BodyModel(model, head_layers, body_layers)

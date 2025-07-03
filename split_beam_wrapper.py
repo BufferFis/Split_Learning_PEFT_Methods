@@ -41,13 +41,14 @@ class SplitGPT2ForGeneration(PreTrainedModel, GenerationMixin):
 
     # ---------- standard forward ---------------------------------------
     def forward(self,
-                input_ids:      torch.LongTensor,
+                input_ids: torch.LongTensor,
                 attention_mask: Optional[torch.FloatTensor] = None,
                 **ignored):
         with torch.no_grad():
             h = self.head_client.forward(input_ids, attention_mask)
-            b = self.server.forward(h, attention_mask)
-            logits = self.tail_client.forward(b, attention_mask)
+            b = self.server.forward(h, attention_mask)  # Pass attention_mask
+            logits = self.tail_client.forward(b, attention_mask)  # Pass attention_mask
+
         return CausalLMOutput(logits=logits)
 
     # optional: if you ever want to swap lm_head
