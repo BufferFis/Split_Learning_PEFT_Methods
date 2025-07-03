@@ -18,6 +18,9 @@ class SplitGPT2ForGeneration(PreTrainedModel, GenerationMixin):
         self.head_client = head_client
         self.server      = server
         self.tail_client = tail_client
+        self.config.max_length = 256
+        self.config.min_length = 10
+        self.config.do_sample = False
 
         # --- 2.  make HF aware of the LM-head / embeddings -------------
         # 2-a  expose the lm_head itself

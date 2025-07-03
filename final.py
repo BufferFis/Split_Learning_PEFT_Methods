@@ -388,6 +388,13 @@ class SplitLoRATrainer:
         if self.tokenizer.pad_token is None:
             self.tokenizer.add_special_tokens({"pad_token": self.PAD})
             full_model.resize_token_embeddings(len(self.tokenizer))
+
+        if self.tokenizer.eos_token is None:
+            self.tokenizer.add_special_tokens({"eos_token": "<|endoftext|>"})
+            full_model.resize_token_embeddings(len(self.tokenizer))
+
+        # Set generation config
+        full_model.config.eos_token_id = self.tokenizer.eos_token_id
         
         self.tokenizer.padding_side = "right"  # For generation
         full_model.config.pad_token_id = self.tokenizer.pad_token_id
@@ -719,38 +726,36 @@ def generate_with_beam(trainer, wrapper, mr_text, max_new_tokens=64):
     ids, m = enc["input_ids"].to(device), enc["attention_mask"].to(device)
     
     procs = LogitsProcessorList([
-            # block anything ≥ len(tokenizer)
-            MinLengthLogitsProcessor(min_length=1, eos_token_id=len(trainer.tokenizer))
-        ])
+        MinLengthLogitsProcessor(
+            min_length=10,  # Ensure at least 10 tokens generated
+            eos_token_id=trainer.tokenizer.eos_token_id
+        )
+    ])
 
     with torch.no_grad():
         out = wrapper.generate(
-                        ids,
-                        attention_mask = m,
-
-                        # ---------------- SplitFM beam-search settings -----------------
-                        max_new_tokens        = 64,     # --eval_len
-                        num_beams             = 10,     # --beam
-                        length_penalty        = 0.7,    # --length_penalty
-                        early_stopping        = True,   # end once all beams hit <eos>
-                        no_repeat_ngram_size  = 4,      # --no_repeat_ngram_size
-                        repetition_penalty    = 1.2,    # --repetition_penalty (= neutral)
-                        #diversity_penalty   = 0.35,
-                        #num_beam_groups     = 5,   # must divide num_beams (10)
-
-                        # ----------------------------------------------------------------
-
-                        # no diversity groups in SplitFM; leave defaults
-                        # diversity_penalty   = 0.0
-                        # num_beam_groups     = 1
-
-                        # housekeeping
-                        remove_invalid_values = True,   # robust against any NaNs
-                        #eos_token_id          = trainer.tokenizer.eos_token_id,  # SplitFM passes 628
-                        eos_token_id = trainer.tokenizer.eos_token_id,
-                        pad_token_id          = trainer.tokenizer.pad_token_id,
-                        return_dict_in_generate = False # SplitFM just wants the ids
-                )
+                ids, 
+                attention_mask=m,
+                # FIXED PARAMETERS:
+                max_new_tokens=64,          # Keep this
+                min_length=ids.size(1) + 10,  # Ensure minimum output length
+                length_penalty=0.7,
+                early_stopping=True,
+                no_repeat_ngram_size=3,     # Reduced from 4
+                repetition_penalty=1.1,    # Reduced from 1.2
+                diversity_penalty=0.0,
+                
+                # FIXED TOKEN IDs:
+                eos_token_id=trainer.tokenizer.eos_token_id,  # Proper EOS
+                pad_token_id=trainer.tokenizer.pad_token_id,  # Your custom pad
+                bos_token_id=trainer.tokenizer.bos_token_id,  # Add BOS
+                
+                # REMOVE PROBLEMATIC PROCESSOR:
+                # Remove the MinLengthLogitsProcessor from here
+                remove_invalid_values=True,
+                do_sample=False,            # Ensure deterministic beam search
+                temperature=1.0,            # Keep neutral
+            )
     
     return trainer.tokenizer.decode(out[0, ids.size(1):],
                                     skip_special_tokens=True).strip()
@@ -880,6 +885,7 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text,
         beams = wrapper.generate(
             ids, attention_mask=m,
             max_new_tokens=max_new_tokens,
+            min_length=ids.size(1) + 10,
             num_beams        = k,
             num_return_sequences = k,   # <-- all beams back
             length_penalty   = 0.7,
@@ -887,11 +893,15 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text,
             no_repeat_ngram_size = 4,
             repetition_penalty   = 1.2,
             diversity_penalty    = 0.0, # classic beam, like SplitFM
-            remove_invalid_values = True,
-            eos_token_id = trainer.tokenizer.eos_token_id,
-            pad_token_id = trainer.tokenizer.pad_token_id,
+            eos_token_id=trainer.tokenizer.eos_token_id,  # Proper EOS
+            pad_token_id=trainer.tokenizer.pad_token_id,  # Your custom pad
+            bos_token_id=trainer.tokenizer.bos_token_id,  # Add BOS
+            remove_invalid_values=True,
+            do_sample=False,            # Ensure deterministic beam search
+            temperature=1.0,            # Keep neutral
         )
 
+    
     # decode beams to strings
     prompt_len = ids.size(1)              # tokens that belong to the MR
     cand_txt = [trainer.tokenizer.decode(
@@ -902,6 +912,15 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text,
     bleu = load_metric("bleu")            # already imported in final.py
     scores = [bleu.compute(predictions=[c], references=[[ref_text]])["bleu"]
               for c in cand_txt]
+    
+    print(f"Generated {len(beams)} beams")
+    for i, beam in enumerate(beams[:3]):  # Show first 3 beams
+        decoded = trainer.tokenizer.decode(beam, skip_special_tokens=False)
+        print(f"Beam {i}: {decoded}")
+        
+        # Show just the generated part
+        gen_part = trainer.tokenizer.decode(beam[ids.size(1):], skip_special_tokens=True)
+        print(f"Generated part {i}: '{gen_part}'")
 
     best = cand_txt[int(np.argmax(scores))]
     return best
@@ -971,7 +990,11 @@ def main():
     if not args.eval_only:
         # Create dataloader and train
         train_dl = trainer.create_dataloader(train_ds, batch_size=args.batch_size, shuffle=True, debug_mode=False)
-        trainer.attach_schedulers(train_dl) 
+        trainer.attach_schedulers(train_dl)
+        print(f"Vocab size: {len(trainer.tokenizer)}")
+        print(f"DELIM token: '{trainer.DELIM}' -> {trainer.tokenizer.encode(trainer.DELIM)}")
+        print(f"PAD token: '{trainer.PAD}' -> {trainer.tokenizer.pad_token_id}")
+        print(f"EOS token: '{trainer.tokenizer.eos_token}' -> {trainer.tokenizer.eos_token_id}")
         trainer.train(train_dl, epochs=args.epochs)
         
         # Save checkpoint
