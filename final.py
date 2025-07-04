@@ -865,6 +865,37 @@ def evaluate_official(preds,
     }
 
 
+def generate_with_sampling(trainer, wrapper, mr_text, ref_text, max_new_tokens=40):
+    """Use sampling instead of beam search to avoid repetition"""
+    prompt = mr_text + " " + trainer.DELIM + " "
+    enc = trainer.tokenizer(prompt, return_tensors="pt")
+    ids, m = enc["input_ids"].to(device), enc["attention_mask"].to(device)
+
+    with torch.no_grad():
+        output = wrapper.generate(
+            ids,
+            attention_mask=m,
+            
+            # SAMPLING APPROACH (avoids beam search repetition)
+            max_new_tokens=40,
+            do_sample=True,
+            
+            # Sampling parameters
+            top_k=50,
+            top_p=0.9,
+            temperature=0.8,
+            
+            # Still use some repetition control
+            repetition_penalty=1.3,
+            no_repeat_ngram_size=3,
+            
+            eos_token_id=trainer.tokenizer.eos_token_id,
+            pad_token_id=trainer.tokenizer.pad_token_id,
+        )
+    
+    result = trainer.tokenizer.decode(output[0][ids.size(1):], skip_special_tokens=True).strip()
+    return result
+
 
 def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
     """Compute BLEU & METEOR on `n_samples` examples using beam search."""
@@ -1074,7 +1105,8 @@ def main():
         # quick manual check on one MR
         example_mr = "name[Blue Spice], eatType[coffee shop], area[city centre]"
         example_ref = "Blue Spice is a coffee shop in the city centre."
-        print("Beam-10 output:", generate_with_beam_mbr(trainer, wrapper, example_mr, example_ref))
+        print("Sampling output:", generate_with_sampling(trainer, wrapper, example_mr, example_ref))
+
 
         # full dev-set evaluation (first 100 samples)
         train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
