@@ -436,7 +436,7 @@ class SplitLoRATrainer:
         
         self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
         full_model = GPT2LMHeadModel.from_pretrained('gpt2')
-        self.DELIM = " = "
+        self.DELIM = " is "  # More natural language connector
         self.PAD = self.tokenizer.eos_token  # Use eos_token as pad
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
@@ -747,32 +747,39 @@ class SplitLoRATrainer:
             full_text = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
             print(f"Full input: '{full_text}'")
             
-            # Show the specific positions we're analyzing
-            last_5_tokens = input_ids[0, -5:].tolist()
-            last_5_labels = labels[0, -5:].tolist()
-            print(f"Last 5 input tokens: {last_5_tokens}")
-            print(f"Last 5 labels: {last_5_labels}")
-            print(f"Last 5 decoded: {[self.tokenizer.decode([t]) for t in last_5_tokens]}")
+            # Find actual content end (before padding)
+            padding_mask = (input_ids[0] == self.tokenizer.pad_token_id)
+            if padding_mask.any():
+                real_length = padding_mask.int().argmax().item()  # First padding position
+            else:
+                real_length = input_ids.size(1)  # No padding
             
-            # Check if these are padding positions
-            padding_positions = (input_ids[0] == self.tokenizer.pad_token_id).sum().item()
-            real_length = len(input_ids[0]) - padding_positions
-            print(f"Real sequence length: {real_length}/128")
-            print(f"Positions -5 to -1 are: {'PADDING' if real_length <= 123 else 'REAL CONTENT'}")
+            print(f"Real sequence length: {real_length}/{input_ids.size(1)}")
             
-            # Forward pass
-            head_out = self.head_client.forward(input_ids, attention_mask)
-            body_out = self.server.forward(head_out, attention_mask)
-            logits = self.tail_client.forward(body_out, attention_mask)
-
-            # Get top predictions for meaningful positions only
+            # FIXED: Analyze positions relative to REAL content, not padded length
             if real_length > 5:
-                # Analyze positions around the delimiter and end of real content
-                meaningful_positions = [-real_length+input_ids.size(1)-3, -real_length+input_ids.size(1)-2, -real_length+input_ids.size(1)-1]
+                # Analyze last 3 positions of ACTUAL content
+                meaningful_positions = [real_length-3, real_length-2, real_length-1]
+                
+                print("=== MEANINGFUL POSITIONS ANALYSIS ===")
+                print(f"Analyzing actual content positions: {meaningful_positions}")
+                
+                # Show what tokens are at these positions
+                for pos in meaningful_positions:
+                    token_id = input_ids[0, pos].item()
+                    token_text = self.tokenizer.decode([token_id])
+                    label = labels[0, pos].item()
+                    print(f"Position {pos}: '{token_text}' (label: {label})")
+                
+                # Forward pass
+                head_out = self.head_client.forward(input_ids, attention_mask)
+                body_out = self.server.forward(head_out, attention_mask)
+                logits = self.tail_client.forward(body_out, attention_mask)
+                
+                # Get predictions for meaningful positions
                 probs = torch.softmax(logits[0, meaningful_positions], dim=-1)
                 top_tokens = torch.topk(probs, 3, dim=-1)
                 
-                print("=== MEANINGFUL POSITIONS ANALYSIS ===")
                 for i, pos in enumerate(meaningful_positions):
                     print(f"Position {pos} (real content):")
                     for j in range(3):
@@ -780,7 +787,9 @@ class SplitLoRATrainer:
                         prob = top_tokens.values[i, j].item()
                         token_text = self.tokenizer.decode([token_id])
                         print(f"  Top {j+1}: '{token_text}' (prob: {prob:.3f})")
- 
+            else:
+                print("Sequence too short for meaningful analysis")
+
     
             
 
@@ -1089,92 +1098,41 @@ def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
     return {"bleu": bleu_score, "meteor": meteor_score, "failed": fails, "sacrebleu": sacre_score, **official}
 
 # ─── MBR beam search ────────────────────────────────────────────────
-def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text,
-                           max_new_tokens=64, k=10):
-    """
-    Return the BLEU-best candidate among the top-k beams (MBR reranking).
-    """
+def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text, max_new_tokens=64, k=10):
     prompt = mr_text + " " + trainer.DELIM + " "
-    enc    = trainer.tokenizer(prompt, return_tensors="pt")
+    enc = trainer.tokenizer(prompt, return_tensors="pt")
     ids, m = enc["input_ids"].to(device), enc["attention_mask"].to(device)
 
     with torch.no_grad():
+        # ULTRA SIMPLE beam search - no complex parameters
         beams = wrapper.generate(
             ids,
             attention_mask=m,
-            
-            # FIXED: Clean beam search parameters
-            max_new_tokens=25,
-            min_length=ids.size(1) + 5,
-            
+            max_new_tokens=20,              # Shorter for E2E
             num_beams=k,
             num_return_sequences=k,
-            
-            # CRITICAL: Completely remove beam groups and diversity penalties
             early_stopping=True,
-            length_penalty=1.0,
-            
-            # GENTLE repetition control
-            no_repeat_ngram_size=2,
-            repetition_penalty=1.1,
-            
-            # REMOVE ALL PROBLEMATIC PARAMETERS:
-            # No diversity_penalty
-            # No num_beam_groups
-            # No temperature/top_p/top_k in beam search
-            
+            length_penalty=1.0,             # Neutral
             eos_token_id=trainer.tokenizer.eos_token_id,
             pad_token_id=trainer.tokenizer.pad_token_id,
-            do_sample=False,  # Pure beam search
+            do_sample=False,
+            # REMOVE ALL OTHER PARAMETERS - keep it simple!
         )
 
-    # DEBUG: Check what was generated
-    print(f"Generated {len(beams)} total sequences")
-    # Extract only the generated parts (after the prompt)
+    # Extract candidates
     candidates = []
     for i, beam in enumerate(beams):
-        generated_part = beam[ids.size(1):]  # Remove prompt
+        generated_part = beam[ids.size(1):]
         candidate = trainer.tokenizer.decode(generated_part, skip_special_tokens=True).strip()
-        
         print(f"Beam {i}: '{candidate}'")
-        
-        # FIXED: Filter out very short candidates
-        if len(candidate.split()) >= 3:  # At least 3 words
+        if len(candidate.split()) >= 2:  # At least 2 words
             candidates.append(candidate)
-        else:
-            print(f"  -> Filtered out (too short)")
-    
-    # If no valid candidates, return fallback
+
     if not candidates:
-        print("No valid candidates found, returning fallback")
-        return "the restaurant has a high rating"
+        return "The restaurant serves food"  # Simple fallback
     
-    # FIXED: Safe MBR reranking
-    if len(candidates) == 1:
-        return candidates[0]
-    
-    # decode beams to strings
-    prompt_len = ids.size(1)              # tokens that belong to the MR
-    cand_txt = [trainer.tokenizer.decode(
-                seq[prompt_len:],       # keep everything *after* the prompt
-                skip_special_tokens=True).strip()
-                for seq in beams]
+    return candidates[0]  # Return first valid candidate (no MBR for now)
 
-    bleu = load_metric("bleu")            # already imported in final.py
-    scores = [bleu.compute(predictions=[c], references=[[ref_text]])["bleu"]
-              for c in cand_txt]
-    
-    print(f"Generated {len(beams)} beams")
-    for i, beam in enumerate(beams[:3]):  # Show first 3 beams
-        decoded = trainer.tokenizer.decode(beam, skip_special_tokens=False)
-        print(f"Beam {i}: {decoded}")
-        
-        # Show just the generated part
-        gen_part = trainer.tokenizer.decode(beam[ids.size(1):], skip_special_tokens=True)
-        print(f"Generated part {i}: '{gen_part}'")
-
-    best = cand_txt[int(np.argmax(scores))]
-    return best
 
 
 def test_simple_greedy(trainer, wrapper, mr_text):
@@ -1183,25 +1141,20 @@ def test_simple_greedy(trainer, wrapper, mr_text):
     ids, m = enc["input_ids"].to(device), enc["attention_mask"].to(device)
 
     with torch.no_grad():
+        # ABSOLUTE MINIMAL greedy generation
         output = wrapper.generate(
             ids,
             attention_mask=m,
-            
-            # MINIMAL greedy parameters
-            max_new_tokens=15,
-            min_length=ids.size(1) + 3,
-            
-            do_sample=False,  # Pure greedy
-            
-            # MINIMAL repetition control
-            repetition_penalty=1.02,  # Almost none
-            
+            max_new_tokens=12,              # Very short
+            do_sample=False,                # Pure greedy
             eos_token_id=trainer.tokenizer.eos_token_id,
             pad_token_id=trainer.tokenizer.pad_token_id,
+            # NO OTHER PARAMETERS AT ALL
         )
     
     result = trainer.tokenizer.decode(output[0][ids.size(1):], skip_special_tokens=True).strip()
     return result
+
 
 
 
