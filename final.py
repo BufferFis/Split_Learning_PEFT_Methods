@@ -985,18 +985,11 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text,
         beams = wrapper.generate(
             ids, 
             attention_mask=m,
-            
-            # FIXED: Force longer generation
             max_new_tokens=30,
-            min_length=ids.size(1) + 8,  # Force at least 15 new tokens
-            
-            # FIXED: Beam search params  
+            min_length=ids.size(1) + 8, 
             num_beams=k,
             num_return_sequences=k,
-            length_penalty=1.0,          # Neutral length penalty
             early_stopping=False,        # Don't stop early
-            
-            # FIXED: Repetition handling
             no_repeat_ngram_size=4,      # Reduced to allow some repetition
             repetition_penalty=2.00,     # Mild penalty
             length_penalty=0.9,             # Slight length preference
