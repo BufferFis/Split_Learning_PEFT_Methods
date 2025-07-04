@@ -879,7 +879,7 @@ def generate_with_sampling(trainer, wrapper, mr_text, ref_text, max_new_tokens=4
             # SAMPLING APPROACH (avoids beam search repetition)
             max_new_tokens=30,
             do_sample=False,
-            
+            num_beam_groups = 2,
             # Sampling parameters
             top_k=40,
             top_p=0.85,
