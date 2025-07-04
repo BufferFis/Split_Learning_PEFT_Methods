@@ -194,10 +194,8 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             return {"input_ids": input_ids}
             
         def forward(self, hidden_states=None, attention_mask=None, **kwargs):
-            # FIXED: Pass attention_mask to each block
+    
             for block in self.transformer.h:
-                
-                    
                 hidden_states = block(hidden_states, use_cache=False)[0]
             return type('BodyOutput', (), {'last_hidden_state': hidden_states})()
 
@@ -234,16 +232,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
         def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
             hidden_states = inputs_embeds
 
-            # FIXED: Pass attention_mask to each block
-            for block in self.transformer.h:
-                if attention_mask is not None:
-                    # GPT-2 uses 4D attention mask: [batch, 1, seq_len, seq_len]
-                    extended_attention_mask = attention_mask[:, None, None, :]
-                    extended_attention_mask = extended_attention_mask.to(dtype=hidden_states.dtype)
-                    extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
-                else:
-                    extended_attention_mask = None
-                    
+            for block in self.transformer.h:   
                 hidden_states = block(hidden_states, use_cache=False)[0]
 
             hidden_states = self.transformer.ln_f(hidden_states)
@@ -275,7 +264,7 @@ class ServerModel:
         """Forward pass through body layers (inference mode)"""
         self.body_model.eval()
         with torch.no_grad():
-            output = self.body_model(hidden_states=activations, attention_mask=attention_mask)
+            output = self.body_model(hidden_states=activations)
             return output.last_hidden_state
     
     def forward_train(self, activations, attention_mask=None):
@@ -283,7 +272,7 @@ class ServerModel:
         self.body_model.train()
         # Don't detach - maintain gradient connection
         activations.requires_grad_(True)
-        output = self.body_model(hidden_states=activations, attention_mask=attention_mask)
+        output = self.body_model(hidden_states=activations)
         return output.last_hidden_state, activations
     
     def backward(self, body_output, body_grad, head_activations):
@@ -328,7 +317,7 @@ class HeadClient:
         """Forward pass through head layers"""
         output = self.head_model(
             input_ids=input_ids, 
-            attention_mask=attention_mask, 
+            #attention_mask=attention_mask, 
             output_hidden_states=True
         )
         return output.hidden_states[-1]
@@ -361,7 +350,7 @@ class TailClient:
         
     def forward(self, body_activations, attention_mask=None):
         """Forward pass through tail layers"""
-        output = self.tail_model(inputs_embeds=body_activations, attention_mask=attention_mask)
+        output = self.tail_model(inputs_embeds=body_activations)
         return output.logits
     
     def compute_loss_and_backward(self, body_activations, labels, attention_mask=None):
@@ -373,7 +362,7 @@ class TailClient:
         body_activations.retain_grad()  # CRITICAL: Add this line
         
         # Forward pass
-        logits = self.tail_model(inputs_embeds=body_activations, attention_mask=attention_mask).logits
+        logits = self.tail_model(inputs_embeds=body_activations).logits
         logits = torch.clamp(logits, -50.0, 50.0)
 
         # Compute loss 
@@ -424,7 +413,7 @@ class SplitLoRATrainer:
         
         self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
         full_model = GPT2LMHeadModel.from_pretrained('gpt2')
-        self.DELIM = " is "  # More natural language connector
+        self.DELIM = " -> "  # More natural language connector
         self.PAD = self.tokenizer.eos_token  # Use eos_token as pad
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
@@ -755,9 +744,9 @@ class SplitLoRATrainer:
                     print(f"Position {pos}: '{token_text}' (label: {label})")
                 
                 # Forward pass
-                head_out = self.head_client.forward(input_ids, attention_mask)
-                body_out = self.server.forward(head_out, attention_mask)
-                logits = self.tail_client.forward(body_out, attention_mask)
+                head_out = self.head_client.forward(input_ids)
+                body_out = self.server.forward(head_out)
+                logits = self.tail_client.forward(body_out)
                 
                 # Get predictions for meaningful positions
                 probs = torch.softmax(logits[0, meaningful_positions], dim=-1)
