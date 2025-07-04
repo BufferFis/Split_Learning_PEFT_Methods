@@ -436,11 +436,8 @@ class SplitLoRATrainer:
         
         self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
         full_model = GPT2LMHeadModel.from_pretrained('gpt2')
-        
-        # Use existing tokens instead of adding new ones
-        self.DELIM = " ||| "  # Use existing characters - no vocab corruption
+        self.DELIM = ":"
         self.PAD = self.tokenizer.eos_token  # Use eos_token as pad
-        
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
         self.tokenizer.padding_side = "right"
@@ -491,17 +488,15 @@ class SplitLoRATrainer:
         """Improved preprocessing with optional debug mode"""
         dataset = load_dataset("e2e_nlg", trust_remote_code=True)
         
-        def preprocess(example):
-            
+        def preprocess(self, example):
             SEQUENCE_LENGTH = 128
             mr_text = example["meaning_representation"]
             ref_text = example["human_reference"]
-            space_delim = " " + self.DELIM + " "  # Now uses " ||| " instead of " <|gen|> "
+            
+            # FIXED: Use simpler delimiter
+            space_delim = self.DELIM  # Just ":" instead of " ||| "
             full_text = mr_text + space_delim + ref_text
-    
-    
-      
-            # Tokenize full sequence
+            
             encoding = self.tokenizer(
                 full_text,
                 max_length=SEQUENCE_LENGTH,
@@ -509,12 +504,25 @@ class SplitLoRATrainer:
                 padding="max_length",
                 return_attention_mask=True
             )
-            # Simple masking
+            
+            # CRITICAL FIX: Better label generation
             labels = encoding["input_ids"].copy()
-            mr_tokens = self.tokenizer.encode(mr_text + space_delim, add_special_tokens=False)
-            labels[:len(mr_tokens)] = [-100] * len(mr_tokens)
-            labels = [ -100 if tok == self.tokenizer.pad_token_id else tok
-                        for tok in labels ]        
+            
+            # Find delimiter position more reliably
+            input_tokens = encoding["input_ids"]
+            delim_token = self.tokenizer.encode(self.DELIM, add_special_tokens=False)[0]
+            
+            try:
+                delim_pos = input_tokens.index(delim_token)
+                # Mask everything up to and including delimiter
+                labels[:delim_pos + 1] = [-100] * (delim_pos + 1)
+            except ValueError:
+                # Delimiter not found, mask first half
+                labels[:len(labels)//2] = [-100] * (len(labels)//2)
+            
+            # Mask padding tokens
+            labels = [-100 if tok == self.tokenizer.pad_token_id else tok for tok in labels]
+            
             return {
                 "input_ids": encoding["input_ids"],
                 "attention_mask": encoding["attention_mask"],
@@ -522,6 +530,7 @@ class SplitLoRATrainer:
                 "human_reference": example["human_reference"],
                 "meaning_representation": mr_text
             }
+
         
         train_ds = dataset["train"].map(preprocess, remove_columns=dataset["train"].column_names)
         test_ds = dataset["test"].map(preprocess, remove_columns=dataset["test"].column_names)
@@ -587,15 +596,55 @@ class SplitLoRATrainer:
                 self.schedulers.append(sched)
 
 
-    def train(self, train_dataloader, epochs=1):
-        """FIXED: Add gradient clipping and NaN checking"""
-        print(f"Starting training for {epochs} epochs...")
+    def validate_model_sanity(self):
+        """Check if model can generate basic English"""
+        test_prompt = "The restaurant is"
+        enc = self.tokenizer(test_prompt, return_tensors="pt")
+        ids = enc["input_ids"].to(device)
         
+        with torch.no_grad():
+            # Simple greedy generation
+            output = self.head_client.head_model.generate(
+                ids,
+                max_new_tokens=10,
+                do_sample=False,
+                pad_token_id=self.tokenizer.pad_token_id,
+            )
+        
+        result = self.tokenizer.decode(output[0], skip_special_tokens=True)
+        print(f"Sanity check: '{result}'")
+        
+        # Check if output contains mostly punctuation/symbols
+        text_part = result[len(test_prompt):].strip()
+        symbol_ratio = sum(1 for c in text_part if c in '|[](){}') / max(len(text_part), 1)
+        
+        if symbol_ratio > 0.3:
+            print("❌ MODEL GENERATING GIBBERISH - TRAINING FAILED")
+            return False
+        else:
+            print("✅ Model generating reasonable text")
+            return True
+        
+    def train(self, train_dataloader, epochs=1):
+        print(f"Starting training for {epochs} epochs...")
+        example_inputs = None
         for epoch in range(epochs):
             total_loss = 0.0
             num_batches = 0
             
             for batch_idx, batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{epochs}")):
+                if batch_idx == 0 and example_inputs is None:
+                    example_inputs = {
+                        'input_ids': batch["input_ids"][0:1].clone(),
+                        'attention_mask': batch["attention_mask"][0:1].clone(),
+                        'labels': batch["labels"][0:1].clone()
+                    }
+                
+                if batch_idx % 500 == 0:
+                    if not self.validate_model_sanity():
+                        print("Stopping training due to gibberish generation")
+                        break
+                
                 # DEBUG: inspect the first batch once per epoch
                 if batch_idx == 0:
                     # decode first two label sequences (remove -100 paddings)
@@ -652,6 +701,9 @@ class SplitLoRATrainer:
                     
                     if batch_idx % 100 == 0:
                         print(f"Batch {batch_idx}, Loss: {loss:.4f}")
+
+                    if batch_idx % 100 == 0 and example_inputs is not None:
+                        self.debug_model_learning(example_inputs)
                     
                 except Exception as e:
                     print(f"Training error: {e}")
@@ -662,7 +714,33 @@ class SplitLoRATrainer:
             self.metrics["loss"].append(avg_loss)
             print(f"Epoch {epoch+1} average loss: {avg_loss:.4f}")
         
-        print("Training completed!")    
+        print("Training completed!")
+
+
+    def debug_model_learning(self, example_batch):
+        """Debug what the model is actually learning"""
+        with torch.no_grad():
+            input_ids = example_batch['input_ids'].to(device)
+            attention_mask = example_batch['attention_mask'].to(device)
+            
+            # Forward pass
+            head_out = self.head_client.forward(input_ids, attention_mask)
+            body_out = self.server.forward(head_out, attention_mask)
+            logits = self.tail_client.forward(body_out, attention_mask)
+            
+            # Get top predictions
+            probs = torch.softmax(logits[0, -5:], dim=-1)  # Last 5 positions
+            top_tokens = torch.topk(probs, 3, dim=-1)
+            
+            print("=== MODEL LEARNING DEBUG ===")
+            for pos in range(5):
+                pos_idx = -5 + pos
+                print(f"Position {pos_idx}:")
+                for i in range(3):
+                    token_id = top_tokens.indices[pos, i].item()
+                    prob = top_tokens.values[pos, i].item()
+                    token_text = self.tokenizer.decode([token_id])
+                    print(f"  Top {i+1}: '{token_text}' (prob: {prob:.3f})")    
     
             
 
