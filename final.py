@@ -498,7 +498,7 @@ class SplitLoRATrainer:
         dataset = load_dataset("e2e_nlg", trust_remote_code=True)
         
         def preprocess(example):
-            SEQUENCE_LENGTH = 256
+            SEQUENCE_LENGTH = 128
             mr_text = example["meaning_representation"]
             ref_text = example["human_reference"]
             space_delim = " " + self.DELIM + " "
@@ -544,7 +544,7 @@ class SplitLoRATrainer:
     def create_dataloader(self, dataset, batch_size=8, shuffle=True, debug_mode=False):
         """FIXED: Consistent sequence length with debug support"""
         def collate_fn(batch):
-            FIXED_LENGTH = 256  # Match preprocessing length!
+            FIXED_LENGTH = 128  # Match preprocessing length!
             
             input_ids_batch = []
             attention_mask_batch = []
