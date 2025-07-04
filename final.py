@@ -691,76 +691,54 @@ class SplitLoRATrainer:
         return path
     
     def load_checkpoint(self, path="./splitlora_checkpoint"):
-        """Load model and optimizer states"""
+        """FIXED: Load model without recreating or corrupting embeddings"""
         if not os.path.exists(path):
             print(f"Checkpoint path {path} does not exist")
             return False
-        
+
         try:
-            # # 1. be sure the tokenizer already contains the two tokens
-            # if "<|gen|>" not in self.tokenizer.get_vocab():
-            #     self.tokenizer.add_special_tokens({"additional_special_tokens": ["<|gen|>"]})
-            # if self.tokenizer.pad_token is None:
-            #     self.tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
-
-            # 2. load base model once
-            full_model = AutoModelForCausalLM.from_pretrained("gpt2")
-
-            self.tokenizer.add_special_tokens({"additional_special_tokens": [self.DELIM]})
-            full_model.resize_token_embeddings(len(self.tokenizer))
-
-            # later …
-            self.tokenizer.add_special_tokens({"pad_token": self.PAD})
-            full_model.resize_token_embeddings(len(self.tokenizer))
-
-            # 3. ALWAYS resize if sizes differ
-            if len(self.tokenizer) != full_model.get_input_embeddings().num_embeddings:
-                full_model.resize_token_embeddings(len(self.tokenizer))
+            # DON'T recreate the model - use existing one with proper tokenizer
+            # The model and tokenizer are already correctly initialized in __init__
             
-            vocab = len(self.tokenizer)           # e.g. 50_259
-            full_model.config.vocab_size = vocab
-            full_model.generation_config.vocab_size = vocab          # HF ≥4.39
-
-            # 4. now split and load LoRA weights
-            head_model, body_model, tail_model = split_gpt2(full_model, 2, 2)
+            # Load PEFT models directly onto existing split components
+            self.head_client.head_model = PeftModel.from_pretrained(
+                self.head_client.head_model, 
+                os.path.join(path, "head_model"), 
+                is_trainable=True
+            )
             
-            for part in (head_model, body_model, tail_model):
-                part.config.vocab_size = vocab
-                if hasattr(part, "generation_config"):
-                    part.generation_config.vocab_size = vocab
-
-            # Load PEFT models
-            head_model = PeftModel.from_pretrained(head_model, os.path.join(path, "head_model"), is_trainable=True)
-            body_model = PeftModel.from_pretrained(body_model, os.path.join(path, "body_model"), is_trainable=True)
-            tail_model = PeftModel.from_pretrained(tail_model, os.path.join(path, "tail_model"), is_trainable=True)
-            tail_model.base_model.lm_head.weight = head_model.base_model.wte.weight
+            self.server.body_model = PeftModel.from_pretrained(
+                self.server.body_model,
+                os.path.join(path, "body_model"), 
+                is_trainable=True
+            )
             
-            for wrapped in (head_model, body_model, tail_model):
-                wrapped.base_model.config.vocab_size = vocab
-                if hasattr(wrapped.base_model, "generation_config"):
-                    wrapped.base_model.generation_config.vocab_size = vocab
+            self.tail_client.tail_model = PeftModel.from_pretrained(
+                self.tail_client.tail_model,
+                os.path.join(path, "tail_model"), 
+                is_trainable=True
+            )
 
-            # Update components
-            self.head_client.head_model = head_model.to(device)
-            self.server.body_model = body_model.to(device)
-            self.tail_client.tail_model = tail_model.to(device)
-            
+            # Ensure weight tying
+            self.tail_client.tail_model.base_model.lm_head.weight = self.head_client.head_model.base_model.wte.weight
+
             # Load optimizers
             self.head_client.optimizer.load_state_dict(torch.load(os.path.join(path, "head_optimizer.pt"), map_location=device))
             self.server.optimizer.load_state_dict(torch.load(os.path.join(path, "body_optimizer.pt"), map_location=device))
             self.tail_client.optimizer.load_state_dict(torch.load(os.path.join(path, "tail_optimizer.pt"), map_location=device))
-            
+
             # Load metrics
             with open(os.path.join(path, "metrics.json"), "r") as f:
                 self.metrics = json.load(f)
-            
-            print(f"Checkpoint loaded from {path}")
+
+            print(f"✅ Checkpoint loaded successfully from {path}")
             return True
-            
+
         except Exception as e:
             print(f"Error loading checkpoint: {e}")
             traceback.print_exc()
             return False
+
     
 
 
