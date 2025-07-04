@@ -1081,7 +1081,7 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text, max_new_tokens=6
             ids,
             attention_mask=m,
             max_new_tokens=20,              # Shorter for E2E
-            num_beams=k,
+            num_beams=5,
             num_return_sequences=k,
             early_stopping=True,
             length_penalty=1.0,             # Neutral
