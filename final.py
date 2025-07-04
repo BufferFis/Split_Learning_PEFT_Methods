@@ -877,17 +877,19 @@ def generate_with_sampling(trainer, wrapper, mr_text, ref_text, max_new_tokens=4
             attention_mask=m,
             
             # SAMPLING APPROACH (avoids beam search repetition)
-            max_new_tokens=40,
+            max_new_tokens=30,
             do_sample=True,
             
             # Sampling parameters
-            top_k=50,
-            top_p=0.9,
-            temperature=0.8,
+            top_k=40,
+            top_p=0.85,
+            temperature=1.2,
             
             # Still use some repetition control
-            repetition_penalty=1.3,
-            no_repeat_ngram_size=3,
+            repetition_penalty=2.0,
+            no_repeat_ngram_size=4,
+            length_penalty=1.1,         # Encourage longer outputs
+            diversity_penalty=1.0,      # Force diversity
             
             eos_token_id=trainer.tokenizer.eos_token_id,
             pad_token_id=trainer.tokenizer.pad_token_id,
@@ -985,8 +987,8 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text,
             attention_mask=m,
             
             # FIXED: Force longer generation
-            max_new_tokens=64,
-            min_length=ids.size(1) + 15,  # Force at least 15 new tokens
+            max_new_tokens=30,
+            min_length=ids.size(1) + 8,  # Force at least 15 new tokens
             
             # FIXED: Beam search params  
             num_beams=k,
@@ -995,9 +997,11 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text,
             early_stopping=False,        # Don't stop early
             
             # FIXED: Repetition handling
-            no_repeat_ngram_size=2,      # Reduced to allow some repetition
-            repetition_penalty=1.05,     # Mild penalty
-            
+            no_repeat_ngram_size=4,      # Reduced to allow some repetition
+            repetition_penalty=2.00,     # Mild penalty
+            length_penalty=0.9,             # Slight length preference
+            diversity_penalty=1.5,          # Force beam diversity
+            num_beam_groups=min(k//2, 3),   # Group diverse beams
             # FIXED: Token handling
             eos_token_id=trainer.tokenizer.eos_token_id,
             pad_token_id=trainer.tokenizer.pad_token_id,
@@ -1056,6 +1060,30 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text,
     return best
 
 
+def test_simple_greedy(trainer, wrapper, mr_text):
+    """Test with simple greedy generation"""
+    prompt = mr_text + " " + trainer.DELIM + " "
+    enc = trainer.tokenizer(prompt, return_tensors="pt")
+    ids, m = enc["input_ids"].to(device), enc["attention_mask"].to(device)
+    
+    print(f"Greedy input: '{prompt}'")
+    
+    with torch.no_grad():
+        output = wrapper.generate(
+            ids,
+            attention_mask=m,
+            max_new_tokens=20,
+            do_sample=False,
+            repetition_penalty=1.8,     # Strong penalty even for greedy
+            no_repeat_ngram_size=3,
+            eos_token_id=trainer.tokenizer.eos_token_id,
+            pad_token_id=trainer.tokenizer.pad_token_id,
+        )
+    
+    result = trainer.tokenizer.decode(output[0][ids.size(1):], skip_special_tokens=True).strip()
+    print(f"Greedy result: '{result}'")
+    return result
+
 
 
 
@@ -1106,9 +1134,9 @@ def main():
         example_mr = "name[Blue Spice], eatType[coffee shop], area[city centre]"
         example_ref = "Blue Spice is a coffee shop in the city centre."
         print("Sampling output:", generate_with_sampling(trainer, wrapper, example_mr, example_ref))
+        print("=== SIMPLE GREEDY TEST ===")
+        greedy_result = test_simple_greedy(trainer, wrapper, example_mr)
 
-
-        # full dev-set evaluation (first 100 samples)
         train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
         
         results = evaluate_beam(trainer, wrapper, test_ds, n_samples=len(test_ds))
