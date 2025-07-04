@@ -488,7 +488,7 @@ class SplitLoRATrainer:
         """Improved preprocessing with optional debug mode"""
         dataset = load_dataset("e2e_nlg", trust_remote_code=True)
         
-        def preprocess(self, example):
+        def preprocess(example):
             SEQUENCE_LENGTH = 128
             mr_text = example["meaning_representation"]
             ref_text = example["human_reference"]
