@@ -149,15 +149,9 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             all_hidden_states = ()
             for block in self.h:
                 # Convert attention_mask to the format GPT-2 blocks expect
-                if attention_mask is not None:
-                    # GPT-2 uses 4D attention mask: [batch, 1, seq_len, seq_len]
-                    extended_attention_mask = attention_mask[:, None, None, :]
-                    extended_attention_mask = extended_attention_mask.to(dtype=self.wte.weight.dtype)
-                    extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
-                else:
-                    extended_attention_mask = None
+                
                     
-                hidden_states = block(hidden_states, attention_mask=extended_attention_mask, use_cache=False)[0]
+                hidden_states = block(hidden_states, use_cache=False)[0]
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
             if output_hidden_states:
@@ -202,15 +196,9 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
         def forward(self, hidden_states=None, attention_mask=None, **kwargs):
             # FIXED: Pass attention_mask to each block
             for block in self.transformer.h:
-                if attention_mask is not None:
-                    # GPT-2 uses 4D attention mask: [batch, 1, seq_len, seq_len]
-                    extended_attention_mask = attention_mask[:, None, None, :]
-                    extended_attention_mask = extended_attention_mask.to(dtype=hidden_states.dtype)
-                    extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
-                else:
-                    extended_attention_mask = None
+                
                     
-                hidden_states = block(hidden_states, attention_mask=extended_attention_mask, use_cache=False)[0]
+                hidden_states = block(hidden_states, use_cache=False)[0]
             return type('BodyOutput', (), {'last_hidden_state': hidden_states})()
 
     # Tail Model (last few layers + LM head)
@@ -256,7 +244,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
                 else:
                     extended_attention_mask = None
                     
-                hidden_states = block(hidden_states, attention_mask=extended_attention_mask, use_cache=False)[0]
+                hidden_states = block(hidden_states, use_cache=False)[0]
 
             hidden_states = self.transformer.ln_f(hidden_states)
             logits = self.lm_head(hidden_states)
@@ -685,14 +673,9 @@ class SplitLoRATrainer:
                         continue
                     
                     # Forward through pipeline
-                    head_activations = self.head_client.forward(input_ids, attention_mask)
-                    body_activations, head_activations_stored = self.server.forward_train(
-                        head_activations, attention_mask
-                    )
-
-                    loss, body_grad = self.tail_client.compute_loss_and_backward(
-                        body_activations, labels, attention_mask
-                    )
+                    head_activations = self.head_client.forward(input_ids)  # No attention_mask
+                    body_activations, head_activations_stored = self.server.forward_train(head_activations)  # No attention_mask
+                    loss, body_grad = self.tail_client.compute_loss_and_backward(body_activations, labels)  # No attention_mask
 
                     
                     # FIX: Check for NaN loss
