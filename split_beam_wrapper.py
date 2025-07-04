@@ -47,22 +47,12 @@ class SplitGPT2ForGeneration(PreTrainedModel, GenerationMixin):
                 input_ids: torch.LongTensor,
                 attention_mask: Optional[torch.FloatTensor] = None,
                 **ignored):
-        
-        print(f"Wrapper input shape: {input_ids.shape}")
-        print(f"Wrapper attention mask shape: {attention_mask.shape if attention_mask is not None else None}")
-        
         with torch.no_grad():
             h = self.head_client.forward(input_ids, attention_mask)
-            print(f"Head output shape: {h.shape if hasattr(h, 'shape') else 'No shape attr'}")
-            
-            b = self.server.forward(h, attention_mask)
-            print(f"Body output shape: {b.shape if hasattr(b, 'shape') else 'No shape attr'}")
-            
-            logits = self.tail_client.forward(b, attention_mask)
-            print(f"Tail output shape: {logits.shape if hasattr(logits, 'shape') else 'No shape attr'}")
+            b = self.server.forward(h, attention_mask)  # Pass attention_mask
+            logits = self.tail_client.forward(b, attention_mask)  # Pass attention_mask
 
         return CausalLMOutput(logits=logits)
-
 
     # optional: if you ever want to swap lm_head
     def get_output_embeddings(self):

@@ -33,6 +33,67 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 
+def diagnose_tokenizer_corruption(trainer):
+    """Check if tokenizer is corrupted"""
+    print("=== TOKENIZER DIAGNOSIS ===")
+    print(f"Vocab size: {len(trainer.tokenizer)}")
+    print(f"Original GPT-2 vocab size: 50257")
+    print(f"Added tokens: {len(trainer.tokenizer) - 50257}")
+    
+    # Test basic tokens
+    test_words = ["the", "restaurant", "food", "good", "city"]
+    for word in test_words:
+        token_ids = trainer.tokenizer.encode(word, add_special_tokens=False)
+        decoded = trainer.tokenizer.decode(token_ids)
+        print(f"'{word}' -> {token_ids} -> '{decoded}' {'❌ CORRUPTED' if decoded != word else '✅'}")
+    
+    # Test special tokens
+    print(f"DELIM token: '{trainer.DELIM}' -> {trainer.tokenizer.encode(trainer.DELIM)}")
+    print(f"PAD token: '{trainer.PAD}' -> {trainer.tokenizer.pad_token_id}")
+
+def create_clean_model_and_tokenizer():
+    """Create a clean model with properly added tokens"""
+    from transformers import GPT2Tokenizer, GPT2LMHeadModel
+    
+    # Load clean tokenizer and model
+    tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+    model = GPT2LMHeadModel.from_pretrained('gpt2')
+    
+    # CRITICAL: Set pad_token BEFORE adding custom tokens
+    tokenizer.pad_token = tokenizer.eos_token  # Use existing token first
+    
+    # Add custom tokens properly
+    special_tokens = {
+        'additional_special_tokens': ['<|gen|>']
+    }
+    
+    num_added = tokenizer.add_special_tokens(special_tokens)
+    print(f"Added {num_added} special tokens")
+    
+    # CRITICAL: Resize embeddings properly
+    model.resize_token_embeddings(len(tokenizer))
+    
+    # Initialize new token embeddings properly
+    with torch.no_grad():
+        # Get the new token embeddings
+        new_tokens_start = len(tokenizer) - num_added
+        
+        # Initialize new embeddings as average of existing embeddings
+        existing_embeddings = model.transformer.wte.weight[:new_tokens_start]
+        avg_embedding = existing_embeddings.mean(dim=0)
+        
+        # Set new token embeddings
+        for i in range(new_tokens_start, len(tokenizer)):
+            model.transformer.wte.weight[i] = avg_embedding + torch.randn_like(avg_embedding) * 0.01
+    
+    # Verify tokenizer works
+    test_text = "The restaurant serves food"
+    tokens = tokenizer.encode(test_text)
+    decoded = tokenizer.decode(tokens)
+    assert decoded == test_text, f"Tokenizer corrupted: '{test_text}' != '{decoded}'"
+    
+    print("✅ Clean model and tokenizer created successfully")
+    return model, tokenizer
 
 
 
@@ -362,49 +423,36 @@ class TailClient:
 
 
 class SplitLoRATrainer:
-    """Main trainer class combining all components"""
     def __init__(self,
-                model_name="gpt2",
-                head_layers=2,
-                tail_layers=2,
-                learning_rate=2e-4,
-                warmup_steps=500,
-                max_epochs=5):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            model_name="gpt2",
+            head_layers=2,
+            tail_layers=2,
+            learning_rate=2e-4,
+            warmup_steps=500,
+            max_epochs=5):
+    
+        # FIXED: Use clean model creation
+        full_model, self.tokenizer = create_clean_model_and_tokenizer()
         
+        # Set up tokens using cleaned tokenizer
+        self.DELIM = "<|gen|>"  # This was properly added in create_clean_model_and_tokenizer
+        self.PAD = self.tokenizer.eos_token  # Use existing EOS token as PAD
         
-        # Load and split model
-        full_model = AutoModelForCausalLM.from_pretrained(model_name)
-        added = 0
+        # Set tokenizer properties
+        self.tokenizer.padding_side = "right"
+        self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
         
-        self.DELIM = "<|gen|>"                          # ONE token
-        if self.DELIM not in self.tokenizer.get_vocab():
-            self.tokenizer.add_special_tokens(
-                {"additional_special_tokens": [self.DELIM]}
-            )
-            full_model.resize_token_embeddings(len(self.tokenizer))
-        
-        self.PAD = "<|pad|>"
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.add_special_tokens({"pad_token": self.PAD})
-            full_model.resize_token_embeddings(len(self.tokenizer))
-
-        if self.tokenizer.eos_token is None:
-            self.tokenizer.add_special_tokens({"eos_token": "<|endoftext|>"})
-            full_model.resize_token_embeddings(len(self.tokenizer))
-
         # Set generation config
         full_model.config.eos_token_id = self.tokenizer.eos_token_id
-        
-        self.tokenizer.padding_side = "right"  # For generation
         full_model.config.pad_token_id = self.tokenizer.pad_token_id
         
-        # --- keep every config in sync with the enlarged vocabulary ------------
-        vocab = len(self.tokenizer)           # e.g. 50_259
+        # Keep vocab config in sync
+        vocab = len(self.tokenizer)
         full_model.config.vocab_size = vocab
-        full_model.generation_config.vocab_size = vocab          # HF ≥4.39
+        if hasattr(full_model, 'generation_config'):
+            full_model.generation_config.vocab_size = vocab
 
-
+        # Split model
         head_model, body_model, tail_model = split_gpt2(full_model, head_layers, tail_layers)
 
         for part in (head_model, body_model, tail_model):
@@ -412,13 +460,13 @@ class SplitLoRATrainer:
             if hasattr(part, "generation_config"):
                 part.generation_config.vocab_size = vocab
             
-        # Apply LoRA/DoRA - Now supported with Python 3.11.9!
+        # Apply LoRA/DoRA
         lora_config = LoraConfig(
             r=8,
             lora_alpha=16,
             lora_dropout=0.1,
             bias="none",
-            use_dora=True,  # DoRA is now fully supported!
+            use_dora=True,
             task_type="CAUSAL_LM",
             target_modules=["c_attn", "c_proj"]
         )
@@ -439,11 +487,11 @@ class SplitLoRATrainer:
         self.tail_client = TailClient(tail_model, learning_rate)
         
         self.metrics = {"loss": []}
-
         self._sched_steps = None
         self.warmup_steps = warmup_steps
-        self.max_epochs   = max_epochs
-        self.schedulers   = []     
+        self.max_epochs = max_epochs
+        self.schedulers = []
+     
         
     def load_e2e_dataset(self, debug_mode=False):
         """Improved preprocessing with optional debug mode"""
@@ -871,26 +919,6 @@ def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
     print(f"BLEU  : {bleu_score:.4f}  •  METEOR: {meteor_score:.4f}  •  SBLUE {sacre_score:.4f}  • failed {fails}/{len(store)}")
     return {"bleu": bleu_score, "meteor": meteor_score, "failed": fails, "sacrebleu": sacre_score, **official}
 
-
-def safe_bleu_compute(pred, ref):
-    bleu   = load_metric("bleu")
-    """Safely compute BLEU with error handling"""
-    try:
-        # Filter out very short predictions
-        if len(pred.strip().split()) < 2:
-            return 0.0
-        
-        score = bleu.compute(
-            predictions=[pred], 
-            references=[[ref]],
-            smooth=True  # Enable smoothing
-        )["bleu"]
-        return score if not math.isnan(score) else 0.0
-    except (ZeroDivisionError, ValueError) as e:
-        print(f"BLEU computation failed for '{pred[:50]}...': {e}")
-        return 0.0
-
-
 # ─── MBR beam search ────────────────────────────────────────────────
 def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text,
                            max_new_tokens=64, k=10):
@@ -962,7 +990,8 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text,
                 for seq in beams]
 
     bleu = load_metric("bleu")            # already imported in final.py
-    scores = [safe_bleu_compute(c, ref_text) for c in candidates]
+    scores = [bleu.compute(predictions=[c], references=[[ref_text]])["bleu"]
+              for c in cand_txt]
     
     print(f"Generated {len(beams)} beams")
     for i, beam in enumerate(beams[:3]):  # Show first 3 beams
@@ -1000,6 +1029,8 @@ def main():
                            learning_rate=args.learning_rate,
                            warmup_steps=args.warmup_steps,
                            max_epochs=args.max_epochs)
+    
+    diagnose_tokenizer_corruption(trainer)
     
     # Load checkpoint if specified
     if args.load_checkpoint:
