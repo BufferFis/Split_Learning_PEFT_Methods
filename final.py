@@ -413,7 +413,7 @@ class SplitLoRATrainer:
         
         self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
         full_model = GPT2LMHeadModel.from_pretrained('gpt2')
-        self.DELIM = "###"  # More natural language connector
+        self.DELIM = ":"  # More natural language connector
         self.PAD = self.tokenizer.eos_token  # Use eos_token as pad
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
@@ -471,7 +471,7 @@ class SplitLoRATrainer:
             ref_text = example["human_reference"]
             
             # FIXED: Use simpler delimiter
-            space_delim = self.DELIM  # Just ":" instead of " ||| "
+            space_delim = " " + self.DELIM + " "
             full_text = mr_text + space_delim + ref_text
             
             encoding = self.tokenizer(
@@ -485,17 +485,25 @@ class SplitLoRATrainer:
             # CRITICAL FIX: Better label generation
             labels = encoding["input_ids"].copy()
             
-            # Find delimiter position more reliably
-            input_tokens = encoding["input_ids"]
-            delim_token = self.tokenizer.encode(self.DELIM, add_special_tokens=False)[0]
+            #Find delimiter more robustly
+            delimiter_with_spaces = self.tokenizer.encode(space_delim, add_special_tokens=False)
             
-            try:
-                delim_pos = input_tokens.index(delim_token)
-                # Mask everything up to and including delimiter
-                labels[:delim_pos + 1] = [-100] * (delim_pos + 1)
-            except ValueError:
-                # Delimiter not found, mask first half
-                labels[:len(labels)//2] = [-100] * (len(labels)//2)
+            # Find where the delimiter sequence starts
+            input_tokens = encoding["input_ids"]
+            delim_start = None
+            
+            for i in range(len(input_tokens) - len(delimiter_with_spaces) + 1):
+                if input_tokens[i:i+len(delimiter_with_spaces)] == delimiter_with_spaces:
+                    delim_start = i
+                    break
+            
+            if delim_start is not None:
+                # Mask everything up to and including the delimiter
+                delim_end = delim_start + len(delimiter_with_spaces)
+                labels[:delim_end] = [-100] * delim_end
+            else:
+                # Fallback: mask first third
+                labels[:len(labels)//3] = [-100] * (len(labels)//3)
             
             # Mask padding tokens
             labels = [-100 if tok == self.tokenizer.pad_token_id else tok for tok in labels]
@@ -1073,7 +1081,7 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text, max_new_tokens=6
     prompt = mr_text + " " + trainer.DELIM + " "
     enc = trainer.tokenizer(prompt, return_tensors="pt")
     ids, m = enc["input_ids"].to(device), enc["attention_mask"].to(device)
-
+    bad_tokens = trainer.tokenizer.encode("_*#-=.", add_special_tokens=False)
     with torch.no_grad():
         # ULTRA SIMPLE beam search - no complex parameters
         beams = wrapper.generate(
@@ -1083,25 +1091,60 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text, max_new_tokens=6
             num_return_sequences=10,
             early_stopping=True,
             length_penalty=1.0,             # Neutral
+            no_repeat_ngram_size=3,
+            repetition_penalty=1.8,  # Strong penalty
             eos_token_id=trainer.tokenizer.eos_token_id,
             pad_token_id=trainer.tokenizer.pad_token_id,
+            bad_words_ids=[bad_tokens],
             do_sample=False,
             # REMOVE ALL OTHER PARAMETERS - keep it simple!
         )
 
     # Extract candidates
     candidates = []
-    for i, beam in enumerate(beams):
+    for beam in beams:
         generated_part = beam[ids.size(1):]
         candidate = trainer.tokenizer.decode(generated_part, skip_special_tokens=True).strip()
-        print(f"Beam {i}: '{candidate}'")
-        if len(candidate.split()) >= 2:  # At least 2 words
+        
+        # Check symbol ratio
+        symbol_count = sum(1 for c in candidate if c in '_*#-.=|[]')
+        total_chars = len(candidate)
+        symbol_ratio = symbol_count / max(total_chars, 1)
+        
+        if symbol_ratio < 0.3 and len(candidate.split()) >= 2:  # Less than 30% symbols
             candidates.append(candidate)
 
     if not candidates:
         return "The restaurant serves food"  # Simple fallback
     
     return candidates[0]  # Return first valid candidate (no MBR for now)
+
+def diagnose_training_data(trainer):
+    """Check if training data makes sense"""
+    print("=== TRAINING DATA DIAGNOSIS ===")
+    
+    # Load small sample
+    train_ds, _ = trainer.load_e2e_dataset(debug_mode=False)
+    sample = train_ds[0]
+    
+    print(f"Input IDs: {sample['input_ids'][:20]}")
+    print(f"Labels: {sample['labels'][:20]}")
+    
+    # Decode input
+    full_input = trainer.tokenizer.decode(sample['input_ids'], skip_special_tokens=True)
+    print(f"Full input: '{full_input}'")
+    
+    # Check label masking
+    valid_labels = [t for t in sample['labels'] if t != -100]
+    target_text = trainer.tokenizer.decode(valid_labels, skip_special_tokens=True)
+    print(f"Target text: '{target_text}'")
+    
+    # This should be proper English restaurant description
+    if any(char in target_text for char in '_*#-.='):
+        print("❌ Target text contains symbols - preprocessing is wrong!")
+    else:
+        print("✅ Target text looks normal")
+
 
 
 
@@ -1186,7 +1229,7 @@ def main():
     
     # Load dataset (regular mode)
     train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
-    
+    diagnose_training_data(trainer)
     if args.eval_only:
         # quick manual check on one MR
         example_mr = "name[Blue Spice], eatType[coffee shop], area[city centre]"
