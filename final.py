@@ -875,7 +875,7 @@ def generate_with_sampling(trainer, wrapper, mr_text, ref_text, max_new_tokens=4
         output = wrapper.generate(
             ids,
             attention_mask=m,
-            num_beams = 1,  # Use single beam for sampling
+            num_beams = 5,  # Use single beam for sampling
             # SAMPLING APPROACH (avoids beam search repetition)
             max_new_tokens=30,
             do_sample=True,
