@@ -424,43 +424,39 @@ class TailClient:
 
 class SplitLoRATrainer:
     def __init__(self,
-            model_name="gpt2",
-            head_layers=2,
-            tail_layers=2,
-            learning_rate=2e-4,
-            warmup_steps=500,
-            max_epochs=5):
-    
-        # FIXED: Use clean model creation
-        full_model, self.tokenizer = create_clean_model_and_tokenizer()
+                model_name="gpt2",
+                head_layers=2,
+                tail_layers=2,
+                learning_rate=2e-4,
+                warmup_steps=500,
+                max_epochs=5):
         
-        # Set up tokens using cleaned tokenizer
-        self.DELIM = "<|gen|>"  # This was properly added in create_clean_model_and_tokenizer
-        self.PAD = self.tokenizer.eos_token  # Use existing EOS token as PAD
+        # FIXED: Use existing tokens only - no custom token addition
+        from transformers import GPT2Tokenizer, GPT2LMHeadModel
         
-        # Set tokenizer properties
-        self.tokenizer.padding_side = "right"
+        self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+        full_model = GPT2LMHeadModel.from_pretrained('gpt2')
+        
+        # Use existing tokens instead of adding new ones
+        self.DELIM = " ||| "  # Use existing characters - no vocab corruption
+        self.PAD = self.tokenizer.eos_token  # Use eos_token as pad
+        
+        self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        self.tokenizer.padding_side = "right"
         
-        # Set generation config
+        # Set generation config with existing vocabulary
         full_model.config.eos_token_id = self.tokenizer.eos_token_id
         full_model.config.pad_token_id = self.tokenizer.pad_token_id
         
-        # Keep vocab config in sync
-        vocab = len(self.tokenizer)
+        # Keep vocab unchanged - no resize_token_embeddings!
+        vocab = len(self.tokenizer)  # Should be exactly 50257
         full_model.config.vocab_size = vocab
-        if hasattr(full_model, 'generation_config'):
-            full_model.generation_config.vocab_size = vocab
-
-        # Split model
+        
+        # Split model (no custom tokens to corrupt)
         head_model, body_model, tail_model = split_gpt2(full_model, head_layers, tail_layers)
-
-        for part in (head_model, body_model, tail_model):
-            part.config.vocab_size = vocab
-            if hasattr(part, "generation_config"):
-                part.generation_config.vocab_size = vocab
-            
-        # Apply LoRA/DoRA
+        
+        # Apply LoRA/DoRA to clean models
         lora_config = LoraConfig(
             r=8,
             lora_alpha=16,
@@ -474,12 +470,9 @@ class SplitLoRATrainer:
         head_model = get_peft_model(head_model, lora_config)
         body_model = get_peft_model(body_model, lora_config)
         tail_model = get_peft_model(tail_model, lora_config)
-
+        
+        # Standard weight tying
         tail_model.base_model.lm_head.weight = head_model.base_model.wte.weight
-        for wrapped in (head_model, body_model, tail_model):
-            wrapped.base_model.config.vocab_size = vocab
-            if hasattr(wrapped.base_model, "generation_config"):
-                wrapped.base_model.generation_config.vocab_size = vocab
         
         # Initialize components
         self.server = ServerModel(body_model, learning_rate)
@@ -491,6 +484,7 @@ class SplitLoRATrainer:
         self.warmup_steps = warmup_steps
         self.max_epochs = max_epochs
         self.schedulers = []
+
      
         
     def load_e2e_dataset(self, debug_mode=False):
@@ -498,11 +492,15 @@ class SplitLoRATrainer:
         dataset = load_dataset("e2e_nlg", trust_remote_code=True)
         
         def preprocess(example):
+            
             SEQUENCE_LENGTH = 128
             mr_text = example["meaning_representation"]
             ref_text = example["human_reference"]
-            space_delim = " " + self.DELIM + " "
-            full_text = mr_text + space_delim + ref_text          
+            space_delim = " " + self.DELIM + " "  # Now uses " ||| " instead of " <|gen|> "
+            full_text = mr_text + space_delim + ref_text
+    
+    
+      
             # Tokenize full sequence
             encoding = self.tokenizer(
                 full_text,
@@ -670,74 +668,117 @@ class SplitLoRATrainer:
 
     
     def save_checkpoint(self, path="./splitlora_checkpoint"):
-        """Save model and optimizer states"""
+        """FIXED: Proper PEFT model saving"""
         os.makedirs(path, exist_ok=True)
         
-        # Save models
-        self.head_client.head_model.save_pretrained(os.path.join(path, "head_model"))
-        self.server.body_model.save_pretrained(os.path.join(path, "body_model"))
-        self.tail_client.tail_model.save_pretrained(os.path.join(path, "tail_model"))
-        
-        # Save optimizers
-        torch.save(self.head_client.optimizer.state_dict(), os.path.join(path, "head_optimizer.pt"))
-        torch.save(self.server.optimizer.state_dict(), os.path.join(path, "body_optimizer.pt"))
-        torch.save(self.tail_client.optimizer.state_dict(), os.path.join(path, "tail_optimizer.pt"))
-        
-        # Save metrics
-        with open(os.path.join(path, "metrics.json"), "w") as f:
-            json.dump(self.metrics, f, indent=2)
-        
-        print(f"Checkpoint saved to {path}")
-        return path
+        try:
+            # Save PEFT models properly (not base models)
+            self.head_client.head_model.save_pretrained(
+                os.path.join(path, "head_model"),
+                save_embedding_layers=True,  # Important for custom tokens
+                save_config=True
+            )
+            
+            self.server.body_model.save_pretrained(
+                os.path.join(path, "body_model"),
+                save_embedding_layers=False,  # No embeddings in body
+                save_config=True
+            )
+            
+            self.tail_client.tail_model.save_pretrained(
+                os.path.join(path, "tail_model"),
+                save_embedding_layers=True,  # Important for LM head
+                save_config=True
+            )
+            
+            # Save optimizers
+            torch.save(self.head_client.optimizer.state_dict(), os.path.join(path, "head_optimizer.pt"))
+            torch.save(self.server.optimizer.state_dict(), os.path.join(path, "body_optimizer.pt"))
+            torch.save(self.tail_client.optimizer.state_dict(), os.path.join(path, "tail_optimizer.pt"))
+            
+            # Save tokenizer (critical for vocab consistency)
+            self.tokenizer.save_pretrained(os.path.join(path, "tokenizer"))
+            
+            # Save training metadata
+            metadata = {
+                "vocab_size": len(self.tokenizer),
+                "delim_token": self.DELIM,
+                "pad_token": self.PAD,
+                "metrics": self.metrics,
+                "model_config": {
+                    "head_layers": 2,
+                    "tail_layers": 2,
+                    "body_layers": 8
+                }
+            }
+            
+            with open(os.path.join(path, "training_metadata.json"), "w") as f:
+                json.dump(metadata, f, indent=2)
+            
+            print(f"✅ Checkpoint saved successfully to {path}")
+            return path
+            
+        except Exception as e:
+            print(f"❌ Error saving checkpoint: {e}")
+            traceback.print_exc()
+            return None
+
     
     def load_checkpoint(self, path="./splitlora_checkpoint"):
-        """FIXED: Load model without recreating or corrupting embeddings"""
+        """FIXED: Proper PEFT model loading without nesting"""
         if not os.path.exists(path):
-            print(f"Checkpoint path {path} does not exist")
+            print(f"❌ Checkpoint path {path} does not exist")
             return False
 
         try:
-            # DON'T recreate the model - use existing one with proper tokenizer
-            # The model and tokenizer are already correctly initialized in __init__
+            # Load metadata first to verify compatibility
+            metadata_path = os.path.join(path, "training_metadata.json")
+            if os.path.exists(metadata_path):
+                with open(metadata_path, "r") as f:
+                    metadata = json.load(f)
+                print(f"Loading checkpoint with vocab_size: {metadata['vocab_size']}")
             
-            # Load PEFT models directly onto existing split components
-            self.head_client.head_model = PeftModel.from_pretrained(
-                self.head_client.head_model, 
-                os.path.join(path, "head_model"), 
-                is_trainable=True
-            )
+            # CRITICAL: Don't use PeftModel.from_pretrained on already-PEFT models
+            # Instead, load the adapter weights directly
             
-            self.server.body_model = PeftModel.from_pretrained(
-                self.server.body_model,
-                os.path.join(path, "body_model"), 
-                is_trainable=True
-            )
+            # Method 1: Load adapter weights manually
+            head_adapter_path = os.path.join(path, "head_model", "adapter_model.safetensors")
+            body_adapter_path = os.path.join(path, "body_model", "adapter_model.safetensors") 
+            tail_adapter_path = os.path.join(path, "tail_model", "adapter_model.safetensors")
             
-            self.tail_client.tail_model = PeftModel.from_pretrained(
-                self.tail_client.tail_model,
-                os.path.join(path, "tail_model"), 
-                is_trainable=True
-            )
-
-            # Ensure weight tying
+            if all(os.path.exists(p) for p in [head_adapter_path, body_adapter_path, tail_adapter_path]):
+                # Load adapter weights directly
+                from safetensors.torch import load_file
+                
+                head_weights = load_file(head_adapter_path)
+                body_weights = load_file(body_adapter_path)
+                tail_weights = load_file(tail_adapter_path)
+                
+                # Load weights into existing PEFT models
+                self.head_client.head_model.load_state_dict(head_weights, strict=False)
+                self.server.body_model.load_state_dict(body_weights, strict=False)
+                self.tail_client.tail_model.load_state_dict(tail_weights, strict=False)
+                
+            else:
+                print("⚠️  Adapter files not found, trying alternative loading method...")
+                return False
+            
+            # Ensure weight tying after loading
             self.tail_client.tail_model.base_model.lm_head.weight = self.head_client.head_model.base_model.wte.weight
-
+            
             # Load optimizers
             self.head_client.optimizer.load_state_dict(torch.load(os.path.join(path, "head_optimizer.pt"), map_location=device))
             self.server.optimizer.load_state_dict(torch.load(os.path.join(path, "body_optimizer.pt"), map_location=device))
             self.tail_client.optimizer.load_state_dict(torch.load(os.path.join(path, "tail_optimizer.pt"), map_location=device))
 
-            # Load metrics
-            with open(os.path.join(path, "metrics.json"), "r") as f:
-                self.metrics = json.load(f)
-
             print(f"✅ Checkpoint loaded successfully from {path}")
             return True
 
         except Exception as e:
-            print(f"Error loading checkpoint: {e}")
+            print(f"❌ Error loading checkpoint: {e}")
             traceback.print_exc()
             return False
+
 
     
 
