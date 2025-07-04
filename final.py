@@ -740,25 +740,47 @@ class SplitLoRATrainer:
         with torch.no_grad():
             input_ids = example_batch['input_ids'].to(device)
             attention_mask = example_batch['attention_mask'].to(device)
+            labels = example_batch['labels'].to(device)
+            
+            # CRITICAL: Show what we're actually debugging
+            print("=== DEBUGGING CONTEXT ===")
+            full_text = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
+            print(f"Full input: '{full_text}'")
+            
+            # Show the specific positions we're analyzing
+            last_5_tokens = input_ids[0, -5:].tolist()
+            last_5_labels = labels[0, -5:].tolist()
+            print(f"Last 5 input tokens: {last_5_tokens}")
+            print(f"Last 5 labels: {last_5_labels}")
+            print(f"Last 5 decoded: {[self.tokenizer.decode([t]) for t in last_5_tokens]}")
+            
+            # Check if these are padding positions
+            padding_positions = (input_ids[0] == self.tokenizer.pad_token_id).sum().item()
+            real_length = len(input_ids[0]) - padding_positions
+            print(f"Real sequence length: {real_length}/128")
+            print(f"Positions -5 to -1 are: {'PADDING' if real_length <= 123 else 'REAL CONTENT'}")
             
             # Forward pass
             head_out = self.head_client.forward(input_ids, attention_mask)
             body_out = self.server.forward(head_out, attention_mask)
             logits = self.tail_client.forward(body_out, attention_mask)
-            
-            # Get top predictions
-            probs = torch.softmax(logits[0, -5:], dim=-1)  # Last 5 positions
-            top_tokens = torch.topk(probs, 3, dim=-1)
-            
-            print("=== MODEL LEARNING DEBUG ===")
-            for pos in range(5):
-                pos_idx = -5 + pos
-                print(f"Position {pos_idx}:")
-                for i in range(3):
-                    token_id = top_tokens.indices[pos, i].item()
-                    prob = top_tokens.values[pos, i].item()
-                    token_text = self.tokenizer.decode([token_id])
-                    print(f"  Top {i+1}: '{token_text}' (prob: {prob:.3f})")    
+
+            # Get top predictions for meaningful positions only
+            if real_length > 5:
+                # Analyze positions around the delimiter and end of real content
+                meaningful_positions = [-real_length+input_ids.size(1)-3, -real_length+input_ids.size(1)-2, -real_length+input_ids.size(1)-1]
+                probs = torch.softmax(logits[0, meaningful_positions], dim=-1)
+                top_tokens = torch.topk(probs, 3, dim=-1)
+                
+                print("=== MEANINGFUL POSITIONS ANALYSIS ===")
+                for i, pos in enumerate(meaningful_positions):
+                    print(f"Position {pos} (real content):")
+                    for j in range(3):
+                        token_id = top_tokens.indices[i, j].item()
+                        prob = top_tokens.values[i, j].item()
+                        token_text = self.tokenizer.decode([token_id])
+                        print(f"  Top {j+1}: '{token_text}' (prob: {prob:.3f})")
+ 
     
             
 
@@ -1224,6 +1246,18 @@ def main():
         print("Sampling output:", generate_with_sampling(trainer, wrapper, example_mr, example_ref))
         print("=== SIMPLE GREEDY TEST ===")
         greedy_result = test_simple_greedy(trainer, wrapper, example_mr)
+        # After loading the model but before evaluation, add:
+        print("=== CURRENT GENERATION TEST ===")
+        test_mr = "name[Blue Spice], eatType[coffee shop], area[city centre]"
+        test_result = test_simple_greedy(trainer, wrapper, test_mr)
+        print(f"Current generation quality: '{test_result}'")
+
+        # Check if it's still generating gibberish
+        if any(char in test_result for char in '|[](){}'):
+            print("❌ Still generating symbols - training issues persist")
+        else:
+            print("✅ Generating normal text - period prediction might be normal")
+
 
         train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
         
