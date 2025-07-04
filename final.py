@@ -875,11 +875,11 @@ def generate_with_sampling(trainer, wrapper, mr_text, ref_text, max_new_tokens=4
         output = wrapper.generate(
             ids,
             attention_mask=m,
-            num_beams = 5,  # Use single beam for sampling
+            num_beams = 6,  # Use single beam for sampling
             # SAMPLING APPROACH (avoids beam search repetition)
             max_new_tokens=30,
             do_sample=False,
-            num_beam_groups = 2,
+            num_beam_groups = 2,  # Use 2 groups for diversity
             # Sampling parameters
             top_k=40,
             top_p=0.85,
