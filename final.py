@@ -413,7 +413,7 @@ class SplitLoRATrainer:
         
         self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
         full_model = GPT2LMHeadModel.from_pretrained('gpt2')
-        self.DELIM = " -> "  # More natural language connector
+        self.DELIM = "###"  # More natural language connector
         self.PAD = self.tokenizer.eos_token  # Use eos_token as pad
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
@@ -1128,7 +1128,23 @@ def test_simple_greedy(trainer, wrapper, mr_text):
     return result
 
 
-
+def test_single_token_delimiters(tokenizer):
+    """Find good single-token delimiters"""
+    candidates = [
+        ":",      # Colon
+        ";",      # Semicolon  
+        "=",      # Equals
+        "|",      # Pipe
+        "###",    # Triple hash (from search result [2])
+        ">>",     # Double arrow
+        "=>",     # Arrow equals
+        ":",      # Just colon
+    ]
+    
+    print("=== TESTING SINGLE-TOKEN DELIMITERS ===")
+    for delim in candidates:
+        tokens = tokenizer.encode(delim, add_special_tokens=False)
+        print(f"'{delim}' -> {tokens} ({len(tokens)} tokens) {'✅ SINGLE' if len(tokens) == 1 else '❌ MULTI'}")
 
 
 
@@ -1194,7 +1210,7 @@ def main():
         else:
             print("✅ Generating normal text - period prediction might be normal")
 
-
+        test_single_token_delimiters(trainer.tokenizer)
         train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
         
         results = evaluate_beam(trainer, wrapper, test_ds, n_samples=len(test_ds))
