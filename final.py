@@ -993,8 +993,7 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text,
             no_repeat_ngram_size=4,      # Reduced to allow some repetition
             repetition_penalty=2.00,     # Mild penalty
             length_penalty=0.9,             # Slight length preference
-            diversity_penalty=1.5,          # Force beam diversity
-            num_beam_groups=min(k//2, 3),   # Group diverse beams
+            diversity_penalty=1.5,          # Force beam diversit
             # FIXED: Token handling
             eos_token_id=trainer.tokenizer.eos_token_id,
             pad_token_id=trainer.tokenizer.pad_token_id,
