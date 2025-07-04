@@ -436,7 +436,7 @@ class SplitLoRATrainer:
         
         self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
         full_model = GPT2LMHeadModel.from_pretrained('gpt2')
-        self.DELIM = ":"
+        self.DELIM = " = "
         self.PAD = self.tokenizer.eos_token  # Use eos_token as pad
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
@@ -984,7 +984,6 @@ def evaluate_official(preds,
 
 
 def generate_with_sampling(trainer, wrapper, mr_text, ref_text, max_new_tokens=40):
-    """Use sampling instead of beam search to avoid repetition"""
     prompt = mr_text + " " + trainer.DELIM + " "
     enc = trainer.tokenizer(prompt, return_tensors="pt")
     ids, m = enc["input_ids"].to(device), enc["attention_mask"].to(device)
@@ -993,21 +992,20 @@ def generate_with_sampling(trainer, wrapper, mr_text, ref_text, max_new_tokens=4
         output = wrapper.generate(
             ids,
             attention_mask=m,
-            num_beams = 6,  # Use single beam for sampling
-            # SAMPLING APPROACH (avoids beam search repetition)
-            max_new_tokens=30,
-            do_sample=False,
-            num_beam_groups = 2,  # Use 2 groups for diversity
-            # Sampling parameters
-            top_k=40,
-            top_p=0.85,
-            temperature=1.2,
             
-            # Still use some repetition control
-            repetition_penalty=2.0,
-            no_repeat_ngram_size=4,
-            length_penalty=1.1,         # Encourage longer outputs
-            diversity_penalty=1.0,      # Force diversity
+            # MUCH SIMPLER parameters
+            max_new_tokens=20,
+            min_length=ids.size(1) + 3,
+            
+            do_sample=True,
+            
+            # MINIMAL sampling parameters
+            top_k=50,
+            top_p=0.9,
+            temperature=0.8,
+            
+            # VERY GENTLE repetition control
+            repetition_penalty=1.05,  # Almost no penalty
             
             eos_token_id=trainer.tokenizer.eos_token_id,
             pad_token_id=trainer.tokenizer.pad_token_id,
@@ -1015,6 +1013,7 @@ def generate_with_sampling(trainer, wrapper, mr_text, ref_text, max_new_tokens=4
     
     result = trainer.tokenizer.decode(output[0][ids.size(1):], skip_special_tokens=True).strip()
     return result
+
 
 
 def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
@@ -1101,26 +1100,34 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text,
 
     with torch.no_grad():
         beams = wrapper.generate(
-            ids, 
+            ids,
             attention_mask=m,
-            max_new_tokens=30,
-            min_length=ids.size(1) + 8, 
+            
+            # FIXED: Clean beam search parameters
+            max_new_tokens=25,
+            min_length=ids.size(1) + 5,
+            
             num_beams=k,
             num_return_sequences=k,
-            early_stopping=False,        # Don't stop early
-            no_repeat_ngram_size=4,      # Reduced to allow some repetition
-            repetition_penalty=2.00,     # Mild penalty
-            length_penalty=0.9,             # Slight length preference
-            diversity_penalty=1.5,          # Force beam diversit
-            # FIXED: Token handling
+            
+            # CRITICAL: Completely remove beam groups and diversity penalties
+            early_stopping=True,
+            length_penalty=1.0,
+            
+            # GENTLE repetition control
+            no_repeat_ngram_size=2,
+            repetition_penalty=1.1,
+            
+            # REMOVE ALL PROBLEMATIC PARAMETERS:
+            # No diversity_penalty
+            # No num_beam_groups
+            # No temperature/top_p/top_k in beam search
+            
             eos_token_id=trainer.tokenizer.eos_token_id,
             pad_token_id=trainer.tokenizer.pad_token_id,
-            
-            # FIXED: Generation behavior
-            do_sample=False,
-            temperature=1.0,
-            remove_invalid_values=True,
+            do_sample=False,  # Pure beam search
         )
+
     # DEBUG: Check what was generated
     print(f"Generated {len(beams)} total sequences")
     # Extract only the generated parts (after the prompt)
@@ -1171,28 +1178,31 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text,
 
 
 def test_simple_greedy(trainer, wrapper, mr_text):
-    """Test with simple greedy generation"""
     prompt = mr_text + " " + trainer.DELIM + " "
     enc = trainer.tokenizer(prompt, return_tensors="pt")
     ids, m = enc["input_ids"].to(device), enc["attention_mask"].to(device)
-    
-    print(f"Greedy input: '{prompt}'")
-    
+
     with torch.no_grad():
         output = wrapper.generate(
             ids,
             attention_mask=m,
-            max_new_tokens=20,
-            do_sample=False,
-            repetition_penalty=1.8,     # Strong penalty even for greedy
-            no_repeat_ngram_size=3,
+            
+            # MINIMAL greedy parameters
+            max_new_tokens=15,
+            min_length=ids.size(1) + 3,
+            
+            do_sample=False,  # Pure greedy
+            
+            # MINIMAL repetition control
+            repetition_penalty=1.02,  # Almost none
+            
             eos_token_id=trainer.tokenizer.eos_token_id,
             pad_token_id=trainer.tokenizer.pad_token_id,
         )
     
     result = trainer.tokenizer.decode(output[0][ids.size(1):], skip_special_tokens=True).strip()
-    print(f"Greedy result: '{result}'")
     return result
+
 
 
 
@@ -1244,13 +1254,14 @@ def main():
         example_mr = "name[Blue Spice], eatType[coffee shop], area[city centre]"
         example_ref = "Blue Spice is a coffee shop in the city centre."
         print("Sampling output:", generate_with_sampling(trainer, wrapper, example_mr, example_ref))
-        print("=== SIMPLE GREEDY TEST ===")
-        greedy_result = test_simple_greedy(trainer, wrapper, example_mr)
-        # After loading the model but before evaluation, add:
-        print("=== CURRENT GENERATION TEST ===")
-        test_mr = "name[Blue Spice], eatType[coffee shop], area[city centre]"
-        test_result = test_simple_greedy(trainer, wrapper, test_mr)
-        print(f"Current generation quality: '{test_result}'")
+        
+
+        print("=== TESTING WITH GENTLER PARAMETERS ===")
+        test_result = test_simple_greedy(trainer, wrapper, example_mr)
+        print(f"Gentle generation: '{test_result}'")
+
+        sampling_result = generate_with_sampling(trainer, wrapper, example_mr, example_ref)
+        print(f"Gentle sampling: '{sampling_result}'")
 
         # Check if it's still generating gibberish
         if any(char in test_result for char in '|[](){}'):
