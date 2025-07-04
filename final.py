@@ -972,7 +972,6 @@ def generate_with_sampling(trainer, wrapper, mr_text, ref_text, max_new_tokens=4
     with torch.no_grad():
         output = wrapper.generate(
             ids,
-            attention_mask=m,
             
             # MUCH SIMPLER parameters
             max_new_tokens=20,
@@ -1079,10 +1078,9 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text, max_new_tokens=6
         # ULTRA SIMPLE beam search - no complex parameters
         beams = wrapper.generate(
             ids,
-            attention_mask=m,
             max_new_tokens=20,              # Shorter for E2E
-            num_beams=5,
-            num_return_sequences=k,
+            num_beams=10,
+            num_return_sequences=10,
             early_stopping=True,
             length_penalty=1.0,             # Neutral
             eos_token_id=trainer.tokenizer.eos_token_id,
@@ -1116,7 +1114,6 @@ def test_simple_greedy(trainer, wrapper, mr_text):
         # ABSOLUTE MINIMAL greedy generation
         output = wrapper.generate(
             ids,
-            attention_mask=m,
             max_new_tokens=12,              # Very short
             do_sample=False,                # Pure greedy
             eos_token_id=trainer.tokenizer.eos_token_id,
