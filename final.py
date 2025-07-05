@@ -381,6 +381,15 @@ class TailClient:
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1)
         )
+
+        # ADD: Entropy regularization for better diversity
+        log_probs = torch.log_softmax(shift_logits, dim=-1)
+        entropy = -torch.sum(log_probs * torch.softmax(shift_logits, dim=-1), dim=-1)
+        entropy_loss = -torch.mean(entropy)  # Encourage high entropy
+        
+        # OPTIMIZED: Stronger entropy weight for E2E NLG
+        beta = 0.15  # INCREASED from 0.1
+        total_loss = loss + beta * entropy_loss
         
         # Check for NaN loss
         if torch.isnan(loss):
@@ -388,7 +397,7 @@ class TailClient:
             return 0.0, torch.zeros_like(body_activations)
         
         # Backward pass
-        loss.backward(retain_graph=True)
+        total_loss.backward(retain_graph=True)
         
         # Now safely access .grad
         body_grad = body_activations.grad.clone() if body_activations.grad is not None else torch.zeros_like(body_activations)
@@ -463,12 +472,12 @@ class SplitLoRATrainer:
         # Apply LoRA/DoRA to clean models
         lora_config = LoraConfig(
             r=8,
-            lora_alpha=16,
-            lora_dropout=0.1,
-            bias="none",
+            lora_alpha=32,
+            lora_dropout=0.05,
+            bias="lora_only",
             use_dora=True,
             task_type="CAUSAL_LM",
-            target_modules=["c_attn", "c_proj"]
+            target_modules=["c_attn", "c_proj", "c_fc"]
         )
         
         head_model = get_peft_model(head_model, lora_config)
@@ -491,7 +500,7 @@ class SplitLoRATrainer:
 
         
     def preprocess(self, example):
-        SEQUENCE_LENGTH = 256
+        SEQUENCE_LENGTH = 128
         mr_text = example["meaning_representation"]
         ref_text = example["human_reference"]
         
@@ -1247,18 +1256,20 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text, max_new_tokens=6
         # ULTRA SIMPLE beam search - no complex parameters
         beams = wrapper.generate(
             ids,
-            max_new_tokens=30,              # Shorter for E2E
-            num_beams=10,
-            num_return_sequences=10,
+            max_new_tokens=3,              # Shorter for E2E
+            num_beams=12,
+            num_return_sequences=8,
             early_stopping=True,
-            length_penalty=1.0,             # Neutral
+            length_penalty=1.1,             # Neutral
             no_repeat_ngram_size=3,
-            repetition_penalty=1.8,  # Strong penalty
+            repetition_penalty=1.3,  # Strong penalty
+            # IMPROVED diversity
+            diversity_penalty=0.3,      # Add diversity
+            num_beam_groups=3,          # Group beams for diversity
             eos_token_id=trainer.tokenizer.eos_token_id,
             pad_token_id=trainer.tokenizer.pad_token_id,
             bad_words_ids=[bad_tokens],
             do_sample=False,
-            # REMOVE ALL OTHER PARAMETERS - keep it simple!
         )
 
     # Extract candidates
@@ -1267,18 +1278,15 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text, max_new_tokens=6
         generated_part = beam[ids.size(1):]
         candidate = trainer.tokenizer.decode(generated_part, skip_special_tokens=True).strip()
         
-        # Check symbol ratio
-        symbol_count = sum(1 for c in candidate if c in '_*#-.=|[]')
-        total_chars = len(candidate)
-        symbol_ratio = symbol_count / max(total_chars, 1)
-        
-        if symbol_ratio < 0.3 and len(candidate.split()) >= 2:  # Less than 30% symbols
+        words = candidate.split()
+        if (len(words) >= 5 and                              # Minimum length
+            len(set(words)) / len(words) > 0.7 and           # Diversity ratio
+            candidate.count('.') <= 2 and                    # Not too fragmented
+            not candidate.endswith(('and', 'with', 'in', 'a', 'the'))):  # Complete sentences
             candidates.append(candidate)
-
-    if not candidates:
-        return "The restaurant serves food"  # Simple fallback
     
-    return candidates[0]  # Return first valid candidate (no MBR for now)
+    # Return best candidate or fallback
+    return candidates[0] if candidates else "[FELL BACK]"
 
 def diagnose_training_data(trainer, train_ds):
     """Check if training data makes sense"""
@@ -1413,8 +1421,6 @@ def main():
             print("✅ Generating normal text - period prediction might be normal")
 
         test_single_token_delimiters(trainer.tokenizer)
-        train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
-        
         results = evaluate_beam(trainer, wrapper, test_ds, n_samples=len(test_ds))
         # Save evaluation results
         with open(os.path.join(args.save_path, "evaluation_results.json"), "w") as f:
