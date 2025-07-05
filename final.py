@@ -1279,10 +1279,7 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text, max_new_tokens=6
         candidate = trainer.tokenizer.decode(generated_part, skip_special_tokens=True).strip()
         
         words = candidate.split()
-        if (len(words) >= 5 and                              # Minimum length
-            len(set(words)) / len(words) > 0.7 and           # Diversity ratio
-            candidate.count('.') <= 2 and                    # Not too fragmented
-            not candidate.endswith(('and', 'with', 'in', 'a', 'the'))):  # Complete sentences
+        if (len(words) >= 5):                             # Minimum length
             candidates.append(candidate)
     
     # Return best candidate or fallback
