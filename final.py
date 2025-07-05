@@ -475,7 +475,7 @@ class SplitLoRATrainer:
         mr_text = example["meaning_representation"]
         ref_text = example["human_reference"]
         
-        # Build full text with spaces around delimiter
+        # SIMPLIFIED: Use delimiter with spaces, but rely on single token search
         space_delim = " " + self.DELIM + " "  # " <|gen|> "
         full_text = mr_text + space_delim + ref_text
         
@@ -487,40 +487,20 @@ class SplitLoRATrainer:
             return_attention_mask=True
         )
         
-        # FIXED: Look for the complete delimiter sequence
+        # SIMPLIFIED: Just look for the special token directly (what your fallback does)
         labels = encoding["input_ids"].copy()
         
-        # Get the full delimiter token sequence (space + delimiter + space)
-        delimiter_tokens = self.tokenizer.encode(space_delim, add_special_tokens=False)
-        print(f"🔍 Looking for delimiter tokens: {delimiter_tokens}")
+        # Find the delimiter token (single token) - this is what's working
+        delim_token_id = self.tokenizer.encode(self.DELIM, add_special_tokens=False)[0]  # [50257]
         
-        # Find the delimiter sequence in the input
-        input_tokens = encoding["input_ids"]
-        delim_start = None
-        
-        for i in range(len(input_tokens) - len(delimiter_tokens) + 1):
-            if input_tokens[i:i+len(delimiter_tokens)] == delimiter_tokens:
-                delim_start = i
-                break
-        
-        if delim_start is not None:
-            # Mask everything up to and including the delimiter sequence
-            delim_end = delim_start + len(delimiter_tokens)
-            labels[:delim_end] = [-100] * delim_end
-            print(f"✅ Delimiter found at position {delim_start}-{delim_end}")
-        else:
-            # Fallback if delimiter not found
-            print(f"⚠️ Delimiter sequence {delimiter_tokens} not found in {input_tokens[:30]}...")
-            # Try to find just the delimiter token without spaces
-            delim_token_id = self.tokenizer.encode(self.DELIM, add_special_tokens=False)[0]
-            try:
-                delim_pos = input_tokens.index(delim_token_id)
-                labels[:delim_pos + 1] = [-100] * (delim_pos + 1)
-                print(f"✅ Found bare delimiter at position {delim_pos}")
-            except ValueError:
-                # Last resort: mask first half
-                labels[:len(labels)//2] = [-100] * (len(labels)//2)
-                print("⚠️ Using fallback masking")
+        try:
+            delim_pos = encoding["input_ids"].index(delim_token_id)
+            # Mask everything up to and including delimiter
+            labels[:delim_pos + 1] = [-100] * (delim_pos + 1)
+            # Remove debug prints for cleaner output
+        except ValueError:
+            # Fallback: mask first half if delimiter not found
+            labels[:len(labels)//2] = [-100] * (len(labels)//2)
         
         # Mask padding tokens
         labels = [-100 if tok == self.tokenizer.pad_token_id else tok for tok in labels]
@@ -532,8 +512,6 @@ class SplitLoRATrainer:
             "human_reference": example["human_reference"],
             "meaning_representation": mr_text
         }
-
-
 
 
 
