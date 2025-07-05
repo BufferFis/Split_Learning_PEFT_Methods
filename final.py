@@ -783,26 +783,27 @@ class SplitLoRATrainer:
             else:
                 print("Sequence too short for meaningful analysis")
 
-    
-            
-
-    
     def save_checkpoint(self, path="./splitlora_checkpoint"):
-        """FIXED: Save merged models to preserve custom token embeddings"""
+        """FIXED: Save merged models using state dicts"""
         os.makedirs(path, exist_ok=True)
         
         try:
-            # CRITICAL: Merge PEFT adapters into base models to preserve ALL weights
             print("Merging and saving models with custom embeddings...")
             
+            # Merge PEFT adapters into base models
             head_merged = self.head_client.head_model.merge_and_unload()
             body_merged = self.server.body_model.merge_and_unload()
             tail_merged = self.tail_client.tail_model.merge_and_unload()
             
-            # Save merged models (includes custom token embeddings)
-            head_merged.save_pretrained(os.path.join(path, "head_model_merged"))
-            body_merged.save_pretrained(os.path.join(path, "body_model_merged"))
-            tail_merged.save_pretrained(os.path.join(path, "tail_model_merged"))
+            # FIXED: Save state dicts instead of using save_pretrained
+            torch.save(head_merged.state_dict(), os.path.join(path, "head_model_merged.pt"))
+            torch.save(body_merged.state_dict(), os.path.join(path, "body_model_merged.pt"))
+            torch.save(tail_merged.state_dict(), os.path.join(path, "tail_model_merged.pt"))
+            
+            # Save model configurations
+            torch.save(head_merged.config, os.path.join(path, "head_config.pt"))
+            torch.save(body_merged.config, os.path.join(path, "body_config.pt"))
+            torch.save(tail_merged.config, os.path.join(path, "tail_config.pt"))
             
             # Save tokenizer
             self.tokenizer.save_pretrained(os.path.join(path, "tokenizer"))
@@ -836,10 +837,8 @@ class SplitLoRATrainer:
             traceback.print_exc()
             return None
 
-
-    
     def load_checkpoint(self, path="./splitlora_checkpoint"):
-        """FIXED: Load merged models and recreate PEFT structure"""
+        """FIXED: Load merged models from state dicts"""
         if not os.path.exists(path):
             print(f"❌ Checkpoint path {path} does not exist")
             return False
@@ -854,21 +853,76 @@ class SplitLoRATrainer:
             # Load tokenizer (preserves custom tokens)
             self.tokenizer = AutoTokenizer.from_pretrained(os.path.join(path, "tokenizer"))
             
-            # Load merged models (includes custom token embeddings)
-            from transformers import AutoModelForCausalLM
-            head_merged = AutoModelForCausalLM.from_pretrained(os.path.join(path, "head_model_merged"))
-            body_merged = AutoModelForCausalLM.from_pretrained(os.path.join(path, "body_model_merged"))
-            tail_merged = AutoModelForCausalLM.from_pretrained(os.path.join(path, "tail_model_merged"))
+            # FIXED: Create fresh full model with correct vocab size
+            from transformers import GPT2LMHeadModel
+            full_model = GPT2LMHeadModel.from_pretrained('gpt2')
+            
+            # Resize to match saved model
+            full_model.resize_token_embeddings(metadata['vocab_size'])
+            
+            # Load the merged head model state dict to get the embeddings
+            head_state = torch.load(os.path.join(path, "head_model_merged.pt"), map_location=device)
+            
+            # Extract embedding weights and copy to full model
+            if 'wte.weight' in head_state:
+                full_model.transformer.wte.weight.data = head_state['wte.weight']
+            if 'wpe.weight' in head_state:
+                full_model.transformer.wpe.weight.data = head_state['wpe.weight']
+            
+            # Extract transformer layers from all parts
+            head_config = torch.load(os.path.join(path, "head_config.pt"), map_location=device)
+            body_state = torch.load(os.path.join(path, "body_model_merged.pt"), map_location=device)
+            tail_state = torch.load(os.path.join(path, "tail_model_merged.pt"), map_location=device)
+            
+            # Reconstruct layer weights in full model
+            layer_idx = 0
+            
+            # Head layers
+            for i in range(2):  # head_layers
+                if f'h.{i}.ln_1.weight' in head_state:
+                    full_model.transformer.h[layer_idx].load_state_dict({
+                        k[len(f'h.{i}.'):]: v for k, v in head_state.items() 
+                        if k.startswith(f'h.{i}.')
+                    }, strict=False)
+                layer_idx += 1
+            
+            # Body layers  
+            for i in range(8):  # body_layers
+                body_layer_key = f'transformer.h.{i}'
+                if f'{body_layer_key}.ln_1.weight' in body_state:
+                    full_model.transformer.h[layer_idx].load_state_dict({
+                        k[len(f'{body_layer_key}.'):]: v for k, v in body_state.items()
+                        if k.startswith(f'{body_layer_key}.')
+                    }, strict=False)
+                layer_idx += 1
+            
+            # Tail layers
+            for i in range(2):  # tail_layers
+                tail_layer_key = f'transformer.h.{i}'
+                if f'{tail_layer_key}.ln_1.weight' in tail_state:
+                    full_model.transformer.h[layer_idx].load_state_dict({
+                        k[len(f'{tail_layer_key}.'):]: v for k, v in tail_state.items()
+                        if k.startswith(f'{tail_layer_key}.')
+                    }, strict=False)
+                layer_idx += 1
+            
+            # Load final layer norm and LM head from tail
+            if 'transformer.ln_f.weight' in tail_state:
+                full_model.transformer.ln_f.weight.data = tail_state['transformer.ln_f.weight']
+                full_model.transformer.ln_f.bias.data = tail_state['transformer.ln_f.bias']
+            
+            if 'lm_head.weight' in tail_state:
+                full_model.lm_head.weight.data = tail_state['lm_head.weight']
             
             print("✅ Merged models loaded successfully with custom embeddings")
             
             # Verify custom token embeddings were preserved
             delim_id = metadata["custom_tokens"]["delim_id"]
-            delim_embedding = head_merged.transformer.wte.weight[delim_id]
+            delim_embedding = full_model.transformer.wte.weight[delim_id]
             print(f"Loaded DELIM embedding norm: {delim_embedding.norm().item():.4f}")
             
-            # Recreate split models from merged models
-            head_model, body_model, tail_model = split_gpt2(head_merged, 2, 2)
+            # Recreate split models from loaded full model
+            head_model, body_model, tail_model = split_gpt2(full_model, 2, 2)
             
             # Re-apply PEFT to the loaded models
             lora_config = LoraConfig(
@@ -897,9 +951,6 @@ class SplitLoRATrainer:
             traceback.print_exc()
             return False
 
-
-
-    
 
 
 # ─── Beam-search helpers ──────────────────────────────────────────────
