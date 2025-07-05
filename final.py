@@ -788,42 +788,35 @@ class SplitLoRATrainer:
 
     
     def save_checkpoint(self, path="./splitlora_checkpoint"):
-        """FIXED: Proper PEFT model saving"""
+        """FIXED: Save merged models to preserve custom token embeddings"""
         os.makedirs(path, exist_ok=True)
         
         try:
-            # Save PEFT models properly (not base models)
-            self.head_client.head_model.save_pretrained(
-                os.path.join(path, "head_model"),
-                save_embedding_layers=True,  # Important for custom tokens
-                save_config=True
-            )
+            # CRITICAL: Merge PEFT adapters into base models to preserve ALL weights
+            print("Merging and saving models with custom embeddings...")
             
-            self.server.body_model.save_pretrained(
-                os.path.join(path, "body_model"),
-                save_embedding_layers=False,  # No embeddings in body
-                save_config=True
-            )
+            head_merged = self.head_client.head_model.merge_and_unload()
+            body_merged = self.server.body_model.merge_and_unload()
+            tail_merged = self.tail_client.tail_model.merge_and_unload()
             
-            self.tail_client.tail_model.save_pretrained(
-                os.path.join(path, "tail_model"),
-                save_embedding_layers=True,  # Important for LM head
-                save_config=True
-            )
+            # Save merged models (includes custom token embeddings)
+            head_merged.save_pretrained(os.path.join(path, "head_model_merged"))
+            body_merged.save_pretrained(os.path.join(path, "body_model_merged"))
+            tail_merged.save_pretrained(os.path.join(path, "tail_model_merged"))
             
-            # Save optimizers
-            torch.save(self.head_client.optimizer.state_dict(), os.path.join(path, "head_optimizer.pt"))
-            torch.save(self.server.optimizer.state_dict(), os.path.join(path, "body_optimizer.pt"))
-            torch.save(self.tail_client.optimizer.state_dict(), os.path.join(path, "tail_optimizer.pt"))
-            
-            # Save tokenizer (critical for vocab consistency)
+            # Save tokenizer
             self.tokenizer.save_pretrained(os.path.join(path, "tokenizer"))
             
-            # Save training metadata
+            # Save training metadata including custom token info
             metadata = {
                 "vocab_size": len(self.tokenizer),
-                "delim_token": self.DELIM,
-                "pad_token": self.PAD,
+                "original_vocab_size": 50257,
+                "custom_tokens": {
+                    "delim_token": self.DELIM,
+                    "delim_id": self.tokenizer.encode(self.DELIM, add_special_tokens=False)[0],
+                    "pad_token": self.PAD,
+                    "pad_id": self.tokenizer.pad_token_id
+                },
                 "metrics": self.metrics,
                 "model_config": {
                     "head_layers": 2,
@@ -835,62 +828,67 @@ class SplitLoRATrainer:
             with open(os.path.join(path, "training_metadata.json"), "w") as f:
                 json.dump(metadata, f, indent=2)
             
-            print(f"✅ Checkpoint saved successfully to {path}")
+            print(f"✅ Merged checkpoint with custom embeddings saved to {path}")
             return path
             
         except Exception as e:
-            print(f"❌ Error saving checkpoint: {e}")
+            print(f"❌ Error saving merged checkpoint: {e}")
             traceback.print_exc()
             return None
 
+
     
     def load_checkpoint(self, path="./splitlora_checkpoint"):
-        """FIXED: Proper PEFT model loading without nesting"""
+        """FIXED: Load merged models and recreate PEFT structure"""
         if not os.path.exists(path):
             print(f"❌ Checkpoint path {path} does not exist")
             return False
 
         try:
-            # Load metadata first to verify compatibility
-            metadata_path = os.path.join(path, "training_metadata.json")
-            if os.path.exists(metadata_path):
-                with open(metadata_path, "r") as f:
-                    metadata = json.load(f)
-                print(f"Loading checkpoint with vocab_size: {metadata['vocab_size']}")
+            # Load metadata first
+            with open(os.path.join(path, "training_metadata.json"), "r") as f:
+                metadata = json.load(f)
             
-            # CRITICAL: Don't use PeftModel.from_pretrained on already-PEFT models
-            # Instead, load the adapter weights directly
+            print(f"Loading merged checkpoint with vocab_size: {metadata['vocab_size']}")
             
-            # Method 1: Load adapter weights manually
-            head_adapter_path = os.path.join(path, "head_model", "adapter_model.safetensors")
-            body_adapter_path = os.path.join(path, "body_model", "adapter_model.safetensors") 
-            tail_adapter_path = os.path.join(path, "tail_model", "adapter_model.safetensors")
+            # Load tokenizer (preserves custom tokens)
+            self.tokenizer = AutoTokenizer.from_pretrained(os.path.join(path, "tokenizer"))
             
-            if all(os.path.exists(p) for p in [head_adapter_path, body_adapter_path, tail_adapter_path]):
-                # Load adapter weights directly
-                from safetensors.torch import load_file
-                
-                head_weights = load_file(head_adapter_path)
-                body_weights = load_file(body_adapter_path)
-                tail_weights = load_file(tail_adapter_path)
-                
-                # Load weights into existing PEFT models
-                self.head_client.head_model.load_state_dict(head_weights, strict=False)
-                self.server.body_model.load_state_dict(body_weights, strict=False)
-                self.tail_client.tail_model.load_state_dict(tail_weights, strict=False)
-                
-            else:
-                print("⚠️  Adapter files not found, trying alternative loading method...")
-                return False
+            # Load merged models (includes custom token embeddings)
+            from transformers import AutoModelForCausalLM
+            head_merged = AutoModelForCausalLM.from_pretrained(os.path.join(path, "head_model_merged"))
+            body_merged = AutoModelForCausalLM.from_pretrained(os.path.join(path, "body_model_merged"))
+            tail_merged = AutoModelForCausalLM.from_pretrained(os.path.join(path, "tail_model_merged"))
             
-            # Ensure weight tying after loading
+            print("✅ Merged models loaded successfully with custom embeddings")
+            
+            # Verify custom token embeddings were preserved
+            delim_id = metadata["custom_tokens"]["delim_id"]
+            delim_embedding = head_merged.transformer.wte.weight[delim_id]
+            print(f"Loaded DELIM embedding norm: {delim_embedding.norm().item():.4f}")
+            
+            # Recreate split models from merged models
+            head_model, body_model, tail_model = split_gpt2(head_merged, 2, 2)
+            
+            # Re-apply PEFT to the loaded models
+            lora_config = LoraConfig(
+                r=8, lora_alpha=16, lora_dropout=0.1,
+                bias="none", use_dora=True, task_type="CAUSAL_LM",
+                target_modules=["c_attn", "c_proj"]
+            )
+            
+            head_model = get_peft_model(head_model, lora_config)
+            body_model = get_peft_model(body_model, lora_config)
+            tail_model = get_peft_model(tail_model, lora_config)
+            
+            # Update components with loaded models
+            self.head_client.head_model = head_model.to(device)
+            self.server.body_model = body_model.to(device)
+            self.tail_client.tail_model = tail_model.to(device)
+            
+            # Ensure weight tying
             self.tail_client.tail_model.base_model.lm_head.weight = self.head_client.head_model.base_model.wte.weight
             
-            # Load optimizers
-            self.head_client.optimizer.load_state_dict(torch.load(os.path.join(path, "head_optimizer.pt"), map_location=device))
-            self.server.optimizer.load_state_dict(torch.load(os.path.join(path, "body_optimizer.pt"), map_location=device))
-            self.tail_client.optimizer.load_state_dict(torch.load(os.path.join(path, "tail_optimizer.pt"), map_location=device))
-
             print(f"✅ Checkpoint loaded successfully from {path}")
             return True
 
@@ -898,6 +896,7 @@ class SplitLoRATrainer:
             print(f"❌ Error loading checkpoint: {e}")
             traceback.print_exc()
             return False
+
 
 
     
