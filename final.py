@@ -414,7 +414,7 @@ class SplitLoRATrainer:
         
         self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
         full_model = GPT2LMHeadModel.from_pretrained('gpt2')
-        self.DELIM = "<|gen|>"
+        
 
          # FIXED: Properly initialize custom token embeddings
         original_vocab_size = len(self.tokenizer)
