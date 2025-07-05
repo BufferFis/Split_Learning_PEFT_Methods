@@ -838,6 +838,7 @@ class SplitLoRATrainer:
             return None
 
     def load_checkpoint(self, path="./splitlora_checkpoint"):
+        from transformers.models.gpt2.configuration_gpt2 import GPT2Config
         """FIXED: Load merged models from state dicts"""
         if not os.path.exists(path):
             print(f"❌ Checkpoint path {path} does not exist")
@@ -869,12 +870,14 @@ class SplitLoRATrainer:
             if 'wpe.weight' in head_state:
                 full_model.transformer.wpe.weight.data = head_state['wpe.weight']
             
-            # Extract transformer layers from all parts
-            head_config = torch.load(os.path.join(path, "head_config.pt"), map_location=device)
-            body_state = torch.load(os.path.join(path, "body_model_merged.pt"), map_location=device)
-            tail_state = torch.load(os.path.join(path, "tail_model_merged.pt"), map_location=device)
-            
-            # Reconstruct layer weights in full model
+            with torch.serialization.safe_globals([GPT2Config]):
+                head_config = torch.load(os.path.join(path, "head_config.pt"), 
+                                        map_location=device, weights_only=True)
+                body_state = torch.load(os.path.join(path, "body_model_merged.pt"), 
+                                    map_location=device, weights_only=True) 
+                tail_state = torch.load(os.path.join(path, "tail_model_merged.pt"), 
+                                    map_location=device, weights_only=True)
+                # Reconstruct layer weights in full model
             layer_idx = 0
             
             # Head layers
