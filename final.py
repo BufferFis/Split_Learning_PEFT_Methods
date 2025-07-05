@@ -460,73 +460,62 @@ class SplitLoRATrainer:
         self.max_epochs = max_epochs
         self.schedulers = []
 
-     
         
+    def preprocess(self, example):
+        """Preprocessing method for individual examples"""
+        SEQUENCE_LENGTH = 128
+        mr_text = example["meaning_representation"]
+        ref_text = example["human_reference"]
+        
+        # Build full text
+        space_delim = " " + self.DELIM + " "  # " : "
+        full_text = mr_text + space_delim + ref_text
+        
+        encoding = self.tokenizer(
+            full_text,
+            max_length=SEQUENCE_LENGTH,
+            truncation=True,
+            padding="max_length",
+            return_attention_mask=True
+        )
+        
+        # FIXED: More robust delimiter finding
+        labels = encoding["input_ids"].copy()
+        
+        # Find delimiter position in the full text
+        delim_pos_in_text = full_text.find(space_delim)
+        if delim_pos_in_text != -1:
+            # Find corresponding token position
+            prefix_text = full_text[:delim_pos_in_text + len(space_delim)]
+            prefix_tokens = self.tokenizer.encode(prefix_text, add_special_tokens=False)
+            
+            # Mask everything up to end of delimiter
+            mask_until = min(len(prefix_tokens), len(labels))
+            labels[:mask_until] = [-100] * mask_until
+        else:
+            # Fallback: mask first half
+            labels[:len(labels)//2] = [-100] * (len(labels)//2)
+        
+        # Mask padding tokens  
+        for i, token_id in enumerate(labels):
+            if token_id == self.tokenizer.pad_token_id:
+                labels[i] = -100
+        
+        return {
+            "input_ids": encoding["input_ids"],
+            "attention_mask": encoding["attention_mask"],
+            "labels": labels,
+            "human_reference": example["human_reference"],
+            "meaning_representation": mr_text
+        }
+
     def load_e2e_dataset(self, debug_mode=False):
         """Improved preprocessing with optional debug mode"""
         dataset = load_dataset("e2e_nlg", trust_remote_code=True)
         
-        def preprocess(example):
-            SEQUENCE_LENGTH = 128
-            mr_text = example["meaning_representation"]
-            ref_text = example["human_reference"]
-            
-            # Build full text
-            space_delim = " " + self.DELIM + " "  # " : "
-            full_text = mr_text + space_delim + ref_text
-            
-            encoding = self.tokenizer(
-                full_text,
-                max_length=SEQUENCE_LENGTH,
-                truncation=True,
-                padding="max_length",
-                return_attention_mask=True
-            )
-            
-            # FIXED: More robust delimiter finding
-            labels = encoding["input_ids"].copy()
-            
-            # Find delimiter position in the full text
-            delim_pos_in_text = full_text.find(space_delim)
-            if delim_pos_in_text != -1:
-                # Find corresponding token position
-                prefix_text = full_text[:delim_pos_in_text + len(space_delim)]
-                prefix_tokens = self.tokenizer.encode(prefix_text, add_special_tokens=False)
-                
-                # Mask everything up to end of delimiter
-                mask_until = min(len(prefix_tokens), len(labels))
-                labels[:mask_until] = [-100] * mask_until
-            else:
-                # Fallback: mask first half
-                labels[:len(labels)//2] = [-100] * (len(labels)//2)
-            
-            # Mask padding tokens  
-            for i, token_id in enumerate(labels):
-                if token_id == self.tokenizer.pad_token_id:
-                    labels[i] = -100
-            
-            return {
-                "input_ids": encoding["input_ids"],
-                "attention_mask": encoding["attention_mask"],
-                "labels": labels,
-                "human_reference": example["human_reference"],
-                "meaning_representation": mr_text
-            }
-
-
-        
-        train_ds = dataset["train"].map(preprocess, remove_columns=dataset["train"].column_names)
-        test_ds = dataset["test"].map(preprocess, remove_columns=dataset["test"].column_names)
-        
-        # DEBUG MODE: Use only tiny subset
-        if debug_mode:
-            print("🐛 DEBUG MODE: Using tiny dataset subset")
-            print(f"   - Sequence length: 64")
-            print(f"   - Training samples: 2000 (instead of {len(train_ds):,})")
-            print(f"   - Test samples: 200 (instead of {len(test_ds):,})")
-            train_ds = train_ds.select(range(2000))  # Only 2000 samples!
-            test_ds = test_ds.select(range(200))     # Only 200 samples!
-        
+        # Use the class method instead of nested function
+        train_ds = dataset["train"].map(self.preprocess, remove_columns=dataset["train"].column_names)
+        test_ds = dataset["test"].map(self.preprocess, remove_columns=dataset["test"].column_names)
         return train_ds, test_ds
 
 
