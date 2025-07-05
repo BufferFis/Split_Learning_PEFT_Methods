@@ -984,7 +984,7 @@ def evaluate_official(preds,
         "cider":    float(fields[5])
     }
 
-def diagnose_preprocessing_detailed_fixed(trainer):
+def diagnose_preprocessing_detailed(trainer):
     """FIXED: Process raw data directly without dataset mapping"""
     print("=== DETAILED PREPROCESSING DIAGNOSIS ===")
     
