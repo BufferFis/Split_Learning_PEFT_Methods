@@ -1012,6 +1012,7 @@ def diagnose_preprocessing_detailed(trainer):
         padding="max_length",
         return_attention_mask=True
     )
+
     
     print(f"Encoded length: {len(encoding['input_ids'])}")
     print(f"Input IDs: {encoding['input_ids'][:20]}")
@@ -1075,6 +1076,39 @@ def generate_with_sampling(trainer, wrapper, mr_text, ref_text, max_new_tokens=4
     
     result = trainer.tokenizer.decode(output[0][ids.size(1):], skip_special_tokens=True).strip()
     return result
+
+
+def diagnose_custom_token_embeddings(trainer):
+    """Check if custom token embeddings are corrupted"""
+    print("=== CUSTOM TOKEN EMBEDDING DIAGNOSIS ===")
+    
+    delim_id = trainer.tokenizer.encode(trainer.DELIM, add_special_tokens=False)[0]
+    pad_id = trainer.tokenizer.pad_token_id
+    
+    # Get embeddings from head model
+    head_embeddings = trainer.head_client.head_model.base_model.wte.weight
+    
+    delim_embedding = head_embeddings[delim_id]
+    pad_embedding = head_embeddings[pad_id]
+    
+    print(f"DELIM embedding norm: {delim_embedding.norm().item():.4f}")
+    print(f"PAD embedding norm: {pad_embedding.norm().item():.4f}")
+    print(f"DELIM embedding mean: {delim_embedding.mean().item():.4f}")
+    print(f"PAD embedding mean: {pad_embedding.mean().item():.4f}")
+    
+    # Check if they're all zeros or NaN (corruption indicators)
+    if delim_embedding.norm().item() < 1e-6:
+        print("❌ DELIM embedding is near-zero - CORRUPTED!")
+    if torch.isnan(delim_embedding).any():
+        print("❌ DELIM embedding contains NaN - CORRUPTED!")
+    
+    # Test tokenizer decode
+    test_ids = [delim_id, pad_id, 1169]  # delim, pad, "the"
+    decoded = trainer.tokenizer.decode(test_ids, skip_special_tokens=False)
+    print(f"Test decode: {test_ids} -> '{decoded}'")
+    
+    if '�' in decoded:
+        print("❌ Unicode corruption detected in tokenizer decode!")
 
 
 
@@ -1288,6 +1322,7 @@ def main():
     # Load checkpoint if specified
     if args.load_checkpoint:
         trainer.load_checkpoint(args.load_checkpoint)
+        diagnose_custom_token_embeddings(trainer)
     
     wrapper = SplitGPT2ForGeneration(
             tokenizer   = trainer.tokenizer,
@@ -1301,11 +1336,12 @@ def main():
     if hasattr(wrapper, "generation_config"):
         wrapper.generation_config.vocab_size = len(trainer.tokenizer)
     
-    # Load dataset (regular mode)
-    train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
-    diagnose_training_data(trainer)
-    diagnose_preprocessing_detailed(trainer)
+    
     if args.eval_only:
+        train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
+        diagnose_training_data(trainer)
+        diagnose_preprocessing_detailed(trainer)
+        diagnose_custom_token_embeddings(trainer)
         # quick manual check on one MR
         example_mr = "name[Blue Spice], eatType[coffee shop], area[city centre]"
         example_ref = "Blue Spice is a coffee shop in the city centre."
@@ -1337,6 +1373,11 @@ def main():
 
 
     if not args.eval_only:
+        # Load dataset (regular mode)
+        train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
+        diagnose_training_data(trainer)
+        diagnose_preprocessing_detailed(trainer)
+        diagnose_custom_token_embeddings(trainer)
         # Create dataloader and train
         train_dl = trainer.create_dataloader(train_ds, batch_size=args.batch_size, shuffle=True, debug_mode=False)
         trainer.attach_schedulers(train_dl)
