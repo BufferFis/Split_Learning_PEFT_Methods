@@ -416,7 +416,9 @@ class SplitLoRATrainer:
         self.DELIM = ":"  # More natural language connector
         self.PAD = self.tokenizer.eos_token  # Use eos_token as pad
         self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+            full_model.resize_token_embeddings(len(self.tokenizer))
         self.tokenizer.padding_side = "right"
         
         # Set generation config with existing vocabulary
@@ -470,8 +472,8 @@ class SplitLoRATrainer:
             mr_text = example["meaning_representation"]
             ref_text = example["human_reference"]
             
-            # FIXED: Use simpler delimiter
-            space_delim = " " + self.DELIM + " "
+            # Build full text
+            space_delim = " " + self.DELIM + " "  # " : "
             full_text = mr_text + space_delim + ref_text
             
             encoding = self.tokenizer(
@@ -482,31 +484,27 @@ class SplitLoRATrainer:
                 return_attention_mask=True
             )
             
-            # CRITICAL FIX: Better label generation
+            # FIXED: More robust delimiter finding
             labels = encoding["input_ids"].copy()
             
-            #Find delimiter more robustly
-            delimiter_with_spaces = self.tokenizer.encode(space_delim, add_special_tokens=False)
-            
-            # Find where the delimiter sequence starts
-            input_tokens = encoding["input_ids"]
-            delim_start = None
-            
-            for i in range(len(input_tokens) - len(delimiter_with_spaces) + 1):
-                if input_tokens[i:i+len(delimiter_with_spaces)] == delimiter_with_spaces:
-                    delim_start = i
-                    break
-            
-            if delim_start is not None:
-                # Mask everything up to and including the delimiter
-                delim_end = delim_start + len(delimiter_with_spaces)
-                labels[:delim_end] = [-100] * delim_end
+            # Find delimiter position in the full text
+            delim_pos_in_text = full_text.find(space_delim)
+            if delim_pos_in_text != -1:
+                # Find corresponding token position
+                prefix_text = full_text[:delim_pos_in_text + len(space_delim)]
+                prefix_tokens = self.tokenizer.encode(prefix_text, add_special_tokens=False)
+                
+                # Mask everything up to end of delimiter
+                mask_until = min(len(prefix_tokens), len(labels))
+                labels[:mask_until] = [-100] * mask_until
             else:
-                # Fallback: mask first third
-                labels[:len(labels)//3] = [-100] * (len(labels)//3)
+                # Fallback: mask first half
+                labels[:len(labels)//2] = [-100] * (len(labels)//2)
             
-            # Mask padding tokens
-            labels = [-100 if tok == self.tokenizer.pad_token_id else tok for tok in labels]
+            # Mask padding tokens  
+            for i, token_id in enumerate(labels):
+                if token_id == self.tokenizer.pad_token_id:
+                    labels[i] = -100
             
             return {
                 "input_ids": encoding["input_ids"],
@@ -515,6 +513,7 @@ class SplitLoRATrainer:
                 "human_reference": example["human_reference"],
                 "meaning_representation": mr_text
             }
+
 
         
         train_ds = dataset["train"].map(preprocess, remove_columns=dataset["train"].column_names)
@@ -971,6 +970,67 @@ def evaluate_official(preds,
         "cider":    float(fields[5])
     }
 
+def diagnose_preprocessing_detailed(trainer):
+    """Debug preprocessing step by step"""
+    print("=== DETAILED PREPROCESSING DIAGNOSIS ===")
+    
+    # Get raw example
+    from datasets import load_dataset
+    dataset = load_dataset("e2e_nlg", trust_remote_code=True)
+    raw_example = dataset["train"][0]
+    
+    print(f"Raw MR: '{raw_example['meaning_representation']}'")
+    print(f"Raw reference: '{raw_example['human_reference']}'")
+    
+    # Process manually step by step
+    mr_text = raw_example["meaning_representation"]
+    ref_text = raw_example["human_reference"]
+    space_delim = " " + trainer.DELIM + " "
+    full_text = mr_text + space_delim + ref_text
+    
+    print(f"Full text: '{full_text}'")
+    
+    # Tokenize
+    encoding = trainer.tokenizer(
+        full_text,
+        max_length=128,
+        truncation=True,
+        padding="max_length",
+        return_attention_mask=True
+    )
+    
+    print(f"Encoded length: {len(encoding['input_ids'])}")
+    print(f"Input IDs: {encoding['input_ids'][:20]}")
+    
+    # Check delimiter position
+    delimiter_tokens = trainer.tokenizer.encode(space_delim, add_special_tokens=False)
+    print(f"Delimiter tokens: {delimiter_tokens}")
+    
+    # Find delimiter in sequence
+    input_tokens = encoding["input_ids"]
+    for i in range(len(input_tokens) - len(delimiter_tokens) + 1):
+        if input_tokens[i:i+len(delimiter_tokens)] == delimiter_tokens:
+            print(f"Delimiter found at position {i}")
+            break
+    else:
+        print("❌ Delimiter not found in tokenized sequence!")
+    
+    # Test current preprocessing
+    processed = trainer.preprocess(raw_example)
+    labels = processed['labels']
+    
+    # Extract target (non -100 labels)
+    target_ids = [t for t in labels if t != -100]
+    target_text = trainer.tokenizer.decode(target_ids, skip_special_tokens=True)
+    print(f"Extracted target: '{target_text}'")
+    
+    # This should match the reference text
+    if target_text.strip() != ref_text.strip():
+        print("❌ Target extraction is wrong!")
+        print(f"Expected: '{ref_text}'")
+        print(f"Got: '{target_text}'")
+    else:
+        print("✅ Target extraction is correct")
 
 def generate_with_sampling(trainer, wrapper, mr_text, ref_text, max_new_tokens=40):
     prompt = mr_text + " " + trainer.DELIM + " "
@@ -1230,6 +1290,7 @@ def main():
     # Load dataset (regular mode)
     train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
     diagnose_training_data(trainer)
+    diagnose_preprocessing_detailed(trainer)
     if args.eval_only:
         # quick manual check on one MR
         example_mr = "name[Blue Spice], eatType[coffee shop], area[city centre]"
