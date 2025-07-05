@@ -1254,22 +1254,31 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text, max_new_tokens=6
     bad_tokens = trainer.tokenizer.encode("_*#-=.", add_special_tokens=False)
     with torch.no_grad():
         # ULTRA SIMPLE beam search - no complex parameters
+        # beams = wrapper.generate(
+        #     ids,
+        #     max_new_tokens=60,              # Shorter for E2E
+        #     num_beams=12,
+        #     num_return_sequences=8,
+        #     early_stopping=True,
+        #     length_penalty=1.1,             # Neutral
+        #     no_repeat_ngram_size=3,
+        #     repetition_penalty=1.3,  # Strong penalty
+        #     # IMPROVED diversity
+        #     diversity_penalty=0.3,      # Add diversity
+        #     num_beam_groups=4,          # Group beams for diversity
+        #     eos_token_id=trainer.tokenizer.eos_token_id,
+        #     pad_token_id=trainer.tokenizer.pad_token_id,
+        #     bad_words_ids=[bad_tokens],
+        #     do_sample=False,
+        # )
         beams = wrapper.generate(
             ids,
-            max_new_tokens=60,              # Shorter for E2E
-            num_beams=12,
-            num_return_sequences=8,
-            early_stopping=True,
-            length_penalty=1.1,             # Neutral
+            max_new_tokens=60,              # Very short
+            do_sample=False,                # Pure greedy
             no_repeat_ngram_size=3,
-            repetition_penalty=1.3,  # Strong penalty
-            # IMPROVED diversity
-            diversity_penalty=0.3,      # Add diversity
-            num_beam_groups=3,          # Group beams for diversity
+            early_stopping=True,
             eos_token_id=trainer.tokenizer.eos_token_id,
-            pad_token_id=trainer.tokenizer.pad_token_id,
-            bad_words_ids=[bad_tokens],
-            do_sample=False,
+            pad_token_id=trainer.tokenizer.pad_token_id
         )
 
     # Extract candidates
@@ -1279,10 +1288,7 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text, max_new_tokens=6
         candidate = trainer.tokenizer.decode(generated_part, skip_special_tokens=True).strip()
         
         words = candidate.split()
-        if (len(words) >= 5 and                              # Minimum length
-            len(set(words)) / len(words) > 0.7 and           # Diversity ratio
-            candidate.count('.') <= 2 and                    # Not too fragmented
-            not candidate.endswith(('and', 'with', 'in', 'a', 'the'))):  # Complete sentences
+        if (len(words) >= 5):                             # Minimum length
             candidates.append(candidate)
     
     # Return best candidate or fallback
