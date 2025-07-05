@@ -471,12 +471,13 @@ class SplitLoRATrainer:
 
         
     def preprocess(self, example):
-        SEQUENCE_LENGTH = 128  # RESTORE: Old sequence length
+        SEQUENCE_LENGTH = 128
         mr_text = example["meaning_representation"]
         ref_text = example["human_reference"]
         
-        space_delim = " " + self.DELIM + " "  # " <|gen|> "
-        full_text = mr_text + space_delim + ref_text
+        # FIXED: Use delimiter without spaces since it's a special token
+        space_delim = self.DELIM  # Just "<|gen|>" not " <|gen|> "
+        full_text = mr_text + " " + space_delim + " " + ref_text
         
         encoding = self.tokenizer(
             full_text,
@@ -486,10 +487,22 @@ class SplitLoRATrainer:
             return_attention_mask=True
         )
         
-        # RESTORE: Old simple masking
+        # FIXED: Look for single delimiter token
         labels = encoding["input_ids"].copy()
-        mr_tokens = self.tokenizer.encode(mr_text + space_delim, add_special_tokens=False)
-        labels[:len(mr_tokens)] = [-100] * len(mr_tokens)
+        
+        # Find the delimiter token (single token)
+        delim_token_id = self.tokenizer.encode(self.DELIM, add_special_tokens=False)[0]  # Should be 50257
+        
+        try:
+            delim_pos = encoding["input_ids"].index(delim_token_id)
+            # Mask everything up to and including delimiter
+            labels[:delim_pos + 1] = [-100] * (delim_pos + 1)
+        except ValueError:
+            # Fallback if delimiter not found
+            print(f"⚠️ Delimiter {self.DELIM} not found in sequence")
+            labels[:len(labels)//2] = [-100] * (len(labels)//2)
+        
+        # Mask padding tokens
         labels = [-100 if tok == self.tokenizer.pad_token_id else tok for tok in labels]
         
         return {
@@ -499,6 +512,7 @@ class SplitLoRATrainer:
             "human_reference": example["human_reference"],
             "meaning_representation": mr_text
         }
+
 
 
 
