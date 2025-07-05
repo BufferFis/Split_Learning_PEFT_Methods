@@ -413,7 +413,11 @@ class SplitLoRATrainer:
         
         self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
         full_model = GPT2LMHeadModel.from_pretrained('gpt2')
-        self.DELIM = ":"  # More natural language connector
+        if self.DELIM not in self.tokenizer.get_vocab():
+            self.tokenizer.add_special_tokens({"additional_special_tokens": [self.DELIM]})
+            full_model.resize_token_embeddings(len(self.tokenizer))
+        self.DELIM = "<|gen|>"
+
         if self.tokenizer.pad_token is None:
             self.tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
             full_model.resize_token_embeddings(len(self.tokenizer))
@@ -427,6 +431,9 @@ class SplitLoRATrainer:
         # Keep vocab unchanged - no resize_token_embeddings!
         vocab = len(self.tokenizer)  # Should be exactly 50257
         full_model.config.vocab_size = vocab
+
+        if hasattr(full_model, 'generation_config'):
+            full_model.generation_config.vocab_size = vocab
         
         # Split model (no custom tokens to corrupt)
         head_model, body_model, tail_model = split_gpt2(full_model, head_layers, tail_layers)
@@ -462,13 +469,11 @@ class SplitLoRATrainer:
 
         
     def preprocess(self, example):
-        """Preprocessing method for individual examples"""
-        SEQUENCE_LENGTH = 128
+        SEQUENCE_LENGTH = 128  # RESTORE: Old sequence length
         mr_text = example["meaning_representation"]
         ref_text = example["human_reference"]
         
-        # Build full text
-        space_delim = " " + self.DELIM + " "  # " : "
+        space_delim = " " + self.DELIM + " "  # " <|gen|> "
         full_text = mr_text + space_delim + ref_text
         
         encoding = self.tokenizer(
@@ -479,27 +484,11 @@ class SplitLoRATrainer:
             return_attention_mask=True
         )
         
-        # FIXED: More robust delimiter finding
+        # RESTORE: Old simple masking
         labels = encoding["input_ids"].copy()
-        
-        # Find delimiter position in the full text
-        delim_pos_in_text = full_text.find(space_delim)
-        if delim_pos_in_text != -1:
-            # Find corresponding token position
-            prefix_text = full_text[:delim_pos_in_text + len(space_delim)]
-            prefix_tokens = self.tokenizer.encode(prefix_text, add_special_tokens=False)
-            
-            # Mask everything up to end of delimiter
-            mask_until = min(len(prefix_tokens), len(labels))
-            labels[:mask_until] = [-100] * mask_until
-        else:
-            # Fallback: mask first half
-            labels[:len(labels)//2] = [-100] * (len(labels)//2)
-        
-        # Mask padding tokens  
-        for i, token_id in enumerate(labels):
-            if token_id == self.tokenizer.pad_token_id:
-                labels[i] = -100
+        mr_tokens = self.tokenizer.encode(mr_text + space_delim, add_special_tokens=False)
+        labels[:len(mr_tokens)] = [-100] * len(mr_tokens)
+        labels = [-100 if tok == self.tokenizer.pad_token_id else tok for tok in labels]
         
         return {
             "input_ids": encoding["input_ids"],
@@ -508,6 +497,8 @@ class SplitLoRATrainer:
             "human_reference": example["human_reference"],
             "meaning_representation": mr_text
         }
+
+
 
     def load_e2e_dataset(self, debug_mode=False):
         """Improved preprocessing with optional debug mode"""
