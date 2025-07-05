@@ -414,11 +414,10 @@ class SplitLoRATrainer:
         self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
         full_model = GPT2LMHeadModel.from_pretrained('gpt2')
         self.DELIM = ":"  # More natural language connector
-        self.PAD = self.tokenizer.eos_token  # Use eos_token as pad
-        self.tokenizer.pad_token = self.tokenizer.eos_token
         if self.tokenizer.pad_token is None:
             self.tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
             full_model.resize_token_embeddings(len(self.tokenizer))
+        self.PAD = self.tokenizer.pad_token
         self.tokenizer.padding_side = "right"
         
         # Set generation config with existing vocabulary
