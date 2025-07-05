@@ -1256,7 +1256,7 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text, max_new_tokens=6
         # ULTRA SIMPLE beam search - no complex parameters
         beams = wrapper.generate(
             ids,
-            max_new_tokens=3,              # Shorter for E2E
+            max_new_tokens=30,              # Shorter for E2E
             num_beams=12,
             num_return_sequences=8,
             early_stopping=True,
