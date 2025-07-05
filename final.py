@@ -415,14 +415,34 @@ class SplitLoRATrainer:
         self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
         full_model = GPT2LMHeadModel.from_pretrained('gpt2')
         self.DELIM = "<|gen|>"
-        if self.DELIM not in self.tokenizer.get_vocab():
-            self.tokenizer.add_special_tokens({"additional_special_tokens": [self.DELIM]})
-            full_model.resize_token_embeddings(len(self.tokenizer))
-        
 
+         # FIXED: Properly initialize custom token embeddings
+        original_vocab_size = len(self.tokenizer)
+            # Add custom tokens
+        self.DELIM = "<|gen|>"
+        special_tokens = {"additional_special_tokens": [self.DELIM]}
+        
         if self.tokenizer.pad_token is None:
-            self.tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
-            full_model.resize_token_embeddings(len(self.tokenizer))
+            special_tokens["pad_token"] = "<|pad|>"
+        
+        num_added = self.tokenizer.add_special_tokens(special_tokens)
+        print(f"Added {num_added} special tokens")
+        
+        # CRITICAL: Resize and properly initialize embeddings
+        full_model.resize_token_embeddings(len(self.tokenizer))
+        
+        # FIXED: Initialize new token embeddings properly
+        if num_added > 0:
+            with torch.no_grad():
+                # Get existing embeddings
+                existing_embeddings = full_model.transformer.wte.weight[:original_vocab_size]
+                avg_embedding = existing_embeddings.mean(dim=0)
+                
+                # Initialize new token embeddings
+                for i in range(original_vocab_size, len(self.tokenizer)):
+                    # Initialize as average + small random noise
+                    full_model.transformer.wte.weight[i] = avg_embedding + torch.randn_like(avg_embedding) * 0.01
+        
         self.PAD = self.tokenizer.pad_token
         self.tokenizer.padding_side = "right"
         
