@@ -1273,10 +1273,10 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text, max_new_tokens=6
         # )
         beams = wrapper.generate(
             ids,
-            max_new_tokens=60,              # Very short
+            max_new_tokens=40,              # Very short
             do_sample=False,                # Pure greedy
             no_repeat_ngram_size=3,
-            early_stopping=True,
+            #early_stopping=True,
             eos_token_id=trainer.tokenizer.eos_token_id,
             pad_token_id=trainer.tokenizer.pad_token_id
         )
