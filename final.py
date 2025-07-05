@@ -984,11 +984,11 @@ def evaluate_official(preds,
         "cider":    float(fields[5])
     }
 
-def diagnose_preprocessing_detailed(trainer):
-    """Debug preprocessing step by step"""
+def diagnose_preprocessing_detailed_fixed(trainer):
+    """FIXED: Process raw data directly without dataset mapping"""
     print("=== DETAILED PREPROCESSING DIAGNOSIS ===")
     
-    # Get raw example
+    # Get raw example (no mapping) - same as your pattern
     from datasets import load_dataset
     dataset = load_dataset("e2e_nlg", trust_remote_code=True)
     raw_example = dataset["train"][0]
@@ -996,7 +996,7 @@ def diagnose_preprocessing_detailed(trainer):
     print(f"Raw MR: '{raw_example['meaning_representation']}'")
     print(f"Raw reference: '{raw_example['human_reference']}'")
     
-    # Process manually step by step
+    # Process manually step by step (KEEP all the detailed analysis)
     mr_text = raw_example["meaning_representation"]
     ref_text = raw_example["human_reference"]
     space_delim = " " + trainer.DELIM + " "
@@ -1004,7 +1004,7 @@ def diagnose_preprocessing_detailed(trainer):
     
     print(f"Full text: '{full_text}'")
     
-    # Tokenize
+    # Tokenize manually (no dataset mapping)
     encoding = trainer.tokenizer(
         full_text,
         max_length=128,
@@ -1012,7 +1012,6 @@ def diagnose_preprocessing_detailed(trainer):
         padding="max_length",
         return_attention_mask=True
     )
-
     
     print(f"Encoded length: {len(encoding['input_ids'])}")
     print(f"Input IDs: {encoding['input_ids'][:20]}")
@@ -1030,8 +1029,8 @@ def diagnose_preprocessing_detailed(trainer):
     else:
         print("❌ Delimiter not found in tokenized sequence!")
     
-    # Test current preprocessing
-    processed = trainer.preprocess(raw_example)
+    # FIXED: Process single example directly (no dataset mapping)
+    processed = trainer.preprocess(raw_example)  # Single processing, no dataset mapping
     labels = processed['labels']
     
     # Extract target (non -100 labels)
@@ -1046,6 +1045,7 @@ def diagnose_preprocessing_detailed(trainer):
         print(f"Got: '{target_text}'")
     else:
         print("✅ Target extraction is correct")
+
 
 def generate_with_sampling(trainer, wrapper, mr_text, ref_text, max_new_tokens=40):
     prompt = mr_text + " " + trainer.DELIM + " "
@@ -1227,12 +1227,10 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text, max_new_tokens=6
     
     return candidates[0]  # Return first valid candidate (no MBR for now)
 
-def diagnose_training_data(trainer):
+def diagnose_training_data(trainer, train_ds):
     """Check if training data makes sense"""
     print("=== TRAINING DATA DIAGNOSIS ===")
-    
-    # Load small sample
-    train_ds, _ = trainer.load_e2e_dataset(debug_mode=False)
+
     sample = train_ds[0]
     
     print(f"Input IDs: {sample['input_ids'][:20]}")
@@ -1339,7 +1337,7 @@ def main():
     
     if args.eval_only:
         train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
-        diagnose_training_data(trainer)
+        diagnose_training_data(trainer, train_ds)
         diagnose_preprocessing_detailed(trainer)
         diagnose_custom_token_embeddings(trainer)
         # quick manual check on one MR
