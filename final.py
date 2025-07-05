@@ -491,7 +491,7 @@ class SplitLoRATrainer:
 
         
     def preprocess(self, example):
-        SEQUENCE_LENGTH = 128
+        SEQUENCE_LENGTH = 256
         mr_text = example["meaning_representation"]
         ref_text = example["human_reference"]
         
@@ -1060,7 +1060,7 @@ def diagnose_preprocessing_detailed(trainer):
     # Tokenize manually (no dataset mapping)
     encoding = trainer.tokenizer(
         full_text,
-        max_length=128,
+        max_length=256,
         truncation=True,
         padding="max_length",
         return_attention_mask=True
@@ -1247,7 +1247,7 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text, max_new_tokens=6
         # ULTRA SIMPLE beam search - no complex parameters
         beams = wrapper.generate(
             ids,
-            max_new_tokens=20,              # Shorter for E2E
+            max_new_tokens=30,              # Shorter for E2E
             num_beams=10,
             num_return_sequences=10,
             early_stopping=True,
