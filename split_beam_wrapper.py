@@ -48,9 +48,9 @@ class SplitGPT2ForGeneration(PreTrainedModel, GenerationMixin):
                 attention_mask: Optional[torch.FloatTensor] = None,
                 **ignored):
         with torch.no_grad():
-            h = self.head_client.forward(input_ids)
-            b = self.server.forward(h)  # Pass attention_mask
-            logits = self.tail_client.forward(b)  
+            h = self.head_client.forward(input_ids, attention_mask)
+            b = self.server.forward(h, attention_mask)  # Pass attention_mask
+            logits = self.tail_client.forward(b, attention_mask)  
 
         return CausalLMOutput(logits=logits)
 
