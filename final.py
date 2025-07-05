@@ -272,7 +272,7 @@ class ServerModel:
         self.body_model.train()
         # Don't detach - maintain gradient connection
         activations.requires_grad_(True)
-        output = self.body_model(hidden_states=activations)
+        output = self.body_model(hidden_states=activations, attention_mask=attention_mask)
         return output.last_hidden_state, activations
     
     def backward(self, body_output, body_grad, head_activations):
@@ -317,7 +317,7 @@ class HeadClient:
         """Forward pass through head layers"""
         output = self.head_model(
             input_ids=input_ids, 
-            #attention_mask=attention_mask, 
+            attention_mask=attention_mask, 
             output_hidden_states=True
         )
         return output.hidden_states[-1]
@@ -350,7 +350,8 @@ class TailClient:
         
     def forward(self, body_activations, attention_mask=None):
         """Forward pass through tail layers"""
-        output = self.tail_model(inputs_embeds=body_activations)
+        output = self.tail_model(inputs_embeds=body_activations, 
+                                 attention_mask=attention_mask)
         return output.logits
     
     def compute_loss_and_backward(self, body_activations, labels, attention_mask=None):
@@ -413,10 +414,11 @@ class SplitLoRATrainer:
         
         self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
         full_model = GPT2LMHeadModel.from_pretrained('gpt2')
+        self.DELIM = "<|gen|>"
         if self.DELIM not in self.tokenizer.get_vocab():
             self.tokenizer.add_special_tokens({"additional_special_tokens": [self.DELIM]})
             full_model.resize_token_embeddings(len(self.tokenizer))
-        self.DELIM = "<|gen|>"
+        
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
