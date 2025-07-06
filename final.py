@@ -963,6 +963,42 @@ class SplitLoRATrainer:
             traceback.print_exc()
             return False
 
+def create_e2e_reference_file(test_dataset):
+    """Create the missing e2e_refs.tsv file from existing dataset"""
+    # No need to reload - use the dataset you already have!
+    
+    # Create the references directory
+    refs_dir = pathlib.Path(__file__).resolve().parent / "e2e-metrics" / "references"
+    refs_dir.mkdir(exist_ok=True)
+    
+    # Create the reference file
+    ref_file = refs_dir / "e2e_refs.tsv"
+    
+    with open(ref_file, 'w') as f:
+        # Write header
+        f.write("MR\treference\n")
+        
+        # Group by MR to handle multiple references
+        mr_refs = {}
+        for example in test_dataset:  # Use the passed dataset
+            mr = example["meaning_representation"]
+            ref = example["human_reference"]
+            
+            if mr not in mr_refs:
+                mr_refs[mr] = []
+            mr_refs[mr].append(ref)
+        
+        # Write grouped references
+        for mr, refs in mr_refs.items():
+            for ref in refs:
+                f.write(f"{mr}\t{ref}\n")
+    
+    print(f"✅ Created reference file: {ref_file}")
+    print(f"📊 Total MR-reference pairs: {len(test_dataset)}")
+    print(f"📊 Unique MRs: {len(mr_refs)}")
+    
+    return str(ref_file)
+
 
 
 # ─── Beam-search helpers ──────────────────────────────────────────────
@@ -1009,51 +1045,79 @@ def generate_with_beam(trainer, wrapper, mr_text, max_new_tokens=64):
 
 
 def evaluate_official(preds, mrs, grouped_refs, ref_file="references/e2e_refs.tsv"):
-    """FIXED: Create matching reference file for grouped evaluation"""
-    # 1) Write system outputs to temp file
+    """FIXED: Create proper multi-reference format for E2E evaluation"""
+    
+    # 1) Write system outputs to temp file (plain text format)
     with tempfile.NamedTemporaryFile('w', delete=False, suffix='.txt') as f:
-        f.write("\n".join(preds) + "\n")
+        for pred in preds:
+            f.write(pred + "\n")
         sys_file = f.name
 
-    # 2) Create grouped reference file that matches system output
-    temp_ref_file = tempfile.NamedTemporaryFile('w', delete=False, suffix='.txt')
-    temp_ref_file.close()
-    create_grouped_reference_file(mrs, grouped_refs, temp_ref_file.name)
+    # 2) Create reference file with multiple references (E2E format)
+    with tempfile.NamedTemporaryFile('w', delete=False, suffix='.txt') as f:
+        for refs in grouped_refs:
+            # Write first reference
+            f.write(refs[0] + "\n")
+            # Write additional references separated by empty lines
+            for additional_ref in refs[1:]:
+                f.write(additional_ref + "\n")
+            # Add empty line to separate different MR groups (if multiple refs exist)
+            if len(refs) > 1:
+                f.write("\n")
+        ref_file_path = f.name
 
     repo = pathlib.Path(__file__).resolve().parent / "e2e-metrics"
     
     try:
+        # Check if e2e-metrics directory exists
+        if not repo.exists():
+            print(f"Warning: E2E metrics directory not found at {repo}")
+            return {"bleu": 0.0, "nist": 0.0, "meteor": 0.0, "rouge_l": 0.0, "cider": 0.0}
+        
+        # Use plain text format (no -t flag needed for plain text)
         out = subprocess.check_output(
             ["python",
              str(repo / "measure_scores.py"),
-             "--python",
-             "-t",
-             temp_ref_file.name,  # Use our grouped reference file
-             sys_file], # System predictions
+             ref_file_path,  # Reference file (plain text)
+             sys_file],      # System predictions (plain text)
             text=True
         )
         
         # Parse output
-        last = [l for l in out.splitlines() if l.strip()][-1]
-        fields = last.split("\t")
-        return {
-            "bleu": float(fields[1]),
-            "nist": float(fields[2]),
-            "meteor": float(fields[3]),
-            "rouge_l": float(fields[4]),
-            "cider": float(fields[5])
-        }
+        lines = [l.strip() for l in out.splitlines() if l.strip()]
+        if not lines:
+            return {"bleu": 0.0, "nist": 0.0, "meteor": 0.0, "rouge_l": 0.0, "cider": 0.0}
+            
+        # Find the metrics line (usually the last non-empty line)
+        metrics_line = lines[-1]
+        fields = metrics_line.split("\t")
         
-    except Exception as e:
+        if len(fields) >= 6:
+            return {
+                "bleu": float(fields[1]),
+                "nist": float(fields[2]),
+                "meteor": float(fields[3]),
+                "rouge_l": float(fields[4]),
+                "cider": float(fields[5])
+            }
+        else:
+            print(f"Warning: Unexpected output format: {metrics_line}")
+            return {"bleu": 0.0, "nist": 0.0, "meteor": 0.0, "rouge_l": 0.0, "cider": 0.0}
+        
+    except subprocess.CalledProcessError as e:
         print(f"Official evaluation failed: {e}")
+        return {"bleu": 0.0, "nist": 0.0, "meteor": 0.0, "rouge_l": 0.0, "cider": 0.0}
+    except Exception as e:
+        print(f"Official evaluation error: {e}")
         return {"bleu": 0.0, "nist": 0.0, "meteor": 0.0, "rouge_l": 0.0, "cider": 0.0}
     finally:
         # Clean up temp files
         try:
             os.unlink(sys_file)
-            os.unlink(temp_ref_file.name)
+            os.unlink(ref_file_path)
         except:
             pass
+
 
 
 
@@ -1231,7 +1295,7 @@ def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
     
     # Official evaluation with grouped data
     try:
-        official = evaluate_official(grouped_preds, grouped_mrs)
+        official = evaluate_official(grouped_preds, grouped_mrs, grouped_refs)
         print(f"OFFICIAL BLEU: {official['bleu']:.2f} • "
             f"NIST {official['nist']:.4f} • "
             f"ROUGE-L {official['rouge_l']:.2f} •"
@@ -1489,6 +1553,8 @@ def main():
     
     if args.eval_only:
         train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
+        print("Creating E2E reference file...")
+        ref_file_path = create_e2e_reference_file(test_ds)  # Pass existing dataset
         diagnose_training_data(trainer, train_ds)
         diagnose_preprocessing_detailed(trainer)
         diagnose_custom_token_embeddings(trainer)
