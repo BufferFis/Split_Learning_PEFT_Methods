@@ -1010,41 +1010,50 @@ def generate_with_beam(trainer, wrapper, mr_text, max_new_tokens=64):
                                     skip_special_tokens=True).strip()
 
 
-def evaluate_official(preds,
-                      ref_file="references/e2e_refs.tsv"):
-    # 1) write system outputs to a temp file
+def evaluate_official(preds, mrs, ref_file="references/e2e_refs.tsv"):
+    """FIXED: Include source MRs for E2E evaluation"""
+    
+    # 1) Write system outputs to temp file
     with tempfile.NamedTemporaryFile('w', delete=False) as f:
         f.write("\n".join(preds) + "\n")
         sys_file = f.name
-
+    
+    # 2) Write source MRs to temp file  
+    with tempfile.NamedTemporaryFile('w', delete=False) as f:
+        f.write("\n".join(mrs) + "\n")
+        src_file = f.name
+    
     repo = pathlib.Path(__file__).resolve().parent / "e2e-metrics"
     ref_path = repo / ref_file
-
+    
     try:
         out = subprocess.check_output(
             ["python",
              str(repo / "measure_scores.py"),
-             "--python",          # pure-Python BLEU/NIST
-             "-t",               # TSV one-line output
-             str(ref_path),
-             sys_file],
+             "--python",
+             "-t",
+             str(ref_path),  # Reference file
+             sys_file,       # System predictions
+             src_file],      # ADDED: Source MRs file
             text=True
         )
     finally:
-        #os.unlink(sys_file)
-        pass  # keep the temp file for debugging
-
-    # 2) take the last non-empty line
+        # Clean up temp files
+        # os.unlink(sys_file)
+        # os.unlink(src_file)
+        pass
+    
+    # Parse output
     last = [l for l in out.splitlines() if l.strip()][-1]
-    fields = last.split("\t")          # 0 = sys name, 1..5 = scores
-
+    fields = last.split("\t")
     return {
-        "bleu":     float(fields[1]),
-        "nist":     float(fields[2]),
-        "meteor":   float(fields[3]),
-        "rouge_l":  float(fields[4]),
-        "cider":    float(fields[5])
+        "bleu": float(fields[1]),
+        "nist": float(fields[2]),
+        "meteor": float(fields[3]),
+        "rouge_l": float(fields[4]),
+        "cider": float(fields[5])
     }
+
 
 def diagnose_preprocessing_detailed(trainer):
     """FIXED: Process raw data directly without dataset mapping"""
@@ -1228,9 +1237,10 @@ def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
     
     # Prepare for official evaluation (which needs grouped references)
     grouped_preds = [bundle["pred"] for bundle in mr_groups.values()]
-    
-    # Official evaluation
-    official = evaluate_official(grouped_preds)  # uses the grouped references
+    grouped_mrs = list(mr_groups.keys())  # Extract the MRs
+
+    # Official evaluation - pass both predictions and MRs
+    official = evaluate_official(grouped_preds, grouped_mrs)  # Fixed: pass both arguments
     print(f"OFFICIAL BLEU: {official['bleu']:.2f} • "
           f"NIST {official['nist']:.4f} • "
           f"ROUGE-L {official['rouge_l']:.2f} •"
