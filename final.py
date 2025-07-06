@@ -963,41 +963,68 @@ class SplitLoRATrainer:
             traceback.print_exc()
             return False
 
-def create_e2e_reference_file(test_dataset):
-    """Create the missing e2e_refs.tsv file from existing dataset"""
-    # No need to reload - use the dataset you already have!
+
+import urllib.request
+import os
+import pandas as pd
+import pathlib
+
+def download_official_e2e_dataset():
+    """Download the official E2E testset_w_refs.csv file"""
+    url = "https://raw.githubusercontent.com/tuetschek/e2e-dataset/master/testset_w_refs.csv"
+    csv_file = "testset_w_refs.csv"
+    
+    if not os.path.exists(csv_file):
+        print("Downloading official E2E testset_w_refs.csv...")
+        urllib.request.urlretrieve(url, csv_file)
+        print(f"✅ Downloaded {csv_file}")
+    else:
+        print(f"✅ {csv_file} already exists")
+    
+    return csv_file
+
+
+def create_e2e_reference_file_from_official_csv():
+    """Create e2e_refs.tsv from the official CSV file"""
+    
+    # Download the official CSV file
+    csv_file = download_official_e2e_dataset()
+    
+    # Read the official CSV file
+    print("Reading official E2E CSV file...")
+    df = pd.read_csv(csv_file, encoding='utf-8')
+    
+    # Verify the structure
+    print(f"CSV columns: {list(df.columns)}")
+    print(f"Total rows: {len(df)}")
+    print(f"Sample data:\n{df.head()}")
     
     # Create the references directory
     refs_dir = pathlib.Path(__file__).resolve().parent / "e2e-metrics" / "references"
     refs_dir.mkdir(exist_ok=True)
     
-    # Create the reference file
+    # Create the reference TSV file
     ref_file = refs_dir / "e2e_refs.tsv"
     
-    with open(ref_file, 'w') as f:
-        # Write header
-        f.write("MR\treference\n")
+    with open(ref_file, 'w', encoding='utf-8') as f:
+        # Write TSV header (required for E2E metrics script)
+        f.write("mr\tref\n")
         
-        # Group by MR to handle multiple references
-        mr_refs = {}
-        for example in test_dataset:  # Use the passed dataset
-            mr = example["meaning_representation"]
-            ref = example["human_reference"]
-            
-            if mr not in mr_refs:
-                mr_refs[mr] = []
-            mr_refs[mr].append(ref)
-        
-        # Write grouped references
-        for mr, refs in mr_refs.items():
-            for ref in refs:
-                f.write(f"{mr}\t{ref}\n")
+        # Write all MR-reference pairs
+        for _, row in df.iterrows():
+            mr = str(row['mr']).replace('\t', ' ').replace('\n', ' ').replace('\r', ' ')
+            ref = str(row['ref']).replace('\t', ' ').replace('\n', ' ').replace('\r', ' ')
+            f.write(f"{mr}\t{ref}\n")
     
     print(f"✅ Created reference file: {ref_file}")
-    print(f"📊 Total MR-reference pairs: {len(test_dataset)}")
-    print(f"📊 Unique MRs: {len(mr_refs)}")
+    print(f"📊 Total MR-reference pairs: {len(df)}")
+    
+    # Count unique MRs for verification
+    unique_mrs = df['mr'].nunique()
+    print(f"📊 Unique MRs: {unique_mrs}")
     
     return str(ref_file)
+
 
 
 
@@ -1044,18 +1071,32 @@ def generate_with_beam(trainer, wrapper, mr_text, max_new_tokens=64):
                                     skip_special_tokens=True).strip()
 
 import re
+import subprocess
+import tempfile
+import pathlib
+
 def evaluate_official(preds, ref_file="references/e2e_refs.tsv"):
-    # collapse all whitespace incl. TAB and NL to a single space
+    """FIXED: Use official E2E reference file for evaluation"""
+    
+    # Clean predictions (collapse whitespace)
     clean_preds = [re.sub(r'\s+', ' ', p).strip() for p in preds]
-
-    with tempfile.NamedTemporaryFile('w', delete=False) as f:
-        f.write("\n".join(clean_preds) + "\n")    # now always 630 lines
+    
+    # Write system outputs to temp file
+    with tempfile.NamedTemporaryFile('w', delete=False, suffix='.txt', encoding='utf-8') as f:
+        f.write("\n".join(clean_preds) + "\n")
         sys_file = f.name
-
+    
     repo = pathlib.Path(__file__).resolve().parent / "e2e-metrics"
     ref_path = repo / ref_file
-
+    
     try:
+        # Check if reference file exists
+        if not ref_path.exists():
+            print(f"❌ Reference file {ref_path} not found")
+            print("Creating reference file from official dataset...")
+            create_e2e_reference_file_from_official_csv()
+        
+        # Run the official E2E evaluation script
         out = subprocess.check_output(
             ["python",
              str(repo / "measure_scores.py"),
@@ -1064,15 +1105,40 @@ def evaluate_official(preds, ref_file="references/e2e_refs.tsv"):
              sys_file],
             text=True
         )
+        
+        # Parse output
+        lines = [l.strip() for l in out.splitlines() if l.strip()]
+        if not lines:
+            return {"bleu": 0.0, "nist": 0.0, "meteor": 0.0, "rouge_l": 0.0, "cider": 0.0}
+        
+        # Find the metrics line (usually the last non-empty line)
+        metrics_line = lines[-1]
+        fields = metrics_line.split("\t")
+        
+        if len(fields) >= 6:
+            return {
+                "bleu": float(fields[1]),
+                "nist": float(fields[2]), 
+                "meteor": float(fields[3]),
+                "rouge_l": float(fields[4]),
+                "cider": float(fields[5])
+            }
+        else:
+            print(f"Warning: Unexpected output format: {metrics_line}")
+            return {"bleu": 0.0, "nist": 0.0, "meteor": 0.0, "rouge_l": 0.0, "cider": 0.0}
+            
+    except subprocess.CalledProcessError as e:
+        print(f"Official evaluation failed: {e}")
+        return {"bleu": 0.0, "nist": 0.0, "meteor": 0.0, "rouge_l": 0.0, "cider": 0.0}
+    except Exception as e:
+        print(f"Official evaluation error: {e}")
+        return {"bleu": 0.0, "nist": 0.0, "meteor": 0.0, "rouge_l": 0.0, "cider": 0.0}
     finally:
-        os.unlink(sys_file)
-
-    last = [l for l in out.splitlines() if l.strip()][-1]
-    b, n, m, r, c = map(float, last.split("\t")[1:6])
-    return dict(bleu=b, nist=n, meteor=m, rouge_l=r, cider=c)
-
-
-
+        # Clean up temp files
+        try:
+            os.unlink(sys_file)
+        except:
+            pass
 
 
 def diagnose_preprocessing_detailed(trainer):
@@ -1512,7 +1578,8 @@ def main():
     
     if args.eval_only:
         train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
-        
+        print("Setting up E2E evaluation with official dataset...")
+        create_e2e_reference_file_from_official_csv()
         diagnose_training_data(trainer, train_ds)
         diagnose_preprocessing_detailed(trainer)
         diagnose_custom_token_embeddings(trainer)
@@ -1536,7 +1603,14 @@ def main():
             print("✅ Generating normal text - period prediction might be normal")
 
         test_single_token_delimiters(trainer.tokenizer)
+        # Run evaluation
         results = evaluate_beam(trainer, wrapper, test_ds, n_samples=len(test_ds))
+        results_file = os.path.join(args.save_path, "evaluation_results.json")
+        with open(results_file, "w") as f:
+            json.dump(results, f, indent=2)
+        
+        print(f"Results saved to {results_file}")
+
         # Save evaluation results
         with open(os.path.join(args.save_path, "evaluation_results.json"), "w") as f:
             json.dump(results, f, indent=2)
