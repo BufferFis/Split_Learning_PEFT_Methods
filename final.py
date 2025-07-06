@@ -473,7 +473,7 @@ class SplitLoRATrainer:
         lora_config = LoraConfig(
             r=8,
             lora_alpha=32,
-            lora_dropout=0.05,
+            lora_dropout=0.1,
             bias="lora_only",
             use_dora=True,
             task_type="CAUSAL_LM",
@@ -500,7 +500,7 @@ class SplitLoRATrainer:
 
         
     def preprocess(self, example):
-        SEQUENCE_LENGTH = 128
+        SEQUENCE_LENGTH = 512
         mr_text = example["meaning_representation"]
         ref_text = example["human_reference"]
         
@@ -558,7 +558,7 @@ class SplitLoRATrainer:
     def create_dataloader(self, dataset, batch_size=8, shuffle=True, debug_mode=False):
         """FIXED: Consistent sequence length with debug support"""
         def collate_fn(batch):
-            FIXED_LENGTH = 128  # Match preprocessing length!
+            FIXED_LENGTH = 512  # Match preprocessing length!
             
             input_ids_batch = []
             attention_mask_batch = []
@@ -938,9 +938,9 @@ class SplitLoRATrainer:
             
             # Re-apply PEFT to the loaded models
             lora_config = LoraConfig(
-                r=8, lora_alpha=16, lora_dropout=0.1,
-                bias="none", use_dora=True, task_type="CAUSAL_LM",
-                target_modules=["c_attn", "c_proj"]
+                r=8, lora_alpha=32, lora_dropout=0.1,
+                bias="lora_only", use_dora=True, task_type="CAUSAL_LM",
+                target_modules=["c_attn", "c_proj", "c_fc"]
             )
             
             head_model = get_peft_model(head_model, lora_config)
@@ -1441,9 +1441,15 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text, max_new_tokens=6
     with torch.no_grad():
         # ULTRA SIMPLE beam search - no complex parameters
         output = wrapper.generate(
-            ids,
-            max_new_tokens=40,              # Very short
-            do_sample=False,                # Pure greedy
+                    ids,
+            max_new_tokens=80,
+            num_beams=10,
+            early_stopping=True,
+            do_sample=True,
+            top_p=0.9,
+            temperature=0.8,
+            length_penalty=0.9,
+            no_repeat_ngram_size=2,
             eos_token_id=trainer.tokenizer.eos_token_id,
             pad_token_id=trainer.tokenizer.pad_token_id,
             # NO OTHER PARAMETERS AT ALL
@@ -1540,7 +1546,7 @@ def main():
     parser = argparse.ArgumentParser(description="SplitLoRA Single File Implementation")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for training")
     parser.add_argument("--epochs", type=int, default=1, help="Number of training epochs")
-    parser.add_argument("--learning_rate", type=float, default=2e-5, help="Learning rate")
+    parser.add_argument("--learning_rate", type=float, default=2e-4, help="Learning rate")
     parser.add_argument("--warmup_steps", type=int, default=500)
     parser.add_argument("--max_epochs",  type=int, default=5)
     parser.add_argument("--eval_only", action="store_true", help="Only run evaluation")
