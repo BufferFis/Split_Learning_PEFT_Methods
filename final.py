@@ -1209,7 +1209,7 @@ def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
     for mr, data in tqdm(mr_groups.items(), desc="Generating"):
         if not data["generated"]:
             try:
-                pred = generate_with_beam(trainer, wrapper, mr)
+                pred = generate_with_beam_mbr(trainer, wrapper, mr)
                 grouped_preds.append(pred)
                 grouped_mrs.append(mr)
                 grouped_refs.append(data["refs"])  # Multiple refs per MR
