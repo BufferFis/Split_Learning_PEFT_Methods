@@ -984,7 +984,6 @@ def generate_with_beam(trainer, wrapper, mr_text, max_new_tokens=64):
     with torch.no_grad():
         out = wrapper.generate(
                 ids, 
-                attention_mask=m,
                 # FIXED PARAMETERS:
                 max_new_tokens=64,          # Keep this
                 min_length=ids.size(1) + 10,  # Ensure minimum output length
@@ -997,12 +996,11 @@ def generate_with_beam(trainer, wrapper, mr_text, max_new_tokens=64):
                 # FIXED TOKEN IDs:
                 eos_token_id=trainer.tokenizer.eos_token_id,  # Proper EOS
                 pad_token_id=trainer.tokenizer.pad_token_id,  # Your custom pad
-                bos_token_id=trainer.tokenizer.bos_token_id,  # Add BOS
                 
                 # REMOVE PROBLEMATIC PROCESSOR:
                 # Remove the MinLengthLogitsProcessor from here
                 remove_invalid_values=True,
-                do_sample=False,            # Ensure deterministic beam search
+                #do_sample=False,            # Ensure deterministic beam search
                 temperature=1.0,            # Keep neutral
             )
     
@@ -1209,7 +1207,7 @@ def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
     for mr, data in tqdm(mr_groups.items(), desc="Generating"):
         if not data["generated"]:
             try:
-                pred = generate_with_beam_mbr(trainer, wrapper, mr)
+                pred = generate_with_beam(trainer, wrapper, mr)
                 grouped_preds.append(pred)
                 grouped_mrs.append(mr)
                 grouped_refs.append(data["refs"])  # Multiple refs per MR
