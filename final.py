@@ -1253,40 +1253,33 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text, max_new_tokens=6
     bad_tokens = trainer.tokenizer.encode("_*#-=.", add_special_tokens=False)
     with torch.no_grad():
         # ULTRA SIMPLE beam search - no complex parameters
-        beams = wrapper.generate(
+        output = wrapper.generate(
             ids,
-            max_new_tokens=50,              # Shorter for E2E
-            num_beams=12,
-            num_return_sequences=8,
-            early_stopping=True,
-            length_penalty=1.1,             # Neutral
-            no_repeat_ngram_size=3,
-            repetition_penalty=1.3,  # Strong penalty
-            # IMPROVED diversity
-            diversity_penalty=0.3,      # Add diversity
-            num_beam_groups=3,          # Group beams for diversity
+            max_new_tokens=40,              # Very short
+            do_sample=False,                # Pure greedy
             eos_token_id=trainer.tokenizer.eos_token_id,
             pad_token_id=trainer.tokenizer.pad_token_id,
-            bad_words_ids=[bad_tokens],
-            do_sample=False,
+            # NO OTHER PARAMETERS AT ALL
         )
 
     # Extract candidates
-    candidates = []
-    for beam in beams:
-        generated_part = beam[ids.size(1):]
-        candidate = trainer.tokenizer.decode(generated_part, skip_special_tokens=True).strip()
+    # candidates = []
+    # for beam in beams:
+    #     generated_part = beam[ids.size(1):]
+    #     candidate = trainer.tokenizer.decode(generated_part, skip_special_tokens=True).strip()
         
-        symbol_count = sum(1 for c in candidate if c in '_*#-.=|[]')
-        total_chars = len(candidate)
-        symbol_ratio = symbol_count / max(total_chars, 1)
-        if symbol_ratio < 0.3 and len(candidate.split()) >= 2:  # Less than 30% 
-            candidates.append(candidate)
-        if not candidates:
-            return "The restaurant serves food"
+    #     symbol_count = sum(1 for c in candidate if c in '_*#-.=|[]')
+    #     total_chars = len(candidate)
+    #     symbol_ratio = symbol_count / max(total_chars, 1)
+    #     if symbol_ratio < 0.3 and len(candidate.split()) >= 2:  # Less than 30% 
+    #         candidates.append(candidate)
+    #     if not candidates:
+    #         return "The restaurant serves food"
     
     # Return best candidate or fallback
-    return candidates[0]
+    # return candidates[0]/
+    result = trainer.tokenizer.decode(output[0][ids.size(1):], skip_special_tokens=True).strip()
+    return result
 
 def diagnose_training_data(trainer, train_ds):
     """Check if training data makes sense"""
