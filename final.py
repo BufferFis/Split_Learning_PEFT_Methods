@@ -963,6 +963,42 @@ class SplitLoRATrainer:
             traceback.print_exc()
             return False
 
+def create_e2e_reference_file(test_dataset):
+    """Create the missing e2e_refs.tsv file from existing dataset"""
+    # No need to reload - use the dataset you already have!
+    
+    # Create the references directory
+    refs_dir = pathlib.Path(__file__).resolve().parent / "e2e-metrics" / "references"
+    refs_dir.mkdir(exist_ok=True)
+    
+    # Create the reference file
+    ref_file = refs_dir / "e2e_refs.tsv"
+    
+    with open(ref_file, 'w') as f:
+        # Write header
+        f.write("MR\treference\n")
+        
+        # Group by MR to handle multiple references
+        mr_refs = {}
+        for example in test_dataset:  # Use the passed dataset
+            mr = example["meaning_representation"]
+            ref = example["human_reference"]
+            
+            if mr not in mr_refs:
+                mr_refs[mr] = []
+            mr_refs[mr].append(ref)
+        
+        # Write grouped references
+        for mr, refs in mr_refs.items():
+            for ref in refs:
+                f.write(f"{mr}\t{ref}\n")
+    
+    print(f"✅ Created reference file: {ref_file}")
+    print(f"📊 Total MR-reference pairs: {len(test_dataset)}")
+    print(f"📊 Unique MRs: {len(mr_refs)}")
+    
+    return str(ref_file)
+
 
 
 # ─── Beam-search helpers ──────────────────────────────────────────────
@@ -1007,53 +1043,35 @@ def generate_with_beam(trainer, wrapper, mr_text, max_new_tokens=64):
     return trainer.tokenizer.decode(out[0, ids.size(1):],
                                     skip_special_tokens=True).strip()
 
+import re
+def evaluate_official(preds, ref_file="references/e2e_refs.tsv"):
+    # collapse all whitespace incl. TAB and NL to a single space
+    clean_preds = [re.sub(r'\s+', ' ', p).strip() for p in preds]
 
-def evaluate_official(preds, mrs, grouped_refs, ref_file="references/e2e_refs.tsv"):
-    """FIXED: Create matching reference file for grouped evaluation"""
-    # 1) Write system outputs to temp file
-    with tempfile.NamedTemporaryFile('w', delete=False, suffix='.txt') as f:
-        f.write("\n".join(preds) + "\n")
+    with tempfile.NamedTemporaryFile('w', delete=False) as f:
+        f.write("\n".join(clean_preds) + "\n")    # now always 630 lines
         sys_file = f.name
 
-    # 2) Create grouped reference file that matches system output
-    temp_ref_file = tempfile.NamedTemporaryFile('w', delete=False, suffix='.txt')
-    temp_ref_file.close()
-    create_grouped_reference_file(mrs, grouped_refs, temp_ref_file.name)
-
     repo = pathlib.Path(__file__).resolve().parent / "e2e-metrics"
-    
+    ref_path = repo / ref_file
+
     try:
         out = subprocess.check_output(
             ["python",
              str(repo / "measure_scores.py"),
-             "--python",
-             "-t",
-             temp_ref_file.name,  # Use our grouped reference file
-             sys_file], # System predictions
+             "--python", "-t",
+             str(ref_path),
+             sys_file],
             text=True
         )
-        
-        # Parse output
-        last = [l for l in out.splitlines() if l.strip()][-1]
-        fields = last.split("\t")
-        return {
-            "bleu": float(fields[1]),
-            "nist": float(fields[2]),
-            "meteor": float(fields[3]),
-            "rouge_l": float(fields[4]),
-            "cider": float(fields[5])
-        }
-        
-    except Exception as e:
-        print(f"Official evaluation failed: {e}")
-        return {"bleu": 0.0, "nist": 0.0, "meteor": 0.0, "rouge_l": 0.0, "cider": 0.0}
     finally:
-        # Clean up temp files
-        try:
-            os.unlink(sys_file)
-            os.unlink(temp_ref_file.name)
-        except:
-            pass
+        os.unlink(sys_file)
+
+    last = [l for l in out.splitlines() if l.strip()][-1]
+    b, n, m, r, c = map(float, last.split("\t")[1:6])
+    return dict(bleu=b, nist=n, meteor=m, rouge_l=r, cider=c)
+
+
 
 
 
@@ -1192,69 +1210,74 @@ def diagnose_custom_token_embeddings(trainer):
         print("❌ Unicode corruption detected in tokenizer decode!")
 
 def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
-    """FIXED: Use grouped evaluation like your past working code"""
-    bleu = load_metric("bleu")
+    """Compute BLEU & METEOR on `n_samples` examples using beam search."""
+    bleu   = load_metric("bleu")
     meteor = load_metric("meteor")
-    
     eval_split = dataset.select(range(min(n_samples, len(dataset))))
-    
-    # GROUP BY UNIQUE MRs (like your past working code)
-    mr_groups = {}
-    for sample in tqdm(eval_split, desc="Grouping by MR"):
-        mr = sample["meaning_representation"]
-        if mr not in mr_groups:
-            mr_groups[mr] = {"refs": [], "generated": False}
-        mr_groups[mr]["refs"].append(sample["human_reference"])
-    
-    print(f"Found {len(mr_groups)} unique MRs (should be ~693)")
-    
-    # Generate ONE prediction per unique MR
-    grouped_preds = []
-    grouped_mrs = []
-    grouped_refs = []
-    
-    for mr, data in tqdm(mr_groups.items(), desc="Generating"):
-        if not data["generated"]:
+
+    # ------------- generate once per MR, collect refs ----------------
+    store = {}                                   # mr → {"pred": str, "refs": [str]}
+    for sample in tqdm(eval_split, desc="Evaluating", unit="sample"):
+        mr   = sample["meaning_representation"]
+        ref  = sample["human_reference"]         # singular in the dataset
+        # generate only the first time we meet this MR
+        if mr not in store:
             try:
-                pred = generate_with_beam(trainer, wrapper, mr)
-                grouped_preds.append(pred)
-                grouped_mrs.append(mr)
-                grouped_refs.append(data["refs"])  # Multiple refs per MR
-                data["generated"] = True
+                pred = generate_with_beam_mbr(
+                           trainer, wrapper, mr, ref)      # any ref is fine
             except Exception as e:
-                print(f"Generation failed for MR: {e}")
-                grouped_preds.append("The restaurant serves food")
-                grouped_mrs.append(mr)
-                grouped_refs.append(data["refs"])
-    
-    print(f"Generated {len(grouped_preds)} predictions for {len(grouped_mrs)} unique MRs")
-    
-    # Official evaluation with grouped data
-    try:
-        official = evaluate_official(grouped_preds, grouped_mrs)
-        print(f"OFFICIAL BLEU: {official['bleu']:.2f} • "
-            f"NIST {official['nist']:.4f} • "
-            f"ROUGE-L {official['rouge_l']:.2f} •"
-            "Meteor {official['meteor']:.2f} • ")
-    except Exception as e:
-        print(f"Official evaluation failed: {e}")
-        official = {"bleu": 0.0, "nist": 0.0, "meteor": 0.0, "rouge_l": 0.0, "cider": 0.0}
-    
-    # Compute metrics using grouped references
-    bleu_score = bleu.compute(predictions=grouped_preds, references=grouped_refs)["bleu"]
-    
-    # For METEOR, use first reference per group
-    meteor_score = meteor.compute(
-        predictions=grouped_preds, 
-        references=[refs[0] for refs in grouped_refs]
-    )["meteor"]
-    print(f"BLEU: {bleu_score:.4f} • METEOR: {meteor_score:.4f} • Unique MRs: {len(grouped_mrs)}")
-    return {
-        "bleu": bleu_score, 
-        "meteor": meteor_score, 
-        "unique_mrs": len(grouped_mrs),
-        **official
-    }
+                print("generation failed:", e)
+                pred = "empty"
+            store[mr] = {"pred": pred, "refs": [ref]}
+        else:
+            store[mr]["refs"].append(ref)
+
+    # ------------- prepare lists for evaluate.compute ----------------
+    preds, refs, fails = [], [], 0
+
+    for mr, bundle in store.items():
+            if bundle["pred"] == "empty":
+                fails += 1
+                continue
+            preds.append(bundle["pred"])
+            refs.append(bundle["refs"])          # list-of-refs for this MR
+
+    if not preds:
+        return {"bleu": 0.0, "meteor": 0.0, "failed": len(store)}
+
+    ref_sets = list(map(list, zip(*refs)))      # shape: n_refs × n_sents
+
+    max_refs = max(len(r) for r in refs)
+    ref_sets = [
+        [sent_refs[i] if i < len(sent_refs) else ""          # fillvalue=""
+        for sent_refs in refs]                              # traverse sequences
+        for i in range(max_refs)                             # traverse ref indices
+    ]
+
+    official = evaluate_official(preds)           # uses the existing refs
+    print(f"OFFICIAL BLEU: {official['bleu']:.2f} • "
+        f"NIST {official['nist']:.4f} • "
+        f"ROUGE-L {official['rouge_l']:.2f}  •"
+        f"Meteor {official['meteor']:.2f} • ")
+
+    sb = SBLEU(tokenize="13a",             # WMT / leaderboard tokeniser
+            smooth_method="exp",        # same smoothing as HF metric
+            smooth_value=0.0,
+            effective_order=True)       # ignore higher n if sent < n words
+
+    sacre_score = sb.corpus_score(preds, ref_sets).score / 100
+
+    # ------------- corpus-level multi-reference BLEU -----------------
+    bleu_score = bleu.compute(predictions=preds,
+                            references=refs,   # <-- list-of-lists
+                            smooth=True)["bleu"]
+
+    meteor_score = meteor.compute(predictions=preds,
+                                references=[r[0] for r in refs])["meteor"]
+
+    print(f"BLEU  : {bleu_score:.4f}  •  METEOR: {meteor_score:.4f}  •  SBLUE {sacre_score:.4f}  • failed {fails}/{len(store)}")
+    return {"bleu": bleu_score, "meteor": meteor_score, "failed": fails, "sacrebleu": sacre_score, **official}
+
 
 
 # def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
@@ -1459,7 +1482,7 @@ def main():
     parser.add_argument("--save_path", type=str, default="./splitlora_checkpoint", help="Path to save checkpoint")
     parser.add_argument("--gpu_device", type=str, default="1", help="GPU device to use")
     args = parser.parse_args()
-    
+    os.makedirs(args.save_path, exist_ok=True)
     trainer = SplitLoRATrainer(model_name="gpt2",
                            head_layers=2,
                            tail_layers=2,
@@ -1489,6 +1512,7 @@ def main():
     
     if args.eval_only:
         train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
+        
         diagnose_training_data(trainer, train_ds)
         diagnose_preprocessing_detailed(trainer)
         diagnose_custom_token_embeddings(trainer)
