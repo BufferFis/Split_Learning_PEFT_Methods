@@ -1230,7 +1230,7 @@ def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
     grouped_preds = [bundle["pred"] for bundle in mr_groups.values()]
     
     # Official evaluation
-    official = evaluate_official(grouped_preds)  # uses the grouped references
+    official = evaluate_official(preds)  # uses the grouped references
     print(f"OFFICIAL BLEU: {official['bleu']:.2f} • "
           f"NIST {official['nist']:.4f} • "
           f"ROUGE-L {official['rouge_l']:.2f} •"
