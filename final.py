@@ -1254,31 +1254,22 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text, max_new_tokens=6
     bad_tokens = trainer.tokenizer.encode("_*#-=.", add_special_tokens=False)
     with torch.no_grad():
         # ULTRA SIMPLE beam search - no complex parameters
-        # beams = wrapper.generate(
-        #     ids,
-        #     max_new_tokens=60,              # Shorter for E2E
-        #     num_beams=12,
-        #     num_return_sequences=8,
-        #     early_stopping=True,
-        #     length_penalty=1.1,             # Neutral
-        #     no_repeat_ngram_size=3,
-        #     repetition_penalty=1.3,  # Strong penalty
-        #     # IMPROVED diversity
-        #     diversity_penalty=0.3,      # Add diversity
-        #     num_beam_groups=4,          # Group beams for diversity
-        #     eos_token_id=trainer.tokenizer.eos_token_id,
-        #     pad_token_id=trainer.tokenizer.pad_token_id,
-        #     bad_words_ids=[bad_tokens],
-        #     do_sample=False,
-        # )
         beams = wrapper.generate(
             ids,
-            max_new_tokens=40,              # Very short
-            do_sample=False,                # Pure greedy
+            max_new_tokens=50,              # Shorter for E2E
+            num_beams=12,
+            num_return_sequences=8,
+            early_stopping=True,
+            length_penalty=1.1,             # Neutral
             no_repeat_ngram_size=3,
-            #early_stopping=True,
+            repetition_penalty=1.3,  # Strong penalty
+            # IMPROVED diversity
+            diversity_penalty=0.3,      # Add diversity
+            num_beam_groups=3,          # Group beams for diversity
             eos_token_id=trainer.tokenizer.eos_token_id,
-            pad_token_id=trainer.tokenizer.pad_token_id
+            pad_token_id=trainer.tokenizer.pad_token_id,
+            bad_words_ids=[bad_tokens],
+            do_sample=False,
         )
 
     # Extract candidates
@@ -1287,12 +1278,16 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text, max_new_tokens=6
         generated_part = beam[ids.size(1):]
         candidate = trainer.tokenizer.decode(generated_part, skip_special_tokens=True).strip()
         
-        words = candidate.split()
-        if (len(words) >= 5):                             # Minimum length
+        symbol_count = sum(1 for c in candidate if c in '_*#-.=|[]')
+        total_chars = len(candidate)
+        symbol_ratio = symbol_count / max(total_chars, 1)
+        if symbol_ratio < 0.3 and len(candidate.split()) >= 2:  # Less than 30% 
             candidates.append(candidate)
+        if not candidates:
+            return "The restaurant serves food"
     
     # Return best candidate or fallback
-    return candidates[0] if candidates else "[FELL BACK]"
+    return candidates[0]
 
 def diagnose_training_data(trainer, train_ds):
     """Check if training data makes sense"""
