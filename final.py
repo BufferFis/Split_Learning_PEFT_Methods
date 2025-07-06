@@ -1176,74 +1176,77 @@ def diagnose_custom_token_embeddings(trainer):
 
 def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
     """Compute BLEU & METEOR on `n_samples` examples using beam search."""
-    bleu   = load_metric("bleu")
+    bleu = load_metric("bleu")
     meteor = load_metric("meteor")
+    
     eval_split = dataset.select(range(min(n_samples, len(dataset))))
-
-    # ------------- generate once per MR, collect refs ----------------
-    store = {}                                   # mr → {"pred": str, "refs": [str]}
+    
+    # FIXED: Generate one prediction per test example, not per unique MR
+    preds, refs_list, fails = [], [], 0
+    
+    # Store unique MR predictions to avoid redundant generation
+    mr_cache = {}
+    
     for sample in tqdm(eval_split, desc="Evaluating", unit="sample"):
-        mr   = sample["meaning_representation"]
-        ref  = sample["human_reference"]         # singular in the dataset
-        # generate only the first time we meet this MR
-        if mr not in store:
+        mr = sample["meaning_representation"]
+        ref = sample["human_reference"]
+        
+        # Generate prediction (use cache for efficiency)
+        if mr not in mr_cache:
             try:
-                pred = generate_with_beam_mbr(
-                           trainer, wrapper, mr, ref)      # any ref is fine
+                pred = generate_with_beam_mbr(trainer, wrapper, mr, ref)
+                if not pred or pred.strip() == "":
+                    pred = "The restaurant serves food"
             except Exception as e:
                 print("generation failed:", e)
-                pred = "empty"
-            store[mr] = {"pred": pred, "refs": [ref]}
+                pred = "The restaurant serves food"
+            mr_cache[mr] = pred
         else:
-            store[mr]["refs"].append(ref)
-
-    # ------------- prepare lists for evaluate.compute ----------------
-
-    preds, refs, fails = [], [], 0
-    
-
-    for mr, bundle in store.items():
-        preds.append(bundle["pred"] if bundle["pred"] != "empty" else "The restaurant serves food")
-        refs.append(bundle["refs"])
-        if bundle["pred"] == "empty":
+            pred = mr_cache[mr]
+        
+        # FIXED: Add one prediction per test example
+        preds.append(pred)
+        refs_list.append([ref])  # Single reference per example
+        
+        if pred == "The restaurant serves food":
             fails += 1
-
-    if not preds:
-        return {"bleu": 0.0, "meteor": 0.0, "failed": len(store)}
     
-    ref_sets = list(map(list, zip(*refs)))      # shape: n_refs × n_sents
-
-    max_refs = max(len(r) for r in refs)
-    ref_sets = [
-        [sent_refs[i] if i < len(sent_refs) else ""          # fillvalue=""
-        for sent_refs in refs]                              # traverse sentences
-        for i in range(max_refs)                             # traverse ref indices
-    ]
-
-    official = evaluate_official(preds)           # uses the 9 refs
+    if not preds:
+        return {"bleu": 0.0, "meteor": 0.0, "failed": len(eval_split)}
+    
+    # Now preds and refs_list have same length as eval_split
+    print(f"Generated {len(preds)} predictions for {len(eval_split)} examples")
+    
+    # Multi-reference preparation for corpus-level metrics
+    # Group by MR for multi-reference evaluation
+    mr_groups = {}
+    for i, sample in enumerate(eval_split):
+        mr = sample["meaning_representation"]
+        if mr not in mr_groups:
+            mr_groups[mr] = {"pred": preds[i], "refs": []}
+        mr_groups[mr]["refs"].append(sample["human_reference"])
+    
+    # Prepare for official evaluation (which needs grouped references)
+    grouped_preds = [bundle["pred"] for bundle in mr_groups.values()]
+    
+    # Official evaluation
+    official = evaluate_official(grouped_preds)  # uses the grouped references
     print(f"OFFICIAL BLEU: {official['bleu']:.2f} • "
-        f"NIST {official['nist']:.4f} • "
-        f"ROUGE-L {official['rouge_l']:.2f}  •"
-        f"Meteor {official['meteor']:.2f} • ")
-
-
-    sb = SBLEU(tokenize="13a",             # WMT / leaderboard tokeniser
-            smooth_method="exp",        # same smoothing as HF metric
-            smooth_value=0.0,
-            effective_order=True)       # ignore higher n if sent < n words
-
-    sacre_score = sb.corpus_score(preds, ref_sets).score / 100
-
-    # ------------- corpus-level multi-reference BLEU -----------------
-    bleu_score = bleu.compute(predictions=preds,
-                            references=refs,   # <-- list-of-lists
-                            smooth=True)["bleu"]
-
-    meteor_score = meteor.compute(predictions=preds,
-                                references=[r[0] for r in refs])["meteor"]
-
-    print(f"BLEU  : {bleu_score:.4f}  •  METEOR: {meteor_score:.4f}  •  SBLUE {sacre_score:.4f}  • failed {fails}/{len(store)}")
+          f"NIST {official['nist']:.4f} • "
+          f"ROUGE-L {official['rouge_l']:.2f} •"
+          f"Meteor {official['meteor']:.2f} • ")
+    
+    # Per-example metrics
+    sb = SBLEU(tokenize="13a", smooth_method="exp", smooth_value=0.0, effective_order=True)
+    sacre_score = sb.corpus_score(preds, [[ref[0]] for ref in refs_list]).score / 100
+    
+    bleu_score = bleu.compute(predictions=preds, references=refs_list, smooth=True)["bleu"]
+    meteor_score = meteor.compute(predictions=preds, references=[r[0] for r in refs_list])["meteor"]
+    
+    print(f"BLEU : {bleu_score:.4f} • METEOR: {meteor_score:.4f} • SBLUE {sacre_score:.4f} • failed {fails}/{len(preds)}")
+    
     return {"bleu": bleu_score, "meteor": meteor_score, "failed": fails, "sacrebleu": sacre_score, **official}
+
 
 # ─── MBR beam search ────────────────────────────────────────────────
 def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text, max_new_tokens=64, k=10):
