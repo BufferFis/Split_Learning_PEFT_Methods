@@ -388,7 +388,7 @@ class TailClient:
         entropy_loss = -torch.mean(entropy)  # Encourage high entropy
         
         # OPTIMIZED: Stronger entropy weight for E2E NLG
-        beta = 0.15  # INCREASED from 0.1
+        beta = 0.05 
         total_loss = loss + beta * entropy_loss
         
         # Check for NaN loss
