@@ -1028,15 +1028,18 @@ def evaluate_official(preds, mrs, ref_file="references/e2e_refs.tsv"):
     
     try:
         out = subprocess.check_output(
-            ["python",
-             str(repo / "measure_scores.py"),
-             "--python",
-             "-t",
-             str(ref_path),  # Reference file
-             sys_file,       # System predictions
-             src_file],      # ADDED: Source MRs file
-            text=True
-        )
+        ["python",
+        str(repo / "measure_scores.py"),
+        "--python",
+        "-t",
+        "-s", src_file,  # ✅ Use -s flag for source file
+        str(ref_path), # Reference file
+        sys_file], # System predictions
+        text=True
+    )
+
+        
+
     finally:
         # Clean up temp files
         # os.unlink(sys_file)
