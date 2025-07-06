@@ -1000,7 +1000,7 @@ def generate_with_beam(trainer, wrapper, mr_text, max_new_tokens=64):
                 # REMOVE PROBLEMATIC PROCESSOR:
                 # Remove the MinLengthLogitsProcessor from here
                 remove_invalid_values=True,
-                #do_sample=False,            # Ensure deterministic beam search
+                do_sample=True,            # Ensure deterministic beam search
                 temperature=1.0,            # Keep neutral
             )
     
@@ -1008,52 +1008,53 @@ def generate_with_beam(trainer, wrapper, mr_text, max_new_tokens=64):
                                     skip_special_tokens=True).strip()
 
 
-def evaluate_official(preds, mrs, ref_file="references/e2e_refs.tsv"):
-    """FIXED: Include source MRs for E2E evaluation"""
-    
+def evaluate_official(preds, mrs, grouped_refs, ref_file="references/e2e_refs.tsv"):
+    """FIXED: Create matching reference file for grouped evaluation"""
     # 1) Write system outputs to temp file
-    with tempfile.NamedTemporaryFile('w', delete=False) as f:
+    with tempfile.NamedTemporaryFile('w', delete=False, suffix='.txt') as f:
         f.write("\n".join(preds) + "\n")
         sys_file = f.name
-    
-    # 2) Write source MRs to temp file  
-    with tempfile.NamedTemporaryFile('w', delete=False) as f:
-        f.write("\n".join(mrs) + "\n")
-        src_file = f.name
-    
+
+    # 2) Create grouped reference file that matches system output
+    temp_ref_file = tempfile.NamedTemporaryFile('w', delete=False, suffix='.txt')
+    temp_ref_file.close()
+    create_grouped_reference_file(mrs, grouped_refs, temp_ref_file.name)
+
     repo = pathlib.Path(__file__).resolve().parent / "e2e-metrics"
-    ref_path = repo / ref_file
     
     try:
         out = subprocess.check_output(
             ["python",
-            str(repo / "measure_scores.py"),
-            "--python",
-            "-t",
-            str(ref_path), # Reference file
-            sys_file], # System predictions
+             str(repo / "measure_scores.py"),
+             "--python",
+             "-t",
+             temp_ref_file.name,  # Use our grouped reference file
+             sys_file], # System predictions
             text=True
         )
-
-
         
-
+        # Parse output
+        last = [l for l in out.splitlines() if l.strip()][-1]
+        fields = last.split("\t")
+        return {
+            "bleu": float(fields[1]),
+            "nist": float(fields[2]),
+            "meteor": float(fields[3]),
+            "rouge_l": float(fields[4]),
+            "cider": float(fields[5])
+        }
+        
+    except Exception as e:
+        print(f"Official evaluation failed: {e}")
+        return {"bleu": 0.0, "nist": 0.0, "meteor": 0.0, "rouge_l": 0.0, "cider": 0.0}
     finally:
         # Clean up temp files
-        # os.unlink(sys_file)
-        # os.unlink(src_file)
-        pass
-    
-    # Parse output
-    last = [l for l in out.splitlines() if l.strip()][-1]
-    fields = last.split("\t")
-    return {
-        "bleu": float(fields[1]),
-        "nist": float(fields[2]),
-        "meteor": float(fields[3]),
-        "rouge_l": float(fields[4]),
-        "cider": float(fields[5])
-    }
+        try:
+            os.unlink(sys_file)
+            os.unlink(temp_ref_file.name)
+        except:
+            pass
+
 
 
 def diagnose_preprocessing_detailed(trainer):
@@ -1149,6 +1150,14 @@ def generate_with_sampling(trainer, wrapper, mr_text, ref_text, max_new_tokens=4
     result = trainer.tokenizer.decode(output[0][ids.size(1):], skip_special_tokens=True).strip()
     return result
 
+def create_grouped_reference_file(grouped_mrs, grouped_refs, temp_path):
+    """Create a reference file that matches grouped evaluation structure"""
+    with open(temp_path, 'w') as f:
+        for refs in grouped_refs:
+            # Use the first reference for each MR group
+            f.write(refs[0] + "\n")
+    return temp_path
+
 
 def diagnose_custom_token_embeddings(trainer):
     """Check if custom token embeddings are corrupted"""
@@ -1239,7 +1248,7 @@ def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
         predictions=grouped_preds, 
         references=[refs[0] for refs in grouped_refs]
     )["meteor"]
-    
+    print(f"BLEU: {bleu_score:.4f} • METEOR: {meteor_score:.4f} • Unique MRs: {len(grouped_mrs)}")
     return {
         "bleu": bleu_score, 
         "meteor": meteor_score, 
@@ -1330,6 +1339,8 @@ def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
 #     print(f"BLEU : {bleu_score:.4f} • METEOR: {meteor_score:.4f} • SBLUE {sacre_score:.4f} • failed {fails}/{len(preds)}")
     
 #     return {"bleu": bleu_score, "meteor": meteor_score, "failed": fails, "sacrebleu": sacre_score, **official}
+
+
 
 
 # ─── MBR beam search ────────────────────────────────────────────────
