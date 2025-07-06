@@ -719,11 +719,8 @@ class SplitLoRATrainer:
                     num_batches += 1
                     
                     
-                    if batch_idx % 100 == 0:
+                    if batch_idx % 50 == 0:
                         print(f"Batch {batch_idx}, Loss: {loss:.4f}")
-
-                    if batch_idx % 100 == 0 and example_inputs is not None:
-                        self.debug_model_learning(example_inputs)
                     
                 except Exception as e:
                     print(f"Training error: {e}")
