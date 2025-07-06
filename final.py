@@ -1242,13 +1242,21 @@ def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
     original_mrs = [sample["meaning_representation"] for sample in eval_split]
     try:
         # Official evaluation - pass both predictions and MRs
-        official = evaluate_official(preds, original_mrs)  # Fixed: pass both arguments
+        official = evaluate_official(preds, original_mrs)
         print(f"OFFICIAL BLEU: {official['bleu']:.2f} • "
             f"NIST {official['nist']:.4f} • "
             f"ROUGE-L {official['rouge_l']:.2f} •"
             f"Meteor {official['meteor']:.2f} • ")
     except Exception as e:
-        print(e)
+        print(f"Official evaluation failed: {e}")
+        # ✅ Initialize official with default values
+        official = {
+            "bleu": 0.0,
+            "nist": 0.0,
+            "meteor": 0.0,
+            "rouge_l": 0.0,
+            "cider": 0.0
+        }
     
     # Per-example metrics
     sb = SBLEU(tokenize="13a", smooth_method="exp", smooth_value=0.0, effective_order=True)
