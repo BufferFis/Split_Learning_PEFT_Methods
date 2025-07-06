@@ -1239,15 +1239,16 @@ def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
         mr_groups[mr]["refs"].append(sample["human_reference"])
     
     # Prepare for official evaluation (which needs grouped references)
-    grouped_preds = [bundle["pred"] for bundle in mr_groups.values()]
-    grouped_mrs = list(mr_groups.keys())  # Extract the MRs
-
-    # Official evaluation - pass both predictions and MRs
-    official = evaluate_official(grouped_preds, grouped_mrs)  # Fixed: pass both arguments
-    print(f"OFFICIAL BLEU: {official['bleu']:.2f} • "
-          f"NIST {official['nist']:.4f} • "
-          f"ROUGE-L {official['rouge_l']:.2f} •"
-          f"Meteor {official['meteor']:.2f} • ")
+    original_mrs = [sample["meaning_representation"] for sample in eval_split]
+    try:
+        # Official evaluation - pass both predictions and MRs
+        official = evaluate_official(preds, original_mrs)  # Fixed: pass both arguments
+        print(f"OFFICIAL BLEU: {official['bleu']:.2f} • "
+            f"NIST {official['nist']:.4f} • "
+            f"ROUGE-L {official['rouge_l']:.2f} •"
+            f"Meteor {official['meteor']:.2f} • ")
+    except Exception as e:
+        print(e)
     
     # Per-example metrics
     sb = SBLEU(tokenize="13a", smooth_method="exp", smooth_value=0.0, effective_order=True)
