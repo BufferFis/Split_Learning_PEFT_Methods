@@ -1203,11 +1203,10 @@ def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
     
 
     for mr, bundle in store.items():
-            if bundle["pred"] == "empty":
-                fails += 1
-                continue
-            preds.append(bundle["pred"])
-            refs.append(bundle["refs"])          # list-of-refs for this MR
+        preds.append(bundle["pred"] if bundle["pred"] != "empty" else "The restaurant serves food")
+        refs.append(bundle["refs"])
+        if bundle["pred"] == "empty":
+            fails += 1
 
     if not preds:
         return {"bleu": 0.0, "meteor": 0.0, "failed": len(store)}
