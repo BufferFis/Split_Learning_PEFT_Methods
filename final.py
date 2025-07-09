@@ -1438,19 +1438,17 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text, max_new_tokens=6
     with torch.no_grad():
         # ULTRA SIMPLE beam search - no complex parameters
         output = wrapper.generate(
-                    ids,
-            max_new_tokens=80,
-            num_beams=10,
+            ids,
+            max_new_tokens=64,
+            num_beams=4,              # Moderate beam size
             early_stopping=True,
-            do_sample=True,
-            top_p=0.9,
-            temperature=0.8,
-            length_penalty=0.9,
-            no_repeat_ngram_size=2,
+            length_penalty=1.0,       # Neutral length penalty
+            no_repeat_ngram_size=3,   # Standard repetition control
+            do_sample=False,          # Pure beam search (no sampling)
             eos_token_id=trainer.tokenizer.eos_token_id,
             pad_token_id=trainer.tokenizer.pad_token_id,
-            # NO OTHER PARAMETERS AT ALL
         )
+
 
     # Extract candidates
     # candidates = []
