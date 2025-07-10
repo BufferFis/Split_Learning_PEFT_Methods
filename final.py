@@ -681,9 +681,9 @@ class SplitLoRATrainer:
                     attention_mask = batch["attention_mask"].to(device)
                     labels = batch["labels"].to(device)
 
-                    print(f"Input attention mask sum: {attention_mask.sum()}")
-                    print(f"Attention mask shape: {attention_mask.shape}")
-                    print(f"Pad token positions: {(input_ids == self.tokenizer.pad_token_id).sum()}")
+                    #print(f"Input attention mask sum: {attention_mask.sum()}")
+                    #print(f"Attention mask shape: {attention_mask.shape}")
+                    #print(f"Pad token positions: {(input_ids == self.tokenizer.pad_token_id).sum()}")
 
                     
                     # FIX: Check for NaN inputs
