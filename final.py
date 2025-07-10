@@ -388,7 +388,7 @@ class TailClient:
         entropy_loss = -torch.mean(entropy)  # Encourage high entropy
         
         # OPTIMIZED: Stronger entropy weight for E2E NLG
-        beta = 0.05 
+        beta = 0.02 
         total_loss = loss + beta * entropy_loss
         
         # Check for NaN loss
@@ -471,7 +471,7 @@ class SplitLoRATrainer:
         
         # Apply LoRA/DoRA to clean models
         lora_config = LoraConfig(
-            r=8,
+            r=2,
             lora_alpha=32,
             lora_dropout=0.1,
             bias="lora_only",
@@ -712,8 +712,8 @@ class SplitLoRATrainer:
                         sched.step()
                     
                     # FIX: Add gradient clipping to all components
-                    torch.nn.utils.clip_grad_norm_(self.head_client.head_model.parameters(), max_norm=1.0)
-                    torch.nn.utils.clip_grad_norm_(self.tail_client.tail_model.parameters(), max_norm=1.0)
+                    torch.nn.utils.clip_grad_norm_(self.head_client.head_model.parameters(), max_norm=0.5)
+                    torch.nn.utils.clip_grad_norm_(self.tail_client.tail_model.parameters(), max_norm=0.5)
                     
                     total_loss += loss
                     num_batches += 1
