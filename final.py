@@ -1440,7 +1440,7 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text, max_new_tokens=6
          output = wrapper.generate(
             ids,
             max_new_tokens=64,           # SplitLoRA's eval_len
-            num_beams=10,                # SplitLoRA's beam size
+            num_beams=6,                # SplitLoRA's beam size
             length_penalty=0.8,          # SplitLoRA's length_penalty
             no_repeat_ngram_size=4,      # SplitLoRA's setting
             repetition_penalty=1.0,      # SplitLoRA's setting
