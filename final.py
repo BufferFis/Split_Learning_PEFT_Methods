@@ -1437,14 +1437,15 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text, max_new_tokens=6
     bad_tokens = trainer.tokenizer.encode("_*#-=.", add_special_tokens=False)
     with torch.no_grad():
         # ULTRA SIMPLE beam search - no complex parameters
-        output = wrapper.generate(
+         output = wrapper.generate(
             ids,
-            max_new_tokens=64,
-            num_beams=4,              # Moderate beam size
+            max_new_tokens=64,           # SplitLoRA's eval_len
+            num_beams=10,                # SplitLoRA's beam size
+            length_penalty=0.8,          # SplitLoRA's length_penalty
+            no_repeat_ngram_size=4,      # SplitLoRA's setting
+            repetition_penalty=1.0,      # SplitLoRA's setting
+            do_sample=False,             # Pure beam search
             early_stopping=True,
-            length_penalty=1.0,       # Neutral length penalty
-            no_repeat_ngram_size=3,   # Standard repetition control
-            do_sample=False,          # Pure beam search (no sampling)
             eos_token_id=trainer.tokenizer.eos_token_id,
             pad_token_id=trainer.tokenizer.pad_token_id,
         )
