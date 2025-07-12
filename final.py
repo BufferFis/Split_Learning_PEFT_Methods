@@ -388,7 +388,7 @@ class TailClient:
         entropy_loss = -torch.mean(entropy)  # Encourage high entropy
         
         # OPTIMIZED: Stronger entropy weight for E2E NLG
-        beta = 0.02 
+        beta = 0.01 
         total_loss = loss + beta * entropy_loss
         
         # Check for NaN loss
@@ -504,8 +504,8 @@ class SplitLoRATrainer:
         mr_text = example["meaning_representation"]
         ref_text = example["human_reference"]
         
-        # SIMPLIFIED: Use delimiter with spaces, but rely on single token search
-        space_delim = " " + self.DELIM + " "  # " <|gen|> "
+        # Keep your current delimiter
+        space_delim = " " + self.DELIM + " "
         full_text = mr_text + space_delim + ref_text
         
         encoding = self.tokenizer(
@@ -516,20 +516,51 @@ class SplitLoRATrainer:
             return_attention_mask=True
         )
         
-        # SIMPLIFIED: Just look for the special token directly (what your fallback does)
         labels = encoding["input_ids"].copy()
         
-        # Find the delimiter token (single token) - this is what's working
-        delim_token_id = self.tokenizer.encode(self.DELIM, add_special_tokens=False)[0]  # [50257]
+        # ROBUST: Search for the delimiter token sequence
+        delim_full_tokens = self.tokenizer.encode(space_delim, add_special_tokens=False)
+        delim_core_token = self.tokenizer.encode(self.DELIM, add_special_tokens=False)[0]  # 50257
         
-        try:
-            delim_pos = encoding["input_ids"].index(delim_token_id)
-            # Mask everything up to and including delimiter
+        input_ids = encoding["input_ids"]
+        delim_pos = None
+        
+        # Method 1: Look for full delimiter sequence
+        for i in range(len(input_ids) - len(delim_full_tokens) + 1):
+            if input_ids[i:i+len(delim_full_tokens)] == delim_full_tokens:
+                delim_pos = i + len(delim_full_tokens) - 1
+                break
+        
+        # Method 2: Look for core delimiter token if full sequence not found
+        if delim_pos is None:
+            try:
+                core_pos = input_ids.index(delim_core_token)
+                delim_pos = core_pos
+            except ValueError:
+                pass
+        
+        # Method 3: Pattern matching around the core token
+        if delim_pos is None:
+            for i, token_id in enumerate(input_ids):
+                if token_id == delim_core_token:
+                    # Check if it's surrounded by spaces or other delimiters
+                    if i > 0 and i < len(input_ids) - 1:
+                        delim_pos = i
+                        break
+        
+        if delim_pos is not None:
             labels[:delim_pos + 1] = [-100] * (delim_pos + 1)
-            # Remove debug prints for cleaner output
-        except ValueError:
-            # Fallback: mask first half if delimiter not found
-            labels[:len(labels)//2] = [-100] * (len(labels)//2)
+        else:
+            # Intelligent fallback: find structural boundary
+            # E2E MRs end with "]" typically
+            bracket_positions = [i for i, token_id in enumerate(input_ids) 
+                            if self.tokenizer.decode([token_id]) == "]"]
+            if bracket_positions:
+                # Use the last bracket as MR boundary
+                labels[:bracket_positions[-1] + 1] = [-100] * (bracket_positions[-1] + 1)
+            else:
+                # Final fallback
+                labels[:len(labels)//2] = [-100] * (len(labels)//2)
         
         # Mask padding tokens
         labels = [-100 if tok == self.tokenizer.pad_token_id else tok for tok in labels]
@@ -541,6 +572,7 @@ class SplitLoRATrainer:
             "human_reference": example["human_reference"],
             "meaning_representation": mr_text
         }
+
 
 
 
