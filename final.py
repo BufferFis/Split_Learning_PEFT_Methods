@@ -1055,6 +1055,41 @@ def create_e2e_reference_file_from_official_csv():
     return str(ref_file)
 
 
+def debug_full_tokenization(trainer, example):
+    """Debug the complete tokenization process"""
+    mr_text = example["meaning_representation"]
+    ref_text = example["human_reference"]
+    space_delim = " " + trainer.DELIM + " "
+    full_text = mr_text + space_delim + ref_text
+    
+    # Tokenize and show COMPLETE sequence
+    encoding = trainer.tokenizer(
+        full_text,
+        max_length=256,
+        truncation=True,
+        padding="max_length",
+        return_attention_mask=True
+    )
+    
+    print(f"=== FULL TOKENIZATION DEBUG ===")
+    print(f"Full text length: {len(full_text)} chars")
+    print(f"Tokenized length: {len(encoding['input_ids'])} tokens")
+    
+    # Show all non-padding tokens
+    input_ids = encoding["input_ids"]
+    non_padding = [token for token in input_ids if token != trainer.tokenizer.pad_token_id]
+    print(f"Non-padding tokens: {len(non_padding)}")
+    print(f"All input IDs: {input_ids}")
+    
+    # Search for delimiter
+    delimiter_tokens = [220, 50257, 220]  # space, <|gen|>, space
+    for i in range(len(input_ids) - 2):
+        if input_ids[i:i+3] == delimiter_tokens:
+            print(f"✅ Delimiter found at position {i}-{i+2}")
+            return i+2  # End of delimiter
+    
+    print("❌ Delimiter still not found in FULL sequence")
+    return None
 
 
 # ─── Beam-search helpers ──────────────────────────────────────────────
@@ -1617,6 +1652,8 @@ def main():
         diagnose_training_data(trainer, train_ds)
         diagnose_preprocessing_detailed(trainer)
         diagnose_custom_token_embeddings(trainer)
+        #NEW FIX
+        debug_full_tokenization(trainer, train_ds[0])
         # quick manual check on one MR
         example_mr = "name[Blue Spice], eatType[coffee shop], area[city centre]"
         example_ref = "Blue Spice is a coffee shop in the city centre."
