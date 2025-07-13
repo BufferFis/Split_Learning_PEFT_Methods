@@ -519,40 +519,63 @@ class SplitLoRATrainer:
         labels = encoding["input_ids"].copy()
         input_ids = encoding["input_ids"]
         
-        # FIXED: Direct search for the core delimiter token
-        delim_core_token = 50257  # Your <|gen|> token (confirmed from debug)
-        
+        # ROBUST: Multiple search strategies for delimiter
+        delim_core_token = 50257  # Your <|gen|> token
         delim_pos = None
-        try:
-            # Simple, direct search for the delimiter token
-            delim_pos = input_ids.index(delim_core_token)
-            print(f"✅ Delimiter found at position {delim_pos}")
-        except ValueError:
-            print("❌ Core delimiter token not found")
         
+        # Strategy 1: Direct search for delimiter token
+        try:
+            delim_pos = input_ids.index(delim_core_token)
+            print(f"✅ Strategy 1: Delimiter found at position {delim_pos}")
+        except ValueError:
+            print("Strategy 1 failed: Core delimiter token not found")
+        
+        # Strategy 2: If not found, search in non-padding region only
+        if delim_pos is None:
+            pad_token_id = self.tokenizer.pad_token_id
+            for i, token_id in enumerate(input_ids):
+                if token_id == pad_token_id:
+                    break  # Stop at first padding token
+                if token_id == delim_core_token:
+                    delim_pos = i
+                    print(f"✅ Strategy 2: Delimiter found at position {delim_pos}")
+                    break
+        
+        # Strategy 3: Structural fallback using E2E dataset patterns
+        if delim_pos is None:
+            print("⚠️ Using structural fallback")
+            # E2E MRs typically end with "]" followed by space
+            bracket_positions = []
+            for i, token_id in enumerate(input_ids):
+                token_text = self.tokenizer.decode([token_id])
+                if token_text == "]":
+                    bracket_positions.append(i)
+            
+            if bracket_positions:
+                # Use the last bracket as the end of MR
+                delim_pos = bracket_positions[-1] + 1
+                print(f"✅ Strategy 3: Using bracket fallback at position {delim_pos}")
+            else:
+                # Final fallback
+                delim_pos = len([t for t in input_ids if t != self.tokenizer.pad_token_id]) // 2
+                print(f"⚠️ Strategy 4: Using 50% fallback at position {delim_pos}")
+        
+        # Apply masking
         if delim_pos is not None:
-            # Mask everything up to and including the delimiter
+            # Mask everything up to and including the delimiter position
             labels[:delim_pos + 1] = [-100] * (delim_pos + 1)
             
             # Verify we have training tokens
-            training_tokens = sum(1 for label in labels if label != -100)
+            training_tokens = sum(1 for label in labels if label != -100 and label != self.tokenizer.pad_token_id)
             print(f"Training tokens available: {training_tokens}")
             
-            if training_tokens < 5:
-                print("❌ Warning: Very few training tokens!")
-        else:
-            # Emergency fallback: use structural markers
-            bracket_positions = [i for i, token_id in enumerate(input_ids) 
-                            if self.tokenizer.decode([token_id]) == "]"]
-            if bracket_positions:
-                fallback_pos = bracket_positions[-1] + 1
-                labels[:fallback_pos] = [-100] * fallback_pos
-                print(f"⚠️ Using bracket fallback at position {fallback_pos}")
-            else:
-                # Final fallback
-                fallback_pos = len(labels) // 2
-                labels[:fallback_pos] = [-100] * fallback_pos
-                print(f"⚠️ Using 50% fallback at position {fallback_pos}")
+            if training_tokens < 3:
+                print("❌ WARNING: Very few training tokens available!")
+                # Show what we're trying to predict
+                target_ids = [t for t in labels if t != -100 and t != self.tokenizer.pad_token_id]
+                if target_ids:
+                    target_text = self.tokenizer.decode(target_ids[:10])  # First 10 tokens
+                    print(f"Target preview: '{target_text}...'")
         
         # Mask padding tokens
         labels = [-100 if tok == self.tokenizer.pad_token_id else tok for tok in labels]
@@ -564,6 +587,7 @@ class SplitLoRATrainer:
             "human_reference": example["human_reference"],
             "meaning_representation": mr_text
         }
+
 
 
 
@@ -1049,7 +1073,7 @@ def create_e2e_reference_file_from_official_csv():
 
 
 def debug_full_tokenization(trainer, example):
-    """Debug the complete tokenization process"""
+    """Debug the complete tokenization process - FIXED VERSION"""
     mr_text = example["meaning_representation"]
     ref_text = example["human_reference"]
     space_delim = " " + trainer.DELIM + " "
@@ -1065,24 +1089,39 @@ def debug_full_tokenization(trainer, example):
     )
     
     print(f"=== FULL TOKENIZATION DEBUG ===")
-    print(f"Full text length: {len(full_text)} chars")
+    print(f"Full text: '{full_text}'")
     print(f"Tokenized length: {len(encoding['input_ids'])} tokens")
     
-    # Show all non-padding tokens
     input_ids = encoding["input_ids"]
     non_padding = [token for token in input_ids if token != trainer.tokenizer.pad_token_id]
     print(f"Non-padding tokens: {len(non_padding)}")
-    print(f"All input IDs: {input_ids}")
     
-    # Search for delimiter
-    delimiter_tokens = [220, 50257, 220]  # space, <|gen|>, space
-    for i in range(len(input_ids) - 2):
-        if input_ids[i:i+3] == delimiter_tokens:
-            print(f"✅ Delimiter found at position {i}-{i+2}")
-            return i+2  # End of delimiter
+    # FIXED: Search for just the core delimiter token (50257)
+    delim_core_token = 50257  # <|gen|>
     
-    print("❌ Delimiter still not found in FULL sequence")
-    return None
+    delimiter_positions = []
+    for i, token in enumerate(input_ids):
+        if token == delim_core_token:
+            delimiter_positions.append(i)
+    
+    if delimiter_positions:
+        delim_pos = delimiter_positions[0]  # Use first occurrence
+        print(f"✅ Delimiter found at position {delim_pos}")
+        
+        # Show context around delimiter
+        start_ctx = max(0, delim_pos - 3)
+        end_ctx = min(len(input_ids), delim_pos + 4)
+        context_tokens = input_ids[start_ctx:end_ctx]
+        context_text = trainer.tokenizer.decode(context_tokens, skip_special_tokens=True)
+        print(f"Context around delimiter: {context_tokens}")
+        print(f"Context text: '{context_text}'")
+        
+        return delim_pos
+    else:
+        print("❌ Delimiter token 50257 not found anywhere in sequence!")
+        print(f"Unique tokens in sequence: {set(input_ids[:60])}")  # Show first 60 unique tokens
+        return None
+
 
 
 # ─── Beam-search helpers ──────────────────────────────────────────────
