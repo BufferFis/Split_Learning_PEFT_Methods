@@ -500,7 +500,7 @@ class SplitLoRATrainer:
 
         
     def preprocess(self, example):
-        SEQUENCE_LENGTH = 128
+        SEQUENCE_LENGTH = 512
         mr_text = example["meaning_representation"]
         ref_text = example["human_reference"]
         
@@ -607,7 +607,7 @@ class SplitLoRATrainer:
     def create_dataloader(self, dataset, batch_size=8, shuffle=True, debug_mode=False):
         """FIXED: Consistent sequence length with debug support"""
         def collate_fn(batch):
-            FIXED_LENGTH = 128  # Match preprocessing length!
+            FIXED_LENGTH = 512  # Match preprocessing length!
             
             input_ids_batch = []
             attention_mask_batch = []
@@ -1082,7 +1082,7 @@ def debug_full_tokenization(trainer, example):
     # Tokenize and show COMPLETE sequence
     encoding = trainer.tokenizer(
         full_text,
-        max_length=128,
+        max_length=512,
         truncation=True,
         padding="max_length",
         return_attention_mask=True
@@ -1260,7 +1260,7 @@ def diagnose_preprocessing_detailed(trainer):
     # Tokenize manually (no dataset mapping)
     encoding = trainer.tokenizer(
         full_text,
-        max_length=128,
+        max_length=512,
         truncation=True,
         padding="max_length",
         return_attention_mask=True
