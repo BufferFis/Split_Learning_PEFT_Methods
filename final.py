@@ -504,7 +504,7 @@ class SplitLoRATrainer:
         mr_text = example["meaning_representation"]
         ref_text = example["human_reference"]
         
-        # Keep your current delimiter
+        # Keep your current delimiter approach
         space_delim = " " + self.DELIM + " "
         full_text = mr_text + space_delim + ref_text
         
@@ -517,50 +517,42 @@ class SplitLoRATrainer:
         )
         
         labels = encoding["input_ids"].copy()
-        
-        # ROBUST: Search for the delimiter token sequence
-        delim_full_tokens = self.tokenizer.encode(space_delim, add_special_tokens=False)
-        delim_core_token = self.tokenizer.encode(self.DELIM, add_special_tokens=False)[0]  # 50257
-        
         input_ids = encoding["input_ids"]
+        
+        # FIXED: Direct search for the core delimiter token
+        delim_core_token = 50257  # Your <|gen|> token (confirmed from debug)
+        
         delim_pos = None
-        
-        # Method 1: Look for full delimiter sequence
-        for i in range(len(input_ids) - len(delim_full_tokens) + 1):
-            if input_ids[i:i+len(delim_full_tokens)] == delim_full_tokens:
-                delim_pos = i + len(delim_full_tokens) - 1
-                break
-        
-        # Method 2: Look for core delimiter token if full sequence not found
-        if delim_pos is None:
-            try:
-                core_pos = input_ids.index(delim_core_token)
-                delim_pos = core_pos
-            except ValueError:
-                pass
-        
-        # Method 3: Pattern matching around the core token
-        if delim_pos is None:
-            for i, token_id in enumerate(input_ids):
-                if token_id == delim_core_token:
-                    # Check if it's surrounded by spaces or other delimiters
-                    if i > 0 and i < len(input_ids) - 1:
-                        delim_pos = i
-                        break
+        try:
+            # Simple, direct search for the delimiter token
+            delim_pos = input_ids.index(delim_core_token)
+            print(f"✅ Delimiter found at position {delim_pos}")
+        except ValueError:
+            print("❌ Core delimiter token not found")
         
         if delim_pos is not None:
+            # Mask everything up to and including the delimiter
             labels[:delim_pos + 1] = [-100] * (delim_pos + 1)
+            
+            # Verify we have training tokens
+            training_tokens = sum(1 for label in labels if label != -100)
+            print(f"Training tokens available: {training_tokens}")
+            
+            if training_tokens < 5:
+                print("❌ Warning: Very few training tokens!")
         else:
-            # Intelligent fallback: find structural boundary
-            # E2E MRs end with "]" typically
+            # Emergency fallback: use structural markers
             bracket_positions = [i for i, token_id in enumerate(input_ids) 
                             if self.tokenizer.decode([token_id]) == "]"]
             if bracket_positions:
-                # Use the last bracket as MR boundary
-                labels[:bracket_positions[-1] + 1] = [-100] * (bracket_positions[-1] + 1)
+                fallback_pos = bracket_positions[-1] + 1
+                labels[:fallback_pos] = [-100] * fallback_pos
+                print(f"⚠️ Using bracket fallback at position {fallback_pos}")
             else:
                 # Final fallback
-                labels[:len(labels)//2] = [-100] * (len(labels)//2)
+                fallback_pos = len(labels) // 2
+                labels[:fallback_pos] = [-100] * fallback_pos
+                print(f"⚠️ Using 50% fallback at position {fallback_pos}")
         
         # Mask padding tokens
         labels = [-100 if tok == self.tokenizer.pad_token_id else tok for tok in labels]
@@ -572,6 +564,7 @@ class SplitLoRATrainer:
             "human_reference": example["human_reference"],
             "meaning_representation": mr_text
         }
+
 
 
 
