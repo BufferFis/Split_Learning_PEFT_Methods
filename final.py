@@ -1658,7 +1658,7 @@ def main():
     if not args.eval_only:
         # Load dataset (regular mode)
         train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False, 
-                                                     fixed_length=optimal_length)
+                                                     sequence_length=optimal_length)
         diagnose_training_data(trainer, train_ds)
         diagnose_preprocessing_detailed(trainer)
         diagnose_custom_token_embeddings(trainer)
