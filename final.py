@@ -1612,7 +1612,7 @@ def main():
     
     if args.eval_only:
         train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False, 
-                                                     fixed_length=optimal_length)
+                                                        sequence_length=optimal_length)
         print("Setting up E2E evaluation with official dataset...")
         create_e2e_reference_file_from_official_csv()
         diagnose_training_data(trainer, train_ds)
