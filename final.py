@@ -499,8 +499,8 @@ class SplitLoRATrainer:
         self.schedulers = []
 
         
-    def preprocess(self, example):
-        SEQUENCE_LENGTH = 512
+    def preprocess(self, example, sequence_length=None):
+        SEQUENCE_LENGTH = sequence_length if sequence_length is not None else 512
         mr_text = example["meaning_representation"]
         ref_text = example["human_reference"]
         
@@ -604,10 +604,10 @@ class SplitLoRATrainer:
 
 
     
-    def create_dataloader(self, dataset, batch_size=8, shuffle=True, debug_mode=False):
+    def create_dataloader(self, dataset, batch_size=8, shuffle=True, debug_mode=False, sequence_length=None):
         """FIXED: Consistent sequence length with debug support"""
         def collate_fn(batch):
-            FIXED_LENGTH = 512  # Match preprocessing length!
+            FIXED_LENGTH = sequence_length if sequence_length is not None else 512
             
             input_ids_batch = []
             attention_mask_batch = []
@@ -1008,6 +1008,33 @@ class SplitLoRATrainer:
             print(f"❌ Error loading checkpoint: {e}")
             traceback.print_exc()
             return False
+
+def analyze_sequence_lengths(trainer, dataset):
+    """Analyze your actual data to choose optimal fixed length"""
+    lengths = []
+    
+    for i in range(min(2000, len(dataset))):  # Sample 1000 examples
+        example = dataset[i]
+        mr_text = example["meaning_representation"]
+        ref_text = example["human_reference"]
+        full_text = mr_text + " " + trainer.DELIM + " " + ref_text
+        length = len(trainer.tokenizer.encode(full_text, add_special_tokens=False))
+        lengths.append(length)
+    
+    # Statistics
+    avg_length = sum(lengths) / len(lengths)
+    p95_length = sorted(lengths)[int(0.95 * len(lengths))]
+    p99_length = sorted(lengths)[int(0.99 * len(lengths))]
+    
+    print(f"Average length: {avg_length:.1f}")
+    print(f"95th percentile: {p95_length}")
+    print(f"99th percentile: {p99_length}")
+    
+    # Recommend fixed length
+    recommended = min(p95_length + 16, 256)  # 95% coverage + buffer, capped at 256
+    print(f"Recommended fixed length: {recommended}")
+    
+    return recommended
 
 
 import urllib.request
@@ -1440,94 +1467,6 @@ def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
     print(f"BLEU  : {bleu_score:.4f}  •  METEOR: {meteor_score:.4f}  •  SBLUE {sacre_score:.4f}  • failed {fails}/{len(store)}")
     return {"bleu": bleu_score, "meteor": meteor_score, "failed": fails, "sacrebleu": sacre_score, **official}
 
-
-
-# def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
-#     """Compute BLEU & METEOR on `n_samples` examples using beam search."""
-#     bleu = load_metric("bleu")
-#     meteor = load_metric("meteor")
-    
-#     eval_split = dataset.select(range(min(n_samples, len(dataset))))
-    
-#     # FIXED: Generate one prediction per test example, not per unique MR
-#     preds, refs_list, fails = [], [], 0
-    
-#     # Store unique MR predictions to avoid redundant generation
-#     mr_cache = {}
-    
-#     for sample in tqdm(eval_split, desc="Evaluating", unit="sample"):
-#         mr = sample["meaning_representation"]
-#         ref = sample["human_reference"]
-        
-#         # Generate prediction (use cache for efficiency)
-#         if mr not in mr_cache:
-#             try:
-#                 pred = generate_with_beam_mbr(trainer, wrapper, mr, ref)
-#                 if not pred or pred.strip() == "":
-#                     pred = "The restaurant serves food"
-#             except Exception as e:
-#                 print("generation failed:", e)
-#                 pred = "The restaurant serves food"
-#             mr_cache[mr] = pred
-#         else:
-#             pred = mr_cache[mr]
-        
-#         # FIXED: Add one prediction per test example
-#         preds.append(pred)
-#         refs_list.append([ref])  # Single reference per example
-        
-#         if pred == "The restaurant serves food":
-#             fails += 1
-    
-#     if not preds:
-#         return {"bleu": 0.0, "meteor": 0.0, "failed": len(eval_split)}
-    
-#     # Now preds and refs_list have same length as eval_split
-#     print(f"Generated {len(preds)} predictions for {len(eval_split)} examples")
-    
-#     # Multi-reference preparation for corpus-level metrics
-#     # Group by MR for multi-reference evaluation
-#     mr_groups = {}
-#     for i, sample in enumerate(eval_split):
-#         mr = sample["meaning_representation"]
-#         if mr not in mr_groups:
-#             mr_groups[mr] = {"pred": preds[i], "refs": []}
-#         mr_groups[mr]["refs"].append(sample["human_reference"])
-    
-#     # Prepare for official evaluation (which needs grouped references)
-#     original_mrs = [sample["meaning_representation"] for sample in eval_split]
-#     try:
-#         # Official evaluation - pass both predictions and MRs
-#         official = evaluate_official(preds, original_mrs)
-#         print(f"OFFICIAL BLEU: {official['bleu']:.2f} • "
-#             f"NIST {official['nist']:.4f} • "
-#             f"ROUGE-L {official['rouge_l']:.2f} •"
-#             f"Meteor {official['meteor']:.2f} • ")
-#     except Exception as e:
-#         print(f"Official evaluation failed: {e}")
-#         # ✅ Initialize official with default values
-#         official = {
-#             "bleu": 0.0,
-#             "nist": 0.0,
-#             "meteor": 0.0,
-#             "rouge_l": 0.0,
-#             "cider": 0.0
-#         }
-    
-#     # Per-example metrics
-#     sb = SBLEU(tokenize="13a", smooth_method="exp", smooth_value=0.0, effective_order=True)
-#     sacre_score = sb.corpus_score(preds, [[ref[0]] for ref in refs_list]).score / 100
-    
-#     bleu_score = bleu.compute(predictions=preds, references=refs_list, smooth=True)["bleu"]
-#     meteor_score = meteor.compute(predictions=preds, references=[r[0] for r in refs_list])["meteor"]
-    
-#     print(f"BLEU : {bleu_score:.4f} • METEOR: {meteor_score:.4f} • SBLUE {sacre_score:.4f} • failed {fails}/{len(preds)}")
-    
-#     return {"bleu": bleu_score, "meteor": meteor_score, "failed": fails, "sacrebleu": sacre_score, **official}
-
-
-
-
 # ─── MBR beam search ────────────────────────────────────────────────
 def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text, max_new_tokens=64, k=10):
     prompt = mr_text + " " + trainer.DELIM + " "
@@ -1549,23 +1488,6 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text, max_new_tokens=6
             pad_token_id=trainer.tokenizer.pad_token_id,
         )
 
-
-    # Extract candidates
-    # candidates = []
-    # for beam in beams:
-    #     generated_part = beam[ids.size(1):]
-    #     candidate = trainer.tokenizer.decode(generated_part, skip_special_tokens=True).strip()
-        
-    #     symbol_count = sum(1 for c in candidate if c in '_*#-.=|[]')
-    #     total_chars = len(candidate)
-    #     symbol_ratio = symbol_count / max(total_chars, 1)
-    #     if symbol_ratio < 0.3 and len(candidate.split()) >= 2:  # Less than 30% 
-    #         candidates.append(candidate)
-    #     if not candidates:
-    #         return "The restaurant serves food"
-    
-    # Return best candidate or fallback
-    # return candidates[0]/
     result = trainer.tokenizer.decode(output[0][ids.size(1):], skip_special_tokens=True).strip()
     return result
 
@@ -1649,6 +1571,7 @@ def main():
     parser.add_argument("--save_path", type=str, default="./splitlora_checkpoint", help="Path to save checkpoint")
     parser.add_argument("--gpu_device", type=str, default="1", help="GPU device to use")
     args = parser.parse_args()
+    
     os.makedirs(args.save_path, exist_ok=True)
     trainer = SplitLoRATrainer(model_name="gpt2",
                            head_layers=2,
@@ -1657,7 +1580,9 @@ def main():
                            warmup_steps=args.warmup_steps,
                            max_epochs=args.max_epochs)
     
-    diagnose_tokenizer_corruption(trainer)
+    print("Analyzing sequence lengths to optimize training...")
+    train_ds_temp, _ = trainer.load_e2e_dataset(debug_mode=False)
+    optimal_length = analyze_sequence_lengths(trainer, train_ds_temp)
     
     # Load checkpoint if specified
     if args.load_checkpoint:
@@ -1678,7 +1603,8 @@ def main():
     
     
     if args.eval_only:
-        train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
+        train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False, 
+                                                     fixed_length=optimal_length)
         print("Setting up E2E evaluation with official dataset...")
         create_e2e_reference_file_from_official_csv()
         diagnose_training_data(trainer, train_ds)
@@ -1723,7 +1649,8 @@ def main():
 
     if not args.eval_only:
         # Load dataset (regular mode)
-        train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False)
+        train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False, 
+                                                     fixed_length=optimal_length)
         diagnose_training_data(trainer, train_ds)
         diagnose_preprocessing_detailed(trainer)
         diagnose_custom_token_embeddings(trainer)
