@@ -593,18 +593,26 @@ class SplitLoRATrainer:
 
 
 
-    def load_e2e_dataset(self, debug_mode=False):
-        """Improved preprocessing with optional debug mode"""
+    def load_e2e_dataset(self, debug_mode=False, sequence_length=512):
+        """FIXED: Accept and use sequence_length parameter"""
         dataset = load_dataset("e2e_nlg", trust_remote_code=True)
         
-        # Use the class method instead of nested function
-        train_ds = dataset["train"].map(self.preprocess, remove_columns=dataset["train"].column_names)
-        test_ds = dataset["test"].map(self.preprocess, remove_columns=dataset["test"].column_names)
+        # Create a wrapper that passes sequence_length to preprocess
+        def preprocess_with_length(example):
+            return self.preprocess(example, sequence_length=sequence_length)
+        
+        # Apply preprocessing with the optimal sequence length
+        train_ds = dataset["train"].map(preprocess_with_length, 
+                                    remove_columns=dataset["train"].column_names)
+        test_ds = dataset["test"].map(preprocess_with_length, 
+                                    remove_columns=dataset["test"].column_names)
+        
         return train_ds, test_ds
 
 
+
     
-    def create_dataloader(self, dataset, batch_size=8, shuffle=True, debug_mode=False, sequence_length=None):
+    def create_dataloader(self, dataset, batch_size=8, shuffle=True, sequence_length=None):
         """FIXED: Consistent sequence length with debug support"""
         def collate_fn(batch):
             FIXED_LENGTH = sequence_length if sequence_length is not None else 512
@@ -1655,7 +1663,7 @@ def main():
         diagnose_preprocessing_detailed(trainer)
         diagnose_custom_token_embeddings(trainer)
         # Create dataloader and train
-        train_dl = trainer.create_dataloader(train_ds, batch_size=args.batch_size, shuffle=True, debug_mode=False)
+        train_dl = trainer.create_dataloader(train_ds, batch_size=args.batch_size, shuffle=True, sequence_length=optimal_length)
         trainer.attach_schedulers(train_dl)
         print(f"Vocab size: {len(trainer.tokenizer)}")
         print(f"DELIM token: '{trainer.DELIM}' -> {trainer.tokenizer.encode(trainer.DELIM)}")
