@@ -594,7 +594,7 @@ class SplitLoRATrainer:
             debug_mode: bool = False,
             sequence_length: int = 512,
             cycle_refs: bool = True,
-            seed: int | None = None
+            seed: Optional[int] = None
         ):
         """
         Load and preprocess the E2E-NLG dataset.
