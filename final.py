@@ -1036,7 +1036,7 @@ class SplitLoRATrainer:
             
             # Re-apply PEFT to the loaded models
             lora_config = LoraConfig(
-                r=8, lora_alpha=32, lora_dropout=0.1,
+                r=2, lora_alpha=32, lora_dropout=0.1,
                 bias="lora_only", use_dora=True, task_type="CAUSAL_LM",
                 target_modules=["c_attn", "c_proj", "c_fc"]
             )
