@@ -650,14 +650,23 @@ class SplitLoRATrainer:
         if self._sched_steps is None:
             total_steps = len(train_dataloader) * self.max_epochs
             self._sched_steps = total_steps
-            for opt in (self.head_client.optimizer,
-                        self.server.optimizer,
-                        self.tail_client.optimizer):
-                sched = get_linear_schedule_with_warmup(
-                            opt,
-                            num_warmup_steps=self.warmup_steps,
-                            num_training_steps=total_steps)
-                self.schedulers.append(sched)
+
+        # Import the combined scheduler
+        from transformers import get_cosine_schedule_with_warmup
+        
+        for opt in (self.head_client.optimizer,
+                    self.server.optimizer,
+                    self.tail_client.optimizer):
+            # ENHANCED: Warmup + Cosine annealing
+            sched = get_cosine_schedule_with_warmup(
+                opt,
+                num_warmup_steps=self.warmup_steps,  # Use your existing warmup_steps
+                num_training_steps=total_steps,
+                num_cycles=0.5,  # Half cosine cycle
+                last_epoch=-1
+            )
+            self.schedulers.append(sched)
+
 
 
     def validate_model_sanity(self):
