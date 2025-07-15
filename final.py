@@ -366,11 +366,18 @@ class TailClient:
         logits = torch.clamp(logits, -50.0, 50.0)
 
         # Compute loss 
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()               # existing
-        shift_labels[shift_labels == -100] = self.loss_fn.ignore_index
+        # shift_logits = logits[..., :-1, :].contiguous()
+        # shift_labels = labels[..., 1:].contiguous()               # existing
+        # shift_labels[shift_labels == -100] = self.loss_fn.ignore_index 
 
-        
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        pad_id = self.tail_model.base_model.config.pad_token_id
+
+        ignore = self.loss_fn.ignore_index
+        shift_labels[shift_labels == pad_id] = ignore
+        shift_labels[shift_labels == -100]  = ignore
+
         # Check for NaN in logits
         if torch.isnan(shift_logits).any():
             print("WARNING: NaN detected in logits!")
@@ -387,7 +394,7 @@ class TailClient:
         entropy_loss = -torch.mean(entropy)  # Encourage high entropy
         
         # OPTIMIZED: Stronger entropy weight for E2E NLG
-        beta = 0.01 
+        beta = 0.05 
         total_loss = loss + beta * entropy_loss
         
         # Check for NaN loss
@@ -751,10 +758,21 @@ class SplitLoRATrainer:
             return True  # Continue training anyway
 
         
-    def train(self, train_dataloader, epochs=1):
+    def train(self, train_dataloader, epochs=1, train_dataset=None, batch_size = 8, sequence_length = 512):
+
         print(f"Starting training for {epochs} epochs...")
         example_inputs = None
         for epoch in range(epochs):
+            if train_dataset is not None:
+                seed = torch.randint(0, 2**31 - 1, ()).item()
+                train_dataset = train_dataset.shuffle(seed=seed)
+                train_dataloader = self.create_dataloader(
+                    train_dataset,
+                    batch_size      = batch_size,
+                    shuffle         = True,  
+                    sequence_length = sequence_length,
+                )
+
             total_loss = 0.0
             num_batches = 0
             
@@ -1035,21 +1053,13 @@ class SplitLoRATrainer:
             head_model, body_model, tail_model = split_gpt2(full_model, 2, 2)
             
             # Re-apply PEFT to the loaded models
-            lora_config = LoraConfig(
-                r=8, lora_alpha=32, lora_dropout=0.1,
-                bias="lora_only", use_dora=True, task_type="CAUSAL_LM",
-                target_modules=["c_attn", "c_proj", "c_fc"]
-            )
-            
-            head_model = get_peft_model(head_model, lora_config)
-            body_model = get_peft_model(body_model, lora_config)
-            tail_model = get_peft_model(tail_model, lora_config)
-            
-            # Update components with loaded models
             self.head_client.head_model = head_model.to(device)
-            self.server.body_model = body_model.to(device)
+            self.server.body_model      = body_model.to(device)
             self.tail_client.tail_model = tail_model.to(device)
-            
+            self.tail_client.tail_model.lm_head.weight = (
+                self.head_client.head_model.wte.weight
+            )
+
             # Ensure weight tying
             self.tail_client.tail_model.base_model.lm_head.weight = self.head_client.head_model.base_model.wte.weight
             
@@ -1529,7 +1539,7 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text, max_new_tokens=6
         # ULTRA SIMPLE beam search - no complex parameters
          output = wrapper.generate(
             ids,
-            max_new_tokens=64,           # SplitLoRA's eval_len
+            max_new_tokens=min(64, trainer.max_seq_len // 3),           # SplitLoRA's eval_len
             num_beams=10,                # SplitLoRA's beam size
             length_penalty=0.8,          # SplitLoRA's length_penalty
             no_repeat_ngram_size=4,      # SplitLoRA's setting
@@ -1640,7 +1650,7 @@ def main():
     if args.load_checkpoint:
         trainer.load_checkpoint(args.load_checkpoint)
         diagnose_custom_token_embeddings(trainer)
-    
+    trainer.max_seq_len = optimal_length
     wrapper = SplitGPT2ForGeneration(
             tokenizer   = trainer.tokenizer,
             head_client = trainer.head_client,
@@ -1713,7 +1723,7 @@ def main():
         print(f"DELIM token: '{trainer.DELIM}' -> {trainer.tokenizer.encode(trainer.DELIM)}")
         print(f"PAD token: '{trainer.PAD}' -> {trainer.tokenizer.pad_token_id}")
         print(f"EOS token: '{trainer.tokenizer.eos_token}' -> {trainer.tokenizer.eos_token_id}")
-        trainer.train(train_dl, epochs=args.epochs)
+        trainer.train(train_dl, epochs=args.epochs, train_dataset = train_ds, batch_size = args.batch_size, sequence_length=optimal_length)
         
         # Save checkpoint
         trainer.save_checkpoint(args.save_path)
