@@ -28,6 +28,7 @@ from sacrebleu.metrics import BLEU as SBLEU
 from itertools import zip_longest
 import subprocess, tempfile, pathlib, json
 from transformers import get_linear_schedule_with_warmup
+import random
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -346,7 +347,7 @@ class TailClient:
             [p for p in self.tail_model.parameters() if p.requires_grad], 
             lr=learning_rate
         )
-        self.loss_fn = nn.CrossEntropyLoss(label_smoothing=0.1)
+        self.loss_fn = nn.CrossEntropyLoss(label_smoothing=0.05)
         
     def forward(self, body_activations, attention_mask=None):
         """Forward pass through tail layers"""
@@ -590,23 +591,58 @@ class SplitLoRATrainer:
 
 
 
+    def load_e2e_dataset(
+            self,
+            *,                       # force keyword arguments
+            debug_mode: bool = False,
+            sequence_length: int = 512,
+            cycle_refs: bool = True,
+            seed: int | None = None
+        ):
+        """
+        Load and preprocess the E2E-NLG dataset.
 
+        Parameters
+        ----------
+        debug_mode       – if True, return a 1 % slice for quick debugging  
+        sequence_length  – fixed length used by `self.preprocess`  
+        cycle_refs       – if True, shuffle training rows on every call
+                        so different references are seen across epochs  
+        seed             – optional shuffle seed (useful for reproducibility)
 
+        Returns
+        -------
+        train_ds, test_ds – HuggingFace datasets ready for DataLoader
+        """
 
-    def load_e2e_dataset(self, debug_mode=False, sequence_length=512):
-        """FIXED: Accept and use sequence_length parameter"""
-        dataset = load_dataset("e2e_nlg", trust_remote_code=True)
-        
-        # Create a wrapper that passes sequence_length to preprocess
-        def preprocess_with_length(example):
-            return self.preprocess(example, sequence_length=sequence_length)
-        
-        # Apply preprocessing with the optimal sequence length
-        train_ds = dataset["train"].map(preprocess_with_length, 
-                                    remove_columns=dataset["train"].column_names)
-        test_ds = dataset["test"].map(preprocess_with_length, 
-                                    remove_columns=dataset["test"].column_names)
-        
+        ds = load_dataset("e2e_nlg", trust_remote_code=True)
+
+        # ── optional tiny slice for lightning-fast tests ─────────────────
+        if debug_mode:
+            ds["train"] = ds["train"].select(range(max(50, len(ds["train"]) // 100)))
+            ds["test"]  = ds["test"].select(range(max(20, len(ds["test"])  // 100)))
+
+        # ── shuffle train split once per call (reference cycling) ────────
+        if cycle_refs:
+            # use caller-supplied seed or pick a new one each time
+            seed = seed if seed is not None else random.randint(0, 2**31 - 1)
+            ds["train"] = ds["train"].shuffle(seed=seed)
+
+        # ── small wrapper so we can pass the length into preprocess ──────
+        def _preprocess(ex):
+            return self.preprocess(ex, sequence_length=sequence_length)
+
+        train_ds = ds["train"].map(
+            _preprocess,
+            remove_columns=ds["train"].column_names,
+            desc="Tokenising train split"
+        )
+        test_ds = ds["test"].map(
+            _preprocess,
+            remove_columns=ds["test"].column_names,
+            desc="Tokenising test split"
+        )
+
         return train_ds, test_ds
 
 
@@ -665,6 +701,7 @@ class SplitLoRATrainer:
                 num_cycles=0.5,  # Half cosine cycle
                 last_epoch=-1
             )
+            for g in opt.param_groups: g['lr'] = max(g['lr'], 1e-4)
             self.schedulers.append(sched)
 
 
