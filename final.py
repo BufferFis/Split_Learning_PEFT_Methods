@@ -6,6 +6,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "1"     # or the bus-id / UUID of AF:00.0
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from typing import Optional
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
