@@ -612,7 +612,7 @@ class SplitLoRATrainer:
         -------
         train_ds, test_ds – HuggingFace datasets ready for DataLoader
         """
-
+        cycle_refs = True  # always shuffle train split by default
         ds = load_dataset("e2e_nlg", trust_remote_code=True)
 
         # ── optional tiny slice for lightning-fast tests ─────────────────
