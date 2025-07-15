@@ -476,8 +476,9 @@ class SplitLoRATrainer:
         head_model, body_model, tail_model = split_gpt2(full_model, head_layers, tail_layers)
         
         # Apply LoRA/DoRA to clean models
-        lora_config = LoraConfig(
-            r=2,
+        self.r = 2
+        self.lora_config = LoraConfig(
+            r=self.r,
             lora_alpha=32,
             lora_dropout=0.1,
             bias="lora_only",
@@ -486,9 +487,9 @@ class SplitLoRATrainer:
             target_modules=["c_attn", "c_proj", "c_fc"]
         )
         
-        head_model = get_peft_model(head_model, lora_config)
-        body_model = get_peft_model(body_model, lora_config)
-        tail_model = get_peft_model(tail_model, lora_config)
+        head_model = get_peft_model(head_model, self.lora_config)
+        body_model = get_peft_model(body_model, self.lora_config)
+        tail_model = get_peft_model(tail_model, self.lora_config)
         
         # Standard weight tying
         tail_model.base_model.lm_head.weight = head_model.base_model.wte.weight
@@ -950,6 +951,8 @@ class SplitLoRATrainer:
                     "body_layers": 8
                 }
             }
+
+            metadata["lora_rank"] = self.r 
             
             with open(os.path.join(path, "training_metadata.json"), "w") as f:
                 json.dump(metadata, f, indent=2)
@@ -1061,8 +1064,8 @@ class SplitLoRATrainer:
             )
 
             # Ensure weight tying
-            self.tail_client.tail_model.base_model.lm_head.weight = self.head_client.head_model.base_model.wte.weight
-            
+            #self.tail_client.tail_model.base_model.lm_head.weight = self.head_client.head_model.base_model.wte.weight
+            self.tail_client.tail_model.lm_head.weight = self.head_client.head_model.wte.weight
             print(f"✅ Checkpoint loaded successfully from {path}")
             return True
 
@@ -1436,7 +1439,7 @@ def diagnose_custom_token_embeddings(trainer):
     pad_id = trainer.tokenizer.pad_token_id
     
     # Get embeddings from head model
-    head_embeddings = trainer.head_client.head_model.base_model.wte.weight
+    head_embeddings = trainer.head_client.head_model.wte.weight
     
     delim_embedding = head_embeddings[delim_id]
     pad_embedding = head_embeddings[pad_id]
