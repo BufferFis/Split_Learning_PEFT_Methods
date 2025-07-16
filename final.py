@@ -150,7 +150,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
                 # Convert attention_mask to the format GPT-2 blocks expect
                 
                     
-                hidden_states = block(hidden_states, attention_mask=attention_mask,use_cache=False)[0]
+                hidden_states = block(hidden_states ,use_cache=False)[0]
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
             if output_hidden_states:
@@ -195,7 +195,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
         def forward(self, hidden_states=None, attention_mask=None, **kwargs):
     
             for block in self.transformer.h:
-                hidden_states = block(hidden_states, attention_mask=attention_mask,use_cache=False)[0]
+                hidden_states = block(hidden_states,use_cache=False)[0]
             return type('BodyOutput', (), {'last_hidden_state': hidden_states})()
 
     # Tail Model (last few layers + LM head)
@@ -232,7 +232,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             hidden_states = inputs_embeds
 
             for block in self.transformer.h:   
-                hidden_states = block(hidden_states, attention_mask=attention_mask,use_cache=False)[0]
+                hidden_states = block(hidden_states,use_cache=False)[0]
 
             hidden_states = self.transformer.ln_f(hidden_states)
             logits = self.lm_head(hidden_states)
