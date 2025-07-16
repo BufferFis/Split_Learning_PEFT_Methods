@@ -420,40 +420,18 @@ class SplitLoRATrainer:
         # FIXED: Use existing tokens only - no custom token addition
         from transformers import GPT2Tokenizer, GPT2LMHeadModel
         
-        self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-        full_model = GPT2LMHeadModel.from_pretrained('gpt2')
+        self.tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        # Re-use EOS as PAD so no new embedding is introduced
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+        full_model = AutoModelForCausalLM.from_pretrained("gpt2")
+        full_model.config.pad_token_id = self.tokenizer.eos_token_id
         self.max_seq_len = 256
 
          # FIXED: Properly initialize custom token embeddings
         original_vocab_size = len(self.tokenizer)
-            # Add custom tokens
-        self.DELIM = "<|gen|>"
-        special_tokens = {"additional_special_tokens": [self.DELIM]}
-        
-        if self.tokenizer.pad_token is None:
-            special_tokens["pad_token"] = "<|pad|>"
-        
-        num_added = self.tokenizer.add_special_tokens(special_tokens)
-        print(f"Added {num_added} special tokens")
-        
-        # CRITICAL: Resize and properly initialize embeddings
-        full_model.resize_token_embeddings(len(self.tokenizer))
-        
-        # FIXED: Initialize new token embeddings properly
-        if num_added > 0:
-            with torch.no_grad():
-                # Get existing embeddings
-                existing_embeddings = full_model.transformer.wte.weight[:original_vocab_size]
-                avg_embedding = existing_embeddings.mean(dim=0)
-                
-                # Initialize new token embeddings
-                for i in range(original_vocab_size, len(self.tokenizer)):
-                    # Initialize as average + small random noise
-                    full_model.transformer.wte.weight[i] = avg_embedding + torch.randn_like(avg_embedding) * 0.01
-        
         self.PAD = self.tokenizer.pad_token
         self.tokenizer.padding_side = "right"
-        
+        self.DELIM = ";"
         # Set generation config with existing vocabulary
         full_model.config.eos_token_id = self.tokenizer.eos_token_id
         full_model.config.pad_token_id = self.tokenizer.pad_token_id
@@ -467,7 +445,7 @@ class SplitLoRATrainer:
         
         # Split model (no custom tokens to corrupt)
         head_model, body_model, tail_model = split_gpt2(full_model, head_layers, tail_layers)
-        
+        tail_model.lm_head.weight = head_model.wte.weight 
         # Apply LoRA/DoRA to clean models
         lora_config = LoraConfig(
             r=2,
@@ -511,7 +489,7 @@ class SplitLoRATrainer:
             full_text,
             max_length=SEQUENCE_LENGTH,
             truncation=True,
-            padding="max_length",
+            padding=False,
             return_attention_mask=True
         )
         
@@ -648,37 +626,31 @@ class SplitLoRATrainer:
     
     def create_dataloader(self, dataset, batch_size=8, shuffle=True, sequence_length=None):
         """FIXED: Consistent sequence length with debug support"""
+        from torch.nn.utils.rnn import pad_sequence   # add at top of file
+
         def collate_fn(batch):
-            FIXED_LENGTH = sequence_length if sequence_length is not None else 512
-            
-            input_ids_batch = []
-            attention_mask_batch = []
-            labels_batch = []
-            
-            for b in batch:
-                input_ids = b["input_ids"][:FIXED_LENGTH]
-                attention_mask = b["attention_mask"][:FIXED_LENGTH]
-                labels = b["labels"][:FIXED_LENGTH]
-                
-                # Pad if shorter
-                if len(input_ids) < FIXED_LENGTH:
-                    pad_length = FIXED_LENGTH - len(input_ids)
-                    input_ids.extend([self.tokenizer.pad_token_id] * pad_length)
-                    attention_mask.extend([0] * pad_length)
-                    labels.extend([-100] * pad_length)
-                
-                input_ids_batch.append(input_ids)
-                attention_mask_batch.append(attention_mask)
-                labels_batch.append(labels)
-            
-            return {
-                "input_ids": torch.tensor(input_ids_batch, dtype=torch.long),
-                "attention_mask": torch.tensor(attention_mask_batch, dtype=torch.float32),
-                "labels": torch.tensor(labels_batch, dtype=torch.long),
-                "human_reference": [b["human_reference"] for b in batch]
-            }
+            # turn lists into tensors, but keep variable length
+            ids   = [torch.tensor(b["input_ids"],  dtype=torch.long) for b in batch]
+            lbls  = [torch.tensor(b["labels"],     dtype=torch.long) for b in batch]
+
+            # right-pad to the longest sequence in *this* minibatch
+            ids  = pad_sequence(ids,  batch_first=True,
+                                padding_value=self.tokenizer.eos_token_id)
+            lbls = pad_sequence(lbls, batch_first=True,
+                                padding_value=-100)                 # ignore in loss
+
+            # build attention mask on-the-fly (1 = real token, 0 = pad/eos padding)
+            attn = (ids != self.tokenizer.eos_token_id).long()
+
+            return {"input_ids": ids,
+                    "attention_mask": attn,
+                    "labels": lbls,
+                    "human_reference": [b["human_reference"] for b in batch]}
         
-        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn)
+        return DataLoader(dataset,
+                  batch_size=batch_size,
+                  shuffle=shuffle,
+                  collate_fn=collate_fn)
     
     def attach_schedulers(self, train_dataloader):
         if self._sched_steps is None:
@@ -890,176 +862,204 @@ class SplitLoRATrainer:
             else:
                 print("Sequence too short for meaningful analysis")
 
-    def save_checkpoint(self, path="./splitlora_checkpoint"):
-        """FIXED: Save merged models using state dicts"""
-        os.makedirs(path, exist_ok=True)
+    def save_checkpoint(self, epoch, path="ckpt.pt"):
+        torch.save({
+            "head_state": self.head_client.head_model.state_dict(),
+            "body_state": self.server.body_model.state_dict(),
+            "tail_state": self.tail_client.tail_model.state_dict(),
+            "opt_head": self.head_client.optimizer.state_dict(),
+            "opt_body": self.server.optimizer.state_dict(),
+            "opt_tail": self.tail_client.optimizer.state_dict(),
+            "sch_head": self.schedulers[0].state_dict(),
+            "sch_body": self.schedulers[1].state_dict(),
+            "sch_tail": self.schedulers[2].state_dict(),
+            "rng_state": torch.random.get_rng_state(),
+        }, path)
+    
+    def load_checkpoint(self, path="ckpt.pt"):
+        ckpt = torch.load(path, map_location=device)
+        self.head_client.head_model.load_state_dict(ckpt["head_state"])
+        self.server.body_model.load_state_dict(ckpt["body_state"])
+        self.tail_client.tail_model.load_state_dict(ckpt["tail_state"])
+        self.head_client.optimizer.load_state_dict(ckpt["opt_head"])
+        self.server.optimizer.load_state_dict(ckpt["opt_body"])
+        self.tail_client.optimizer.load_state_dict(ckpt["opt_tail"])
+        self.schedulers[0].load_state_dict(ckpt["sch_head"])
+        self.schedulers[1].load_state_dict(ckpt["sch_body"])
+        self.schedulers[2].load_state_dict(ckpt["sch_tail"])
+        torch.random.set_rng_state(ckpt["rng_state"])
+        return ckpt["epoch"] + 1          # resume from next epoch
+    
+    # def save_checkpoint(self, path="./splitlora_checkpoint"):
+    #     """FIXED: Save merged models using state dicts"""
+    #     os.makedirs(path, exist_ok=True)
         
-        try:
-            print("Merging and saving models with custom embeddings...")
+    #     try:
+    #         print("Merging and saving models with custom embeddings...")
             
-            # Merge PEFT adapters into base models
-            head_merged = self.head_client.head_model.merge_and_unload()
-            body_merged = self.server.body_model.merge_and_unload()
-            tail_merged = self.tail_client.tail_model.merge_and_unload()
+    #         # Merge PEFT adapters into base models
+    #         head_merged = self.head_client.head_model.merge_and_unload()
+    #         body_merged = self.server.body_model.merge_and_unload()
+    #         tail_merged = self.tail_client.tail_model.merge_and_unload()
             
-            # FIXED: Save state dicts instead of using save_pretrained
-            torch.save(head_merged.state_dict(), os.path.join(path, "head_model_merged.pt"))
-            torch.save(body_merged.state_dict(), os.path.join(path, "body_model_merged.pt"))
-            torch.save(tail_merged.state_dict(), os.path.join(path, "tail_model_merged.pt"))
+    #         # FIXED: Save state dicts instead of using save_pretrained
+    #         torch.save(head_merged.state_dict(), os.path.join(path, "head_model_merged.pt"))
+    #         torch.save(body_merged.state_dict(), os.path.join(path, "body_model_merged.pt"))
+    #         torch.save(tail_merged.state_dict(), os.path.join(path, "tail_model_merged.pt"))
             
-            # Save model configurations
-            torch.save(head_merged.config, os.path.join(path, "head_config.pt"))
-            torch.save(body_merged.config, os.path.join(path, "body_config.pt"))
-            torch.save(tail_merged.config, os.path.join(path, "tail_config.pt"))
+    #         # Save model configurations
+    #         torch.save(head_merged.config, os.path.join(path, "head_config.pt"))
+    #         torch.save(body_merged.config, os.path.join(path, "body_config.pt"))
+    #         torch.save(tail_merged.config, os.path.join(path, "tail_config.pt"))
             
-            # Save tokenizer
-            self.tokenizer.save_pretrained(os.path.join(path, "tokenizer"))
+    #         # Save tokenizer
+    #         self.tokenizer.save_pretrained(os.path.join(path, "tokenizer"))
             
-            # Save training metadata including custom token info
-            metadata = {
-                "vocab_size": len(self.tokenizer),
-                "original_vocab_size": 50257,
-                "custom_tokens": {
-                    "delim_token": self.DELIM,
-                    "delim_id": self.tokenizer.encode(self.DELIM, add_special_tokens=False)[0],
-                    "pad_token": self.PAD,
-                    "pad_id": self.tokenizer.pad_token_id
-                },
-                "metrics": self.metrics,
-                "model_config": {
-                    "head_layers": 2,
-                    "tail_layers": 2,
-                    "body_layers": 8
-                }
-            }
+    #         # Save training metadata including custom token info
+    #         metadata = {
+    #             "vocab_size": len(self.tokenizer),
+    #             "original_vocab_size": 50257,
+    #             "custom_tokens": {
+    #                 "delim_token": self.DELIM,
+    #                 "delim_id": self.tokenizer.encode(self.DELIM, add_special_tokens=False)[0],
+    #                 "pad_token": self.PAD,
+    #                 "pad_id": self.tokenizer.pad_token_id
+    #             },
+    #             "metrics": self.metrics,
+    #             "model_config": {
+    #                 "head_layers": 2,
+    #                 "tail_layers": 2,
+    #                 "body_layers": 8
+    #             }
+    #         }
             
-            with open(os.path.join(path, "training_metadata.json"), "w") as f:
-                json.dump(metadata, f, indent=2)
+    #         with open(os.path.join(path, "training_metadata.json"), "w") as f:
+    #             json.dump(metadata, f, indent=2)
             
-            print(f"✅ Merged checkpoint with custom embeddings saved to {path}")
-            return path
+    #         print(f"✅ Merged checkpoint with custom embeddings saved to {path}")
+    #         return path
             
-        except Exception as e:
-            print(f"❌ Error saving merged checkpoint: {e}")
-            traceback.print_exc()
-            return None
+    #     except Exception as e:
+    #         print(f"❌ Error saving merged checkpoint: {e}")
+    #         traceback.print_exc()
+    #         return None
 
-    def load_checkpoint(self, path="./splitlora_checkpoint"):
-        from transformers.models.gpt2.configuration_gpt2 import GPT2Config
-        """FIXED: Load merged models from state dicts"""
-        if not os.path.exists(path):
-            print(f"❌ Checkpoint path {path} does not exist")
-            return False
+    # def load_checkpoint(self, path="./splitlora_checkpoint"):
+    #     from transformers.models.gpt2.configuration_gpt2 import GPT2Config
+    #     """FIXED: Load merged models from state dicts"""
+    #     if not os.path.exists(path):
+    #         print(f"❌ Checkpoint path {path} does not exist")
+    #         return False
 
-        try:
-            # Load metadata first
-            with open(os.path.join(path, "training_metadata.json"), "r") as f:
-                metadata = json.load(f)
+    #     try:
+    #         # Load metadata first
+    #         with open(os.path.join(path, "training_metadata.json"), "r") as f:
+    #             metadata = json.load(f)
             
-            print(f"Loading merged checkpoint with vocab_size: {metadata['vocab_size']}")
+    #         print(f"Loading merged checkpoint with vocab_size: {metadata['vocab_size']}")
             
-            # Load tokenizer (preserves custom tokens)
-            self.tokenizer = AutoTokenizer.from_pretrained(os.path.join(path, "tokenizer"))
+    #         # Load tokenizer (preserves custom tokens)
+    #         self.tokenizer = AutoTokenizer.from_pretrained(os.path.join(path, "tokenizer"))
             
-            # FIXED: Create fresh full model with correct vocab size
-            from transformers import GPT2LMHeadModel
-            full_model = GPT2LMHeadModel.from_pretrained('gpt2')
+    #         # FIXED: Create fresh full model with correct vocab size
+    #         from transformers import GPT2LMHeadModel
+    #         full_model = GPT2LMHeadModel.from_pretrained('gpt2')
             
-            # Resize to match saved model
-            full_model.resize_token_embeddings(metadata['vocab_size'])
+    #         # Resize to match saved model
+    #         full_model.resize_token_embeddings(metadata['vocab_size'])
             
-            # Load the merged head model state dict to get the embeddings
-            head_state = torch.load(os.path.join(path, "head_model_merged.pt"), map_location=device)
+    #         # Load the merged head model state dict to get the embeddings
+    #         head_state = torch.load(os.path.join(path, "head_model_merged.pt"), map_location=device)
             
-            # Extract embedding weights and copy to full model
-            if 'wte.weight' in head_state:
-                full_model.transformer.wte.weight.data = head_state['wte.weight']
-            if 'wpe.weight' in head_state:
-                full_model.transformer.wpe.weight.data = head_state['wpe.weight']
+    #         # Extract embedding weights and copy to full model
+    #         if 'wte.weight' in head_state:
+    #             full_model.transformer.wte.weight.data = head_state['wte.weight']
+    #         if 'wpe.weight' in head_state:
+    #             full_model.transformer.wpe.weight.data = head_state['wpe.weight']
             
-            with torch.serialization.safe_globals([GPT2Config]):
-                head_config = torch.load(os.path.join(path, "head_config.pt"), 
-                                        map_location=device, weights_only=True)
-                body_state = torch.load(os.path.join(path, "body_model_merged.pt"), 
-                                    map_location=device, weights_only=True) 
-                tail_state = torch.load(os.path.join(path, "tail_model_merged.pt"), 
-                                    map_location=device, weights_only=True)
-                # Reconstruct layer weights in full model
-            layer_idx = 0
+    #         with torch.serialization.safe_globals([GPT2Config]):
+    #             head_config = torch.load(os.path.join(path, "head_config.pt"), 
+    #                                     map_location=device, weights_only=True)
+    #             body_state = torch.load(os.path.join(path, "body_model_merged.pt"), 
+    #                                 map_location=device, weights_only=True) 
+    #             tail_state = torch.load(os.path.join(path, "tail_model_merged.pt"), 
+    #                                 map_location=device, weights_only=True)
+    #             # Reconstruct layer weights in full model
+    #         layer_idx = 0
             
-            # Head layers
-            for i in range(2):  # head_layers
-                if f'h.{i}.ln_1.weight' in head_state:
-                    full_model.transformer.h[layer_idx].load_state_dict({
-                        k[len(f'h.{i}.'):]: v for k, v in head_state.items() 
-                        if k.startswith(f'h.{i}.')
-                    }, strict=False)
-                layer_idx += 1
+    #         # Head layers
+    #         for i in range(2):  # head_layers
+    #             if f'h.{i}.ln_1.weight' in head_state:
+    #                 full_model.transformer.h[layer_idx].load_state_dict({
+    #                     k[len(f'h.{i}.'):]: v for k, v in head_state.items() 
+    #                     if k.startswith(f'h.{i}.')
+    #                 }, strict=False)
+    #             layer_idx += 1
             
-            # Body layers  
-            for i in range(8):  # body_layers
-                body_layer_key = f'transformer.h.{i}'
-                if f'{body_layer_key}.ln_1.weight' in body_state:
-                    full_model.transformer.h[layer_idx].load_state_dict({
-                        k[len(f'{body_layer_key}.'):]: v for k, v in body_state.items()
-                        if k.startswith(f'{body_layer_key}.')
-                    }, strict=False)
-                layer_idx += 1
+    #         # Body layers  
+    #         for i in range(8):  # body_layers
+    #             body_layer_key = f'transformer.h.{i}'
+    #             if f'{body_layer_key}.ln_1.weight' in body_state:
+    #                 full_model.transformer.h[layer_idx].load_state_dict({
+    #                     k[len(f'{body_layer_key}.'):]: v for k, v in body_state.items()
+    #                     if k.startswith(f'{body_layer_key}.')
+    #                 }, strict=False)
+    #             layer_idx += 1
             
-            # Tail layers
-            for i in range(2):  # tail_layers
-                tail_layer_key = f'transformer.h.{i}'
-                if f'{tail_layer_key}.ln_1.weight' in tail_state:
-                    full_model.transformer.h[layer_idx].load_state_dict({
-                        k[len(f'{tail_layer_key}.'):]: v for k, v in tail_state.items()
-                        if k.startswith(f'{tail_layer_key}.')
-                    }, strict=False)
-                layer_idx += 1
+    #         # Tail layers
+    #         for i in range(2):  # tail_layers
+    #             tail_layer_key = f'transformer.h.{i}'
+    #             if f'{tail_layer_key}.ln_1.weight' in tail_state:
+    #                 full_model.transformer.h[layer_idx].load_state_dict({
+    #                     k[len(f'{tail_layer_key}.'):]: v for k, v in tail_state.items()
+    #                     if k.startswith(f'{tail_layer_key}.')
+    #                 }, strict=False)
+    #             layer_idx += 1
             
-            # Load final layer norm and LM head from tail
-            if 'transformer.ln_f.weight' in tail_state:
-                full_model.transformer.ln_f.weight.data = tail_state['transformer.ln_f.weight']
-                full_model.transformer.ln_f.bias.data = tail_state['transformer.ln_f.bias']
+    #         # Load final layer norm and LM head from tail
+    #         if 'transformer.ln_f.weight' in tail_state:
+    #             full_model.transformer.ln_f.weight.data = tail_state['transformer.ln_f.weight']
+    #             full_model.transformer.ln_f.bias.data = tail_state['transformer.ln_f.bias']
             
-            if 'lm_head.weight' in tail_state:
-                full_model.lm_head.weight.data = tail_state['lm_head.weight']
+    #         if 'lm_head.weight' in tail_state:
+    #             full_model.lm_head.weight.data = tail_state['lm_head.weight']
             
-            print("✅ Merged models loaded successfully with custom embeddings")
+    #         print("✅ Merged models loaded successfully with custom embeddings")
             
-            # Verify custom token embeddings were preserved
-            delim_id = metadata["custom_tokens"]["delim_id"]
-            delim_embedding = full_model.transformer.wte.weight[delim_id]
-            print(f"Loaded DELIM embedding norm: {delim_embedding.norm().item():.4f}")
+    #         # Verify custom token embeddings were preserved
+    #         delim_id = metadata["custom_tokens"]["delim_id"]
+    #         delim_embedding = full_model.transformer.wte.weight[delim_id]
+    #         print(f"Loaded DELIM embedding norm: {delim_embedding.norm().item():.4f}")
             
-            # Recreate split models from loaded full model
-            head_model, body_model, tail_model = split_gpt2(full_model, 2, 2)
+    #         # Recreate split models from loaded full model
+    #         head_model, body_model, tail_model = split_gpt2(full_model, 2, 2)
             
-            # Re-apply PEFT to the loaded models
-            lora_config = LoraConfig(
-                r=2, lora_alpha=32, lora_dropout=0.1,
-                bias="lora_only", use_dora=True, task_type="CAUSAL_LM",
-                target_modules=["c_attn", "c_proj", "c_fc"]
-            )
+    #         # Re-apply PEFT to the loaded models
+    #         lora_config = LoraConfig(
+    #             r=2, lora_alpha=32, lora_dropout=0.1,
+    #             bias="lora_only", use_dora=True, task_type="CAUSAL_LM",
+    #             target_modules=["c_attn", "c_proj", "c_fc"]
+    #         )
             
-            head_model = get_peft_model(head_model, lora_config)
-            body_model = get_peft_model(body_model, lora_config)
-            tail_model = get_peft_model(tail_model, lora_config)
+    #         head_model = get_peft_model(head_model, lora_config)
+    #         body_model = get_peft_model(body_model, lora_config)
+    #         tail_model = get_peft_model(tail_model, lora_config)
             
-            # Update components with loaded models
-            self.head_client.head_model = head_model.to(device)
-            self.server.body_model = body_model.to(device)
-            self.tail_client.tail_model = tail_model.to(device)
+    #         # Update components with loaded models
+    #         self.head_client.head_model = head_model.to(device)
+    #         self.server.body_model = body_model.to(device)
+    #         self.tail_client.tail_model = tail_model.to(device)
             
-            # Ensure weight tying
-            self.tail_client.tail_model.base_model.lm_head.weight = self.head_client.head_model.base_model.wte.weight
+    #         # Ensure weight tying
+    #         self.tail_client.tail_model.base_model.lm_head.weight = self.head_client.head_model.base_model.wte.weight
             
-            print(f"✅ Checkpoint loaded successfully from {path}")
-            return True
+    #         print(f"✅ Checkpoint loaded successfully from {path}")
+    #         return True
 
-        except Exception as e:
-            print(f"❌ Error loading checkpoint: {e}")
-            traceback.print_exc()
-            return False
+    #     except Exception as e:
+    #         print(f"❌ Error loading checkpoint: {e}")
+    #         traceback.print_exc()
+    #         return False
 
 def analyze_sequence_lengths(trainer, dataset):
     """Analyze your actual data to choose optimal fixed length"""
@@ -1464,8 +1464,8 @@ def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
         # generate only the first time we meet this MR
         if mr not in store:
             try:
-                pred = test_simple_greedy(
-                           trainer, wrapper, mr)      # any ref is fine
+                pred = generate_with_beam_mbr(
+                           trainer, wrapper, mr, ref)      # any ref is fine
             except Exception as e:
                 print("generation failed:", e)
                 pred = "empty"
@@ -1530,16 +1530,14 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text, max_new_tokens=6
         # ULTRA SIMPLE beam search - no complex parameters
         output = wrapper.generate(
             ids,
-            max_new_tokens=max_out,           # SplitLoRA's eval_len
-            num_beams=10,                # SplitLoRA's beam size
-            length_penalty=0.8,          # SplitLoRA's length_penalty
-            no_repeat_ngram_size=4,      # SplitLoRA's setting
-            repetition_penalty=1.0,      # SplitLoRA's setting
-            do_sample=False,             # Pure beam search
+            num_beams=10,
+            length_penalty=0.7,
+            no_repeat_ngram_size=4,
+            max_new_tokens=64,
             early_stopping=True,
             eos_token_id=trainer.tokenizer.eos_token_id,
-            pad_token_id=trainer.tokenizer.pad_token_id,
-        )
+            pad_token_id=trainer.tokenizer.eos_token_id)
+        
 
     result = trainer.tokenizer.decode(output[0][ids.size(1):], skip_special_tokens=True).strip()
     return result
