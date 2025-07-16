@@ -492,40 +492,52 @@ class SplitLoRATrainer:
 
 
     def preprocess(self, example, sequence_length=None):
+        """
+        Build a single training instance.
+        The MR tokens come first, followed by the delimiter tokens,
+        followed by the reference tokens.
+
+        Anything beyond `sequence_length` is hard-truncated from the *end*,
+        so the delimiter is never lost.
+        """
         SEQ_LEN = sequence_length or 512
-        mr, ref = example["meaning_representation"], example["human_reference"]
 
-        full_text = mr + self.DELIM_SPACED + ref           # unchanged
-        encoding  = self.tokenizer(
-            full_text, max_length=SEQ_LEN, truncation=True,
-            padding=False, return_attention_mask=True)
+        mr  = example["meaning_representation"]
+        ref = example["human_reference"]
 
-        input_ids = encoding["input_ids"]
-        labels    = input_ids.copy()
+        # --- tokenise pieces independently ---------------------------------
+        ids_mr   = self.tokenizer.encode(mr,  add_special_tokens=False)
+        ids_ref  = self.tokenizer.encode(ref, add_special_tokens=False)
+        ids_delim = self.DELIM_TOKENS                      # already built in __init__
 
-        # ── NEW: reliable delimiter search ─────────────────────────────
-        delim_pos = self._find_delim(input_ids)
-        if delim_pos is None:
-            print("⚠️  delimiter not found after tokenisation → fallback")
-            delim_pos = len(input_ids) // 2                # or any fallback
-        else:
-            print(f"✅ Strategy 1: delimiter ends at {delim_pos}")
+        # -------------------------------------------------------------------
+        # [MR] + [DELIM] + [REF]
+        # -------------------------------------------------------------------
+        input_ids = ids_mr + ids_delim + ids_ref
 
-        # mask everything up to & incl. delimiter
-        labels[:delim_pos + 1] = [-100] * (delim_pos + 1)
+        # hard truncation from the right – ensures delimiter is always kept
+        if len(input_ids) > SEQ_LEN:
+            input_ids = input_ids[:SEQ_LEN]
+            # if we chopped off part of the reference we must chop the same
+            # amount from the labels to keep alignment
+            chop = max(0, len(ids_mr) + len(ids_delim) + len(ids_ref) - SEQ_LEN)
+            ids_ref = ids_ref[:-chop] if chop else ids_ref
 
-        # ignore later pad tokens in the loss
-        pad_id = self.tokenizer.pad_token_id
-        labels = [-100 if tok == pad_id else tok for tok in labels]
+        # -------------------------------------------------------------------
+        # labels: mask everything up to and including the delimiter
+        # -------------------------------------------------------------------
+        labels = [-100] * (len(ids_mr) + len(ids_delim)) + ids_ref
+        labels = labels[:SEQ_LEN]                        # may already be correct
+
+        attention_mask = [1] * len(input_ids)            # no pad yet
 
         return {
             "input_ids":        input_ids,
-            "attention_mask":   encoding["attention_mask"],
+            "attention_mask":   attention_mask,
             "labels":           labels,
             "human_reference":  ref,
             "meaning_representation": mr,
         }
-
 
 
 
