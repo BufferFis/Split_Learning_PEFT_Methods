@@ -431,12 +431,10 @@ class SplitLoRATrainer:
         original_vocab_size = len(self.tokenizer)
         self.PAD = self.tokenizer.pad_token
         self.tokenizer.padding_side = "right"
-        self.DELIM = ";"
-        self.DELIM_SPACED = " ;"         # what you insert
-        self.DELIM_TOKENS  = self.tokenizer.encode(
-            self.DELIM_SPACED, add_special_tokens=False)
+        self.DELIM         = ";"              # no spaces
+        self.DELIM_TOKENS  = self.tokenizer.encode(self.DELIM, add_special_tokens=False)
         print(f"DELIM pattern: {self.DELIM_SPACED!r} -> {self.DELIM_TOKENS}")
-        assert len(self.DELIM_TOKENS) == 1,  "delimiter should be single token"
+        assert len(self.DELIM_TOKENS) == 1
         # Set generation config with existing vocabulary
         full_model.config.eos_token_id = self.tokenizer.eos_token_id
         full_model.config.pad_token_id = self.tokenizer.pad_token_id
@@ -499,7 +497,7 @@ class SplitLoRATrainer:
         Anything beyond `sequence_length` is hard-truncated from the *end*,
         so the delimiter is never lost.
         """
-        SEQ_LEN = sequence_length or 512
+        SEQ_LEN = sequence_length if sequence_length is not None else self.max_seq_len
 
         mr  = example["meaning_representation"]
         ref = example["human_reference"]
@@ -1658,7 +1656,7 @@ def main():
     
     if args.eval_only:
         train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False, 
-                                                        sequence_length=optimal_length)
+                                                        sequence_length=trainer.max_seq_len)
         print("Setting up E2E evaluation with official dataset...")
         create_e2e_reference_file_from_official_csv()
         diagnose_training_data(trainer, train_ds)
@@ -1704,12 +1702,12 @@ def main():
     
     # Load dataset (regular mode)
     train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False, 
-                                                    sequence_length=optimal_length)
+                                                    sequence_length=trainer.max_seq_len)
     diagnose_training_data(trainer, train_ds)
     diagnose_preprocessing_detailed(trainer)
     diagnose_custom_token_embeddings(trainer)
     # Create dataloader and train
-    train_dl = trainer.create_dataloader(train_ds, batch_size=args.batch_size, shuffle=True, sequence_length=optimal_length)
+    train_dl = trainer.create_dataloader(train_ds, batch_size=args.batch_size, shuffle=True, sequence_length=trainer.max_seq_len)
     trainer.attach_schedulers(train_dl)
     print(f"Vocab size: {len(trainer.tokenizer)}")
     print(f"DELIM token: '{trainer.DELIM}' -> {trainer.tokenizer.encode(trainer.DELIM)}")
