@@ -1329,8 +1329,8 @@ def diagnose_preprocessing_detailed(trainer):
     # Process manually step by step (KEEP all the detailed analysis)
     mr_text = raw_example["meaning_representation"]
     ref_text = raw_example["human_reference"]
-    space_delim = " " + trainer.DELIM + " "
-    full_text = mr_text + space_delim + ref_text
+    space_delim = trainer.DELIM 
+    full_text = mr_text + " " + space_delim + " " + ref_text
     
     print(f"Full text: '{full_text}'")
     
@@ -1714,6 +1714,7 @@ def main():
     diagnose_training_data(trainer, train_ds)
     diagnose_preprocessing_detailed(trainer)
     diagnose_custom_token_embeddings(trainer)
+    count_zero_target_rows(train_ds)
     # Create dataloader and train
     train_dl = trainer.create_dataloader(train_ds, batch_size=args.batch_size, shuffle=True, sequence_length=trainer.max_seq_len)
     trainer.attach_schedulers(train_dl)
