@@ -1728,7 +1728,7 @@ def main():
         trainer.save_checkpoint(args.save_path, epoch=ep)
     
     
-    trainer.save_checkpoint(args.save_path)
+    
 
 
 if __name__ == "__main__":
