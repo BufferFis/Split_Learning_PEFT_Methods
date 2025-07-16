@@ -611,7 +611,7 @@ class SplitLoRATrainer:
 
             # build attention mask on-the-fly (1 = real token, 0 = pad/eos padding)
             
-            attn = (ids != self.tokenizer.pad_token_id).bool()
+            attn = (ids != self.tokenizer.pad_token_id).long()
 
             return {"input_ids": ids,
                     "attention_mask": attn,
