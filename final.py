@@ -497,7 +497,7 @@ class SplitLoRATrainer:
         input_ids = encoding["input_ids"]
         
         # ROBUST: Multiple search strategies for delimiter
-        delim_core_token = 50257  # Your <|gen|> token
+        delim_core_token = self.DELIM  # Your <|gen|> token
         delim_pos = None
         
         # Strategy 1: Direct search for delimiter token
