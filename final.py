@@ -1605,7 +1605,15 @@ def test_single_token_delimiters(tokenizer):
         tokens = tokenizer.encode(delim, add_special_tokens=False)
         print(f"'{delim}' -> {tokens} ({len(tokens)} tokens) {'✅ SINGLE' if len(tokens) == 1 else '❌ MULTI'}")
 
-
+def count_zero_target_rows(dataset):
+    """
+    Print how many examples have *no* real target tokens
+    (i.e. every label == -100).
+    """
+    bad = sum(1 for ex in dataset if all(t == -100 for t in ex["labels"]))
+    total = len(dataset)
+    print(f"⚠️  rows with ZERO target tokens: {bad}/{total} "
+          f"({bad/total*100:.2f} %)")
 
 
 def main():
@@ -1661,6 +1669,7 @@ def main():
         diagnose_training_data(trainer, train_ds)
         diagnose_preprocessing_detailed(trainer)
         diagnose_custom_token_embeddings(trainer)
+        count_zero_target_rows(train_ds)
         #NEW FIX
         debug_full_tokenization(trainer, train_ds[0])
         # quick manual check on one MR
@@ -1714,7 +1723,7 @@ def main():
     print(f"EOS token: '{trainer.tokenizer.eos_token}' -> {trainer.tokenizer.eos_token_id}")
     for ep in range(start_epoch, start_epoch + args.epochs):
         trainer.train(train_dl, epochs=1)
-        trainer.save(args.save_path, epoch=ep)
+        trainer.save_checkpoint(args.save_path, epoch=ep)
     
     
     trainer.save_checkpoint(args.save_path)
