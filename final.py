@@ -432,6 +432,12 @@ class SplitLoRATrainer:
         self.PAD = self.tokenizer.pad_token
         self.tokenizer.padding_side = "right"
         self.DELIM = ";"
+        self.DELIM_SPACED = " " + self.DELIM + " "         # what you insert
+        self.DELIM_TOKENS = self.tokenizer.encode(         # e.g. [22013]
+            self.DELIM_SPACED,
+            add_special_tokens=False)
+        print(f"DELIM pattern: {self.DELIM_SPACED!r} -> {self.DELIM_TOKENS}")
+
         # Set generation config with existing vocabulary
         full_model.config.eos_token_id = self.tokenizer.eos_token_id
         full_model.config.pad_token_id = self.tokenizer.pad_token_id
@@ -475,95 +481,51 @@ class SplitLoRATrainer:
         self.max_epochs = max_epochs
         self.schedulers = []
 
-        
+    def _find_delim(self, seq):
+        """Return index of LAST delimiter token or None if absent."""
+        pat = self.DELIM_TOKENS
+        plen = len(pat)
+        for i in range(len(seq) - plen + 1):
+            if seq[i:i + plen] == pat:
+                return i + plen - 1                # last token index
+        return None
+
+
     def preprocess(self, example, sequence_length=None):
-        SEQUENCE_LENGTH = sequence_length if sequence_length is not None else 512
-        mr_text = example["meaning_representation"]
-        ref_text = example["human_reference"]
-        
-        # Keep your current delimiter approach
-        space_delim = " " + self.DELIM + " "
-        full_text = mr_text + space_delim + ref_text
-        
-        encoding = self.tokenizer(
-            full_text,
-            max_length=SEQUENCE_LENGTH,
-            truncation=True,
-            padding=False,
-            return_attention_mask=True
-        )
-        
-        labels = encoding["input_ids"].copy()
+        SEQ_LEN = sequence_length or 512
+        mr, ref = example["meaning_representation"], example["human_reference"]
+
+        full_text = mr + self.DELIM_SPACED + ref           # unchanged
+        encoding  = self.tokenizer(
+            full_text, max_length=SEQ_LEN, truncation=True,
+            padding=False, return_attention_mask=True)
+
         input_ids = encoding["input_ids"]
-        
-        # ROBUST: Multiple search strategies for delimiter
-        delim_core_token = self.DELIM  # Your <|gen|> token
-        delim_pos = None
-        
-        # Strategy 1: Direct search for delimiter token
-        try:
-            delim_pos = input_ids.index(delim_core_token)
-            print(f"✅ Strategy 1: Delimiter found at position {delim_pos}")
-        except ValueError:
-            print("Strategy 1 failed: Core delimiter token not found")
-        
-        # Strategy 2: If not found, search in non-padding region only
+        labels    = input_ids.copy()
+
+        # ── NEW: reliable delimiter search ─────────────────────────────
+        delim_pos = self._find_delim(input_ids)
         if delim_pos is None:
-            pad_token_id = self.tokenizer.pad_token_id
-            for i, token_id in enumerate(input_ids):
-                if token_id == pad_token_id:
-                    break  # Stop at first padding token
-                if token_id == delim_core_token:
-                    delim_pos = i
-                    print(f"✅ Strategy 2: Delimiter found at position {delim_pos}")
-                    break
-        
-        # Strategy 3: Structural fallback using E2E dataset patterns
-        if delim_pos is None:
-            print("⚠️ Using structural fallback")
-            # E2E MRs typically end with "]" followed by space
-            bracket_positions = []
-            for i, token_id in enumerate(input_ids):
-                token_text = self.tokenizer.decode([token_id])
-                if token_text == "]":
-                    bracket_positions.append(i)
-            
-            if bracket_positions:
-                # Use the last bracket as the end of MR
-                delim_pos = bracket_positions[-1] + 1
-                print(f"✅ Strategy 3: Using bracket fallback at position {delim_pos}")
-            else:
-                # Final fallback
-                delim_pos = len([t for t in input_ids if t != self.tokenizer.pad_token_id]) // 2
-                print(f"⚠️ Strategy 4: Using 50% fallback at position {delim_pos}")
-        
-        # Apply masking
-        if delim_pos is not None:
-            # Mask everything up to and including the delimiter position
-            labels[:delim_pos + 1] = [-100] * (delim_pos + 1)
-            
-            # Verify we have training tokens
-            training_tokens = sum(1 for label in labels if label != -100 and label != self.tokenizer.pad_token_id)
-            print(f"Training tokens available: {training_tokens}")
-            
-            if training_tokens < 3:
-                print("❌ WARNING: Very few training tokens available!")
-                # Show what we're trying to predict
-                target_ids = [t for t in labels if t != -100 and t != self.tokenizer.pad_token_id]
-                if target_ids:
-                    target_text = self.tokenizer.decode(target_ids[:10])  # First 10 tokens
-                    print(f"Target preview: '{target_text}...'")
-        
-        # Mask padding tokens
-        labels = [-100 if tok == self.tokenizer.pad_token_id else tok for tok in labels]
-        
+            print("⚠️  delimiter not found after tokenisation → fallback")
+            delim_pos = len(input_ids) // 2                # or any fallback
+        else:
+            print(f"✅ Strategy 1: delimiter ends at {delim_pos}")
+
+        # mask everything up to & incl. delimiter
+        labels[:delim_pos + 1] = [-100] * (delim_pos + 1)
+
+        # ignore later pad tokens in the loss
+        pad_id = self.tokenizer.pad_token_id
+        labels = [-100 if tok == pad_id else tok for tok in labels]
+
         return {
-            "input_ids": encoding["input_ids"],
-            "attention_mask": encoding["attention_mask"],
-            "labels": labels,
-            "human_reference": example["human_reference"],
-            "meaning_representation": mr_text
+            "input_ids":        input_ids,
+            "attention_mask":   encoding["attention_mask"],
+            "labels":           labels,
+            "human_reference":  ref,
+            "meaning_representation": mr,
         }
+
 
 
 
