@@ -836,33 +836,60 @@ class SplitLoRATrainer:
             else:
                 print("Sequence too short for meaningful analysis")
 
-    def save_checkpoint(self, epoch, path="ckpt.pt"):
+    def save_checkpoint(self, path: str = "checkpoint.pt", epoch: int = 0):
+        """
+        Save everything needed to  resume or to run inference later.
+        If `path` is a directory, a file called `checkpoint.pt` is written inside it.
+        """
+        if os.path.isdir(path):
+            path = os.path.join(path, "checkpoint.pt")
+
         torch.save({
-            "head_state": self.head_client.head_model.state_dict(),
-            "body_state": self.server.body_model.state_dict(),
-            "tail_state": self.tail_client.tail_model.state_dict(),
-            "opt_head": self.head_client.optimizer.state_dict(),
-            "opt_body": self.server.optimizer.state_dict(),
-            "opt_tail": self.tail_client.optimizer.state_dict(),
-            "sch_head": self.schedulers[0].state_dict(),
-            "sch_body": self.schedulers[1].state_dict(),
-            "sch_tail": self.schedulers[2].state_dict(),
-            "rng_state": torch.random.get_rng_state(),
+            "epoch":      epoch,
+            "head":       self.head_client.head_model.state_dict(),
+            "body":       self.server.body_model.state_dict(),
+            "tail":       self.tail_client.tail_model.state_dict(),
+            "opt_head":   self.head_client.optimizer.state_dict(),
+            "opt_body":   self.server.optimizer.state_dict(),
+            "opt_tail":   self.tail_client.optimizer.state_dict(),
+            "sch_head":   self.schedulers[0].state_dict() if self.schedulers else None,
+            "sch_body":   self.schedulers[1].state_dict() if self.schedulers else None,
+            "sch_tail":   self.schedulers[2].state_dict() if self.schedulers else None,
+            "rng_state":  torch.random.get_rng_state(),
         }, path)
+        print(f"✅ checkpoint saved to {path}")
     
-    def load_checkpoint(self, path="ckpt.pt"):
+    def load_checkpoint(self, path: str = "checkpoint.pt", *, eval_only: bool = False) -> int:
+        """
+        Load weights; return the epoch *after* the one stored (for easy resumption).
+        Set `eval_only=True` to skip optimiser/scheduler and switch all parts to .eval().
+        """
         ckpt = torch.load(path, map_location=device)
-        self.head_client.head_model.load_state_dict(ckpt["head_state"])
-        self.server.body_model.load_state_dict(ckpt["body_state"])
-        self.tail_client.tail_model.load_state_dict(ckpt["tail_state"])
+
+        self.head_client.head_model.load_state_dict(ckpt["head"])
+        self.server.body_model.load_state_dict(ckpt["body"])
+        self.tail_client.tail_model.load_state_dict(ckpt["tail"])
+
+        if eval_only:
+            self.head_client.head_model.eval()
+            self.server.body_model.eval()
+            self.tail_client.tail_model.eval()
+            print("✅ model loaded for evaluation only")
+            return ckpt.get("epoch", 0) + 1
+
+        # training resume: load optimiser & scheduler
         self.head_client.optimizer.load_state_dict(ckpt["opt_head"])
         self.server.optimizer.load_state_dict(ckpt["opt_body"])
         self.tail_client.optimizer.load_state_dict(ckpt["opt_tail"])
-        self.schedulers[0].load_state_dict(ckpt["sch_head"])
-        self.schedulers[1].load_state_dict(ckpt["sch_body"])
-        self.schedulers[2].load_state_dict(ckpt["sch_tail"])
+
+        if ckpt["sch_head"] is not None:
+            self.schedulers[0].load_state_dict(ckpt["sch_head"])
+            self.schedulers[1].load_state_dict(ckpt["sch_body"])
+            self.schedulers[2].load_state_dict(ckpt["sch_tail"])
+
         torch.random.set_rng_state(ckpt["rng_state"])
-        return ckpt["epoch"] + 1          # resume from next epoch
+        print(f"✅ checkpoint loaded from {path} – resuming training")
+        return ckpt.get("epoch", 0) + 1
     
     # def save_checkpoint(self, path="./splitlora_checkpoint"):
     #     """FIXED: Save merged models using state dicts"""
@@ -1609,9 +1636,11 @@ def main():
     train_ds_temp, _ = trainer.load_e2e_dataset(debug_mode=False)
     optimal_length = analyze_sequence_lengths(trainer, train_ds_temp)
     trainer.max_seq_len = optimal_length
+    start_epoch = 0
     # Load checkpoint if specified
     if args.load_checkpoint:
-        trainer.load_checkpoint(args.load_checkpoint)
+        start_epoch = trainer.load_checkpoint(args.load_checkpoint,
+                                            eval_only=args.eval_only) 
         diagnose_custom_token_embeddings(trainer)
     
     wrapper = SplitGPT2ForGeneration(
@@ -1672,24 +1701,26 @@ def main():
 
 
 
-    if not args.eval_only:
-        # Load dataset (regular mode)
-        train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False, 
-                                                     sequence_length=optimal_length)
-        diagnose_training_data(trainer, train_ds)
-        diagnose_preprocessing_detailed(trainer)
-        diagnose_custom_token_embeddings(trainer)
-        # Create dataloader and train
-        train_dl = trainer.create_dataloader(train_ds, batch_size=args.batch_size, shuffle=True, sequence_length=optimal_length)
-        trainer.attach_schedulers(train_dl)
-        print(f"Vocab size: {len(trainer.tokenizer)}")
-        print(f"DELIM token: '{trainer.DELIM}' -> {trainer.tokenizer.encode(trainer.DELIM)}")
-        print(f"PAD token: '{trainer.PAD}' -> {trainer.tokenizer.pad_token_id}")
-        print(f"EOS token: '{trainer.tokenizer.eos_token}' -> {trainer.tokenizer.eos_token_id}")
-        trainer.train(train_dl, epochs=args.epochs)
-        
-        # Save checkpoint
-        trainer.save_checkpoint(args.save_path)
+    
+    # Load dataset (regular mode)
+    train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False, 
+                                                    sequence_length=optimal_length)
+    diagnose_training_data(trainer, train_ds)
+    diagnose_preprocessing_detailed(trainer)
+    diagnose_custom_token_embeddings(trainer)
+    # Create dataloader and train
+    train_dl = trainer.create_dataloader(train_ds, batch_size=args.batch_size, shuffle=True, sequence_length=optimal_length)
+    trainer.attach_schedulers(train_dl)
+    print(f"Vocab size: {len(trainer.tokenizer)}")
+    print(f"DELIM token: '{trainer.DELIM}' -> {trainer.tokenizer.encode(trainer.DELIM)}")
+    print(f"PAD token: '{trainer.PAD}' -> {trainer.tokenizer.pad_token_id}")
+    print(f"EOS token: '{trainer.tokenizer.eos_token}' -> {trainer.tokenizer.eos_token_id}")
+    for ep in range(start_epoch, start_epoch + args.epochs):
+        trainer.train(train_dl, epochs=1)
+        trainer.save(args.save_path, epoch=ep)
+    
+    
+    trainer.save_checkpoint(args.save_path)
 
 
 if __name__ == "__main__":
