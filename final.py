@@ -611,7 +611,7 @@ class SplitLoRATrainer:
 
             # build attention mask on-the-fly (1 = real token, 0 = pad/eos padding)
             
-            attn = (ids != self.tokenizer.pad_token_id)
+            attn = (ids != self.tokenizer.pad_token_id).bool()
 
             return {"input_ids": ids,
                     "attention_mask": attn,
@@ -722,7 +722,7 @@ class SplitLoRATrainer:
                         print("   LABEL:", self.tokenizer.decode(lbl_ids))
                 try:
                     input_ids = batch["input_ids"].to(device)
-                    attention_mask = batch["attention_mask"].to(device)
+                    attention_mask = batch["attention_mask"].to(device).bool()
                     labels = batch["labels"].to(device)
 
                     #print(f"Input attention mask sum: {attention_mask.sum()}")
