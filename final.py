@@ -1464,8 +1464,8 @@ def evaluate_beam(trainer, wrapper, dataset, n_samples=100):
         # generate only the first time we meet this MR
         if mr not in store:
             try:
-                pred = generate_with_beam_mbr(
-                           trainer, wrapper, mr, ref)      # any ref is fine
+                pred = test_simple_greedy(
+                           trainer, wrapper, mr)      # any ref is fine
             except Exception as e:
                 print("generation failed:", e)
                 pred = "empty"
