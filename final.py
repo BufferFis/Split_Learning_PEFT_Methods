@@ -736,9 +736,9 @@ class SplitLoRATrainer:
                         continue
                     
                     # Forward through pipeline
-                    head_activations = self.head_client.forward(input_ids)  # No attention_mask
-                    body_activations, head_activations_stored = self.server.forward_train(head_activations)  # No attention_mask
-                    loss, body_grad = self.tail_client.compute_loss_and_backward(body_activations, labels)  # No attention_mask
+                    head_activations = self.head_client.forward(input_ids, attention_mask=attention_mask)  # No attention_mask
+                    body_activations, head_activations_stored = self.server.forward_train(head_activations, attention_mask)  # No attention_mask
+                    loss, body_grad = self.tail_client.compute_loss_and_backward(body_activations, labels, attention_mask)  # No attention_mask
 
                     
                     # FIX: Check for NaN loss
