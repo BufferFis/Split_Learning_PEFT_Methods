@@ -432,12 +432,11 @@ class SplitLoRATrainer:
         self.PAD = self.tokenizer.pad_token
         self.tokenizer.padding_side = "right"
         self.DELIM = ";"
-        self.DELIM_SPACED = " " + self.DELIM + " "         # what you insert
-        self.DELIM_TOKENS = self.tokenizer.encode(         # e.g. [22013]
-            self.DELIM_SPACED,
-            add_special_tokens=False)
+        self.DELIM_SPACED = " ;"         # what you insert
+        self.DELIM_TOKENS  = self.tokenizer.encode(
+            self.DELIM_SPACED, add_special_tokens=False)
         print(f"DELIM pattern: {self.DELIM_SPACED!r} -> {self.DELIM_TOKENS}")
-
+        assert len(self.DELIM_TOKENS) == 1,  "delimiter should be single token"
         # Set generation config with existing vocabulary
         full_model.config.eos_token_id = self.tokenizer.eos_token_id
         full_model.config.pad_token_id = self.tokenizer.pad_token_id
@@ -614,7 +613,8 @@ class SplitLoRATrainer:
                                 padding_value=-100)                 # ignore in loss
 
             # build attention mask on-the-fly (1 = real token, 0 = pad/eos padding)
-            attn = (ids != self.tokenizer.eos_token_id).long()
+            
+            attn = (ids != self.tokenizer.pad_token_id).long()
 
             return {"input_ids": ids,
                     "attention_mask": attn,
