@@ -433,7 +433,6 @@ class SplitLoRATrainer:
         self.tokenizer.padding_side = "right"
         self.DELIM         = ";"              # no spaces
         self.DELIM_TOKENS  = self.tokenizer.encode(self.DELIM, add_special_tokens=False)
-        print(f"DELIM pattern: {self.DELIM_SPACED!r} -> {self.DELIM_TOKENS}")
         assert len(self.DELIM_TOKENS) == 1
         # Set generation config with existing vocabulary
         full_model.config.eos_token_id = self.tokenizer.eos_token_id
