@@ -422,7 +422,7 @@ class SplitLoRATrainer:
         
         self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
         full_model = GPT2LMHeadModel.from_pretrained('gpt2')
-        
+        self.max_seq_len = 256
 
          # FIXED: Properly initialize custom token embeddings
         original_vocab_size = len(self.tokenizer)
@@ -1526,10 +1526,11 @@ def generate_with_beam_mbr(trainer, wrapper, mr_text, ref_text, max_new_tokens=6
     ids, m = enc["input_ids"].to(device), enc["attention_mask"].to(device)
     bad_tokens = trainer.tokenizer.encode("_*#-=.", add_special_tokens=False)
     with torch.no_grad():
+        max_out = min(64, trainer.max_seq_len // 3)
         # ULTRA SIMPLE beam search - no complex parameters
-         output = wrapper.generate(
+        output = wrapper.generate(
             ids,
-            max_new_tokens=64,           # SplitLoRA's eval_len
+            max_new_tokens=max_out,           # SplitLoRA's eval_len
             num_beams=10,                # SplitLoRA's beam size
             length_penalty=0.8,          # SplitLoRA's length_penalty
             no_repeat_ngram_size=4,      # SplitLoRA's setting
@@ -1635,7 +1636,7 @@ def main():
     print("Analyzing sequence lengths to optimize training...")
     train_ds_temp, _ = trainer.load_e2e_dataset(debug_mode=False)
     optimal_length = analyze_sequence_lengths(trainer, train_ds_temp)
-    
+    trainer.max_seq_len = optimal_length
     # Load checkpoint if specified
     if args.load_checkpoint:
         trainer.load_checkpoint(args.load_checkpoint)
