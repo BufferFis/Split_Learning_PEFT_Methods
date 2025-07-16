@@ -1580,7 +1580,7 @@ def test_simple_greedy(trainer, wrapper, mr_text):
         # ABSOLUTE MINIMAL greedy generation
         output = wrapper.generate(
             ids,
-            max_new_tokens=12,              # Very short
+            #max_new_tokens=12,              # Very short
             do_sample=False,                # Pure greedy
             eos_token_id=trainer.tokenizer.eos_token_id,
             pad_token_id=trainer.tokenizer.pad_token_id,
