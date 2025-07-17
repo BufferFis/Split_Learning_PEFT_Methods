@@ -470,7 +470,7 @@ class SplitLoRATrainer:
         original_vocab_size = len(self.tokenizer)
         self.PAD = self.tokenizer.pad_token
         self.tokenizer.padding_side = "right"
-        self.DELIM         = ";"              # no spaces
+        self.DELIM         = "|"              # no spaces
         self.DELIM_TOKENS  = self.tokenizer.encode(self.DELIM, add_special_tokens=False)
         assert len(self.DELIM_TOKENS) == 1
         # Set generation config with existing vocabulary
