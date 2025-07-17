@@ -464,7 +464,7 @@ class SplitLoRATrainer:
         self.tokenizer.pad_token = self.tokenizer.eos_token
         full_model = AutoModelForCausalLM.from_pretrained("gpt2")
         full_model.config.pad_token_id = self.tokenizer.eos_token_id
-        self.max_seq_len = 150
+        self.max_seq_len = 256
 
         
         original_vocab_size = len(self.tokenizer)
@@ -550,52 +550,55 @@ class SplitLoRATrainer:
 
 
     def preprocess(self, example, sequence_length=None):
-        """
-        Build a single training instance.
-        The MR tokens come first, followed by the delimiter tokens,
-        followed by the reference tokens.
-
-        Anything beyond `sequence_length` is hard-truncated from the *end*,
-        so the delimiter is never lost.
-        """
+        """Simplified fix: Create labels after truncation"""
         SEQ_LEN = sequence_length if sequence_length is not None else self.max_seq_len
-
-        mr  = example["meaning_representation"]
+        
+        mr = example["meaning_representation"]
         ref = example["human_reference"]
-
-        # --- tokenise pieces independently ---------------------------------
-        ids_mr   = self.tokenizer.encode(mr,  add_special_tokens=False)
-        ids_ref  = self.tokenizer.encode(ref, add_special_tokens=False)
-        ids_delim = self.DELIM_TOKENS                      # already built in __init__
-
-        # -------------------------------------------------------------------
-        # [MR] + [DELIM] + [REF]
-        # -------------------------------------------------------------------
+        
+        # Tokenize pieces
+        ids_mr = self.tokenizer.encode(mr, add_special_tokens=False)
+        ids_ref = self.tokenizer.encode(ref, add_special_tokens=False)
+        ids_delim = self.DELIM_TOKENS
+        
+        # Build and truncate input sequence
         input_ids = ids_mr + ids_delim + ids_ref
-
-        # hard truncation from the right – ensures delimiter is always kept
         if len(input_ids) > SEQ_LEN:
             input_ids = input_ids[:SEQ_LEN]
-            # if we chopped off part of the reference we must chop the same
-            # amount from the labels to keep alignment
-            chop = max(0, len(ids_mr) + len(ids_delim) + len(ids_ref) - SEQ_LEN)
-            ids_ref = ids_ref[:-chop] if chop else ids_ref
-
-        # -------------------------------------------------------------------
-        # labels: mask everything up to and including the delimiter
-        # -------------------------------------------------------------------
-        labels = [-100] * (len(ids_mr) + len(ids_delim)) + ids_ref
-        labels = labels[:SEQ_LEN]                        # may already be correct
-
-        attention_mask = [1] * len(input_ids)            # no pad yet
-
+        
+        # Create labels by finding delimiter in TRUNCATED sequence
+        labels = []
+        delim_found = False
+        i = 0
+        
+        while i < len(input_ids):
+            # Check if delimiter starts at position i
+            if (i + len(ids_delim) <= len(input_ids) and 
+                input_ids[i:i+len(ids_delim)] == ids_delim):
+                # Mask delimiter tokens
+                labels.extend([-100] * len(ids_delim))
+                i += len(ids_delim)
+                delim_found = True
+                print("Delim Found YAAYYYY")
+            else:
+                if delim_found:
+                    # After delimiter - these are targets
+                    labels.append(input_ids[i])
+                else:
+                    # Before delimiter - mask MR tokens
+                    labels.append(-100)
+                i += 1
+        
+        attention_mask = [1] * len(input_ids)
+        
         return {
-            "input_ids":        input_ids,
-            "attention_mask":   attention_mask,
-            "labels":           labels,
-            "human_reference":  ref,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "human_reference": ref,
             "meaning_representation": mr,
         }
+
 
 
 
