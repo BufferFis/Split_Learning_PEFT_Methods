@@ -393,7 +393,7 @@ class TailClient:
         return attributes
     
     def validate_coverage(self, mr_text, generated_text):
-        """Validate that all MR attributes are covered in generated text"""
+        """Enhanced coverage validation for all E2E attributes"""
         attributes = self.extract_attributes(mr_text)
         gen_text_lower = generated_text.lower()
         
@@ -401,32 +401,71 @@ class TailClient:
         missing_attrs = []
         
         for attr_name, attr_value in attributes.items():
+            covered = False
+            
+            # Direct match first
             if attr_value in gen_text_lower:
-                covered_attrs.append(f"{attr_name}={attr_value}")
+                covered = True
             else:
-                covered = False
-                
+                # Attribute-specific matching
                 if attr_name == 'eatType':
                     synonyms = {
                         'coffee shop': ['coffee', 'café', 'cafe'],
                         'restaurant': ['restaurant', 'place', 'establishment'],
-                        'pub': ['pub', 'bar']
+                        'pub': ['pub', 'bar'],
+                        'fast food': ['fast food', 'takeaway']
                     }
                     if attr_value in synonyms:
                         covered = any(syn in gen_text_lower for syn in synonyms[attr_value])
                 
+                elif attr_name == 'food':
+                    # Food cuisines are usually mentioned directly
+                    covered = attr_value in gen_text_lower
+                
+                elif attr_name == 'priceRange':
+                    price_indicators = {
+                        'less than': ['cheap', 'inexpensive', 'affordable', 'less than'],
+                        'more than': ['expensive', 'pricey', 'costly', 'more than'],
+                        '£20-25': ['moderate', 'moderately priced'],
+                        '£': ['pound', 'pounds', '£']
+                    }
+                    for pattern, indicators in price_indicators.items():
+                        if pattern in attr_value:
+                            covered = any(ind in gen_text_lower for ind in indicators)
+                            break
+                
                 elif attr_name == 'area':
-                    if attr_value in ['city centre', 'city center']:
-                        covered = any(phrase in gen_text_lower for phrase in ['city centre', 'city center', 'centre', 'center'])
+                    area_patterns = {
+                        'city centre': ['city centre', 'city center', 'centre', 'center'],
+                        'city center': ['city centre', 'city center', 'centre', 'center'],
+                        'riverside': ['riverside', 'river side', 'by the river']
+                    }
+                    if attr_value in area_patterns:
+                        covered = any(phrase in gen_text_lower for phrase in area_patterns[attr_value])
                 
                 elif attr_name == 'familyFriendly':
                     if attr_value == 'yes':
                         covered = any(phrase in gen_text_lower for phrase in ['family', 'kid', 'child'])
+                    elif attr_value == 'no':
+                        covered = any(phrase in gen_text_lower for phrase in ['not family', 'adult only'])
                 
-                if covered:
-                    covered_attrs.append(f"{attr_name}={attr_value}")
-                else:
-                    missing_attrs.append(f"{attr_name}={attr_value}")
+                elif attr_name == 'customer rating' or attr_name == 'customerRating':
+                    # Handle ratings like "1 out of 5", "high", "average"
+                    if 'out of' in attr_value:
+                        # Extract number: "1 out of 5" -> "1"
+                        rating_num = attr_value.split()[0]
+                        covered = rating_num in gen_text_lower or attr_value in gen_text_lower
+                    else:
+                        covered = attr_value in gen_text_lower
+                
+                elif attr_name == 'near':
+                    # Handle "near X" references
+                    covered = attr_value in gen_text_lower or f"near {attr_value}" in gen_text_lower
+            
+            if covered:
+                covered_attrs.append(f"{attr_name}={attr_value}")
+            else:
+                missing_attrs.append(f"{attr_name}={attr_value}")
         
         coverage_ratio = len(covered_attrs) / len(attributes) if attributes else 1.0
         
@@ -436,6 +475,7 @@ class TailClient:
             'missing': missing_attrs,
             'complete': len(missing_attrs) == 0
         }
+
 
 class _DummyLoader:
     """
