@@ -231,9 +231,10 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             
         def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
             hidden_states = inputs_embeds
-
+            dtype = hidden_states.dtype
+            attn_mask = _expand_mask(attention_mask, dtype)
             for block in self.transformer.h:   
-                hidden_states = block(hidden_states,use_cache=False)[0]
+                hidden_states = block(hidden_states,attention_mask=attn_mask,use_cache=False)[0]
 
             hidden_states = self.transformer.ln_f(hidden_states)
             logits = self.lm_head(hidden_states)
