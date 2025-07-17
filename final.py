@@ -212,7 +212,10 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
     tail_model = TailModel(model, head_layers + body_layers)
     
     tail_model.lm_head.weight = head_model.wte.weight
-    
+    print(
+        "✅ Weight tying correct:",
+        tail_model.lm_head.weight.data_ptr() == head_model.base_model.model.wte.weight.data_ptr()
+    )
     return head_model, body_model, tail_model
 
 
