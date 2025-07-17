@@ -650,7 +650,7 @@ class SplitLoRATrainer:
                 # Use the wrapper for generation
                 output = temp_wrapper.generate(
                     ids,
-                    #max_new_tokens=12,              # Very short
+                    max_new_tokens=60,        
                     do_sample=False,                # Pure greedy
                     eos_token_id=self.tokenizer.eos_token_id,
                     pad_token_id=self.tokenizer.pad_token_id,
