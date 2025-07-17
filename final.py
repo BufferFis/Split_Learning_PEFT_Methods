@@ -464,7 +464,7 @@ class SplitLoRATrainer:
         self.tokenizer.pad_token = self.tokenizer.eos_token
         full_model = AutoModelForCausalLM.from_pretrained("gpt2")
         full_model.config.pad_token_id = self.tokenizer.eos_token_id
-        self.max_seq_len = 256
+        self.max_seq_len = 512
 
         
         original_vocab_size = len(self.tokenizer)
@@ -550,7 +550,7 @@ class SplitLoRATrainer:
 
 
     def preprocess(self, example, sequence_length=None):
-        """Simplified fix: Create labels after truncation"""
+        """FIXED: Proper label alignment with truncated sequences"""
         SEQ_LEN = sequence_length if sequence_length is not None else self.max_seq_len
         
         mr = example["meaning_representation"]
@@ -561,33 +561,39 @@ class SplitLoRATrainer:
         ids_ref = self.tokenizer.encode(ref, add_special_tokens=False)
         ids_delim = self.DELIM_TOKENS
         
-        # Build and truncate input sequence
-        input_ids = ids_mr + ids_delim + ids_ref
-        if len(input_ids) > SEQ_LEN:
-            input_ids = input_ids[:SEQ_LEN]
+        # Build full sequence
+        full_sequence = ids_mr + ids_delim + ids_ref
         
-        # Create labels by finding delimiter in TRUNCATED sequence
+        # Truncate if necessary
+        if len(full_sequence) > SEQ_LEN:
+            input_ids = full_sequence[:SEQ_LEN]
+        else:
+            input_ids = full_sequence
+        
+        # Create labels based on ACTUAL input_ids length
         labels = []
-        delim_found = False
-        i = 0
         
-        while i < len(input_ids):
-            # Check if delimiter starts at position i
-            if (i + len(ids_delim) <= len(input_ids) and 
-                input_ids[i:i+len(ids_delim)] == ids_delim):
-                # Mask delimiter tokens
-                labels.extend([-100] * len(ids_delim))
-                i += len(ids_delim)
-                delim_found = True
-                print("Delim Found YAAYYYY")
-            else:
-                if delim_found:
-                    # After delimiter - these are targets
-                    labels.append(input_ids[i])
-                else:
-                    # Before delimiter - mask MR tokens
-                    labels.append(-100)
-                i += 1
+        # Find delimiter position in the ACTUAL input_ids
+        delim_pos = None
+        for i in range(len(input_ids) - len(ids_delim) + 1):
+            if input_ids[i:i+len(ids_delim)] == ids_delim:
+                delim_pos = i
+                break
+        
+        if delim_pos is not None:
+            # Mask everything before and including delimiter
+            mask_length = delim_pos + len(ids_delim)
+            labels = [-100] * mask_length
+            
+            # Add remaining tokens as targets
+            remaining_tokens = input_ids[mask_length:]
+            labels.extend(remaining_tokens)
+        else:
+            # Delimiter not found (heavily truncated) - mask everything
+            labels = [-100] * len(input_ids)
+        
+        # Ensure exact length match
+        assert len(input_ids) == len(labels), f"Length mismatch: {len(input_ids)} vs {len(labels)}"
         
         attention_mask = [1] * len(input_ids)
         
@@ -598,8 +604,6 @@ class SplitLoRATrainer:
             "human_reference": ref,
             "meaning_representation": mr,
         }
-
-
 
 
     def load_e2e_dataset(
@@ -682,35 +686,30 @@ class SplitLoRATrainer:
         print(f"  Average characters lost: {total_loss/max(truncated_count, 1):.1f}")
     
     def create_dataloader(self, dataset, batch_size=8, shuffle=True, sequence_length=None):
-        """FIXED: Consistent sequence length with debug support"""
-        from torch.nn.utils.rnn import pad_sequence   # add at top of file
-
-        def collate_fn(batch):
-            # turn lists into tensors, but keep variable length
-            max_len = max(len(item['input_ids']) for item in batch)
-            max_len = min(max_len, self.max_seq_len)  # Cap at max allowed
-            ids   = [torch.tensor(b["input_ids"][:max_len],  dtype=torch.long) for b in batch]
-            lbls  = [torch.tensor(b["labels"],     dtype=torch.long) for b in batch]
-
-            # right-pad to the longest sequence in *this* minibatch
-            ids  = pad_sequence(ids,  batch_first=True,
-                                padding_value=self.tokenizer.eos_token_id)
-            lbls = pad_sequence(lbls, batch_first=True,
-                                padding_value=-100)                 # ignore in loss
-
-            # build attention mask on-the-fly (1 = real token, 0 = pad/eos padding)
-            
-            attn = (ids != self.tokenizer.pad_token_id)
-
-            return {"input_ids": ids,
-                    "attention_mask": attn,
-                    "labels": lbls,
-                    "human_reference": [b["human_reference"] for b in batch]}
+        """FIXED: Proper padding handling"""
+        from torch.nn.utils.rnn import pad_sequence
         
-        return DataLoader(dataset,
-                  batch_size=batch_size,
-                  shuffle=shuffle,
-                  collate_fn=collate_fn)
+        def collate_fn(batch):
+            # Get actual lengths (no padding yet)
+            ids = [torch.tensor(b["input_ids"], dtype=torch.long) for b in batch]
+            lbls = [torch.tensor(b["labels"], dtype=torch.long) for b in batch]
+            
+            # Pad sequences to batch maximum
+            ids_padded = pad_sequence(ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+            lbls_padded = pad_sequence(lbls, batch_first=True, padding_value=-100)
+            
+            # Create attention mask (1 for real tokens, 0 for padding)
+            attn_mask = (ids_padded != self.tokenizer.pad_token_id)
+            
+            return {
+                "input_ids": ids_padded,
+                "attention_mask": attn_mask,
+                "labels": lbls_padded,
+                "human_reference": [b["human_reference"] for b in batch]
+            }
+        
+        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn)
+
     
     def attach_schedulers(self, train_dataloader):
         # 0. Avoid building duplicate schedulers
