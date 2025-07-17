@@ -899,7 +899,7 @@ class SplitLoRATrainer:
             self.schedulers[1].load_state_dict(ckpt["sch_body"])
             self.schedulers[2].load_state_dict(ckpt["sch_tail"])
 
-        torch.random.set_rng_state(ckpt["rng_state"])
+        torch.random.set_rng_state(ckpt["rng_state"].cpu())
         print(f"✅ checkpoint loaded from {path} – resuming training")
         return ckpt.get("epoch", 0) + 1
 
