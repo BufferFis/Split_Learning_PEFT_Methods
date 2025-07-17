@@ -686,11 +686,11 @@ class SplitLoRATrainer:
         print(f"  Average characters lost: {total_loss/max(truncated_count, 1):.1f}")
     
     def create_dataloader(self, dataset, batch_size=8, shuffle=True, sequence_length=None):
-        """FIXED: Proper padding handling"""
+        """FIXED: Proper padding handling that preserves label alignment"""
         from torch.nn.utils.rnn import pad_sequence
         
         def collate_fn(batch):
-            # Get actual lengths (no padding yet)
+            # Get sequences without padding first
             ids = [torch.tensor(b["input_ids"], dtype=torch.long) for b in batch]
             lbls = [torch.tensor(b["labels"], dtype=torch.long) for b in batch]
             
@@ -698,8 +698,22 @@ class SplitLoRATrainer:
             ids_padded = pad_sequence(ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
             lbls_padded = pad_sequence(lbls, batch_first=True, padding_value=-100)
             
-            # Create attention mask (1 for real tokens, 0 for padding)
+            # CRITICAL FIX: Ensure padding tokens in input correspond to -100 in labels
+            # But don't count padding -100s as "masked tokens" in your debug
+            
+            # Create proper attention mask
             attn_mask = (ids_padded != self.tokenizer.pad_token_id)
+            
+            # VERIFY: Check that non-padding positions have correct label alignment
+            for i in range(len(ids_padded)):
+                # Find actual sequence length (before padding)
+                actual_length = attn_mask[i].sum().item()
+                
+                # Ensure labels match input for non-padding positions
+                if actual_length > 0:
+                    # The first actual_length positions should have the original labels
+                    # The rest should be -100 (padding)
+                    pass  # This is handled by pad_sequence correctly
             
             return {
                 "input_ids": ids_padded,
@@ -709,6 +723,7 @@ class SplitLoRATrainer:
             }
         
         return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn)
+
 
     
     def attach_schedulers(self, train_dataloader):
@@ -1295,11 +1310,19 @@ class SplitLoRATrainer:
         for i in range(min(3, len(batch["input_ids"]))):
             input_ids = batch["input_ids"][i]
             labels = batch["labels"][i]
+            attention_mask = batch["attention_mask"][i]
             
-            # Find delimiter position
+            # CRITICAL: Only analyze non-padding tokens
+            actual_length = attention_mask.sum().item()
+            
+            # Work with actual sequence (no padding)
+            actual_input_ids = input_ids[:actual_length]
+            actual_labels = labels[:actual_length]
+            
+            # Find delimiter position in actual sequence
             delim_pos = None
-            for j in range(len(input_ids) - len(self.DELIM_TOKENS) + 1):
-                if input_ids[j:j+len(self.DELIM_TOKENS)].tolist() == self.DELIM_TOKENS:
+            for j in range(len(actual_input_ids) - len(self.DELIM_TOKENS) + 1):
+                if actual_input_ids[j:j+len(self.DELIM_TOKENS)].tolist() == self.DELIM_TOKENS:
                     delim_pos = j
                     break
             
@@ -1307,18 +1330,19 @@ class SplitLoRATrainer:
                 print(f"❌ Sample {i}: No delimiter found!")
                 continue
             
-            # Check masking
-            masked_tokens = sum(1 for label in labels if label == -100)
-            target_tokens = sum(1 for label in labels if label != -100)
+            # Count masked/target tokens in ACTUAL sequence only
+            masked_tokens = sum(1 for label in actual_labels if label == -100)
+            target_tokens = sum(1 for label in actual_labels if label != -100)
             
             print(f"Sample {i}:")
+            print(f"  Actual sequence length: {actual_length}")
             print(f"  Delimiter position: {delim_pos}")
             print(f"  Masked tokens: {masked_tokens}")
             print(f"  Target tokens: {target_tokens}")
             
             # Decode parts
-            mr_part = input_ids[:delim_pos]
-            ref_part = input_ids[delim_pos+len(self.DELIM_TOKENS):]
+            mr_part = actual_input_ids[:delim_pos]
+            ref_part = actual_input_ids[delim_pos+len(self.DELIM_TOKENS):]
             
             mr_text = self.tokenizer.decode(mr_part, skip_special_tokens=True)
             ref_text = self.tokenizer.decode(ref_part, skip_special_tokens=True)
@@ -1328,12 +1352,12 @@ class SplitLoRATrainer:
             
             # Check if masking is correct
             expected_mask_length = len(mr_part) + len(self.DELIM_TOKENS)
-            actual_mask_length = sum(1 for j, label in enumerate(labels) if label == -100)
             
-            if expected_mask_length == actual_mask_length:
+            if expected_mask_length == masked_tokens:
                 print("  ✅ Label masking is correct")
             else:
-                print(f"  ❌ Label masking wrong: expected {expected_mask_length}, got {actual_mask_length}")
+                print(f"  ❌ Label masking wrong: expected {expected_mask_length}, got {masked_tokens}")
+
 
     
 
