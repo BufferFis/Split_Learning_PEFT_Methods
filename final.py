@@ -355,8 +355,8 @@ class TailClient:
         entropy_loss = -torch.mean(entropy)  # Encourage high entropy
         
         # OPTIMIZED: Stronger entropy weight for E2E NLG
-        beta = 0.01 
-        total_loss = loss + beta * entropy_loss
+        # beta = 0.01 
+        # total_loss = loss + beta * entropy_loss
         
         # Check for NaN loss
         if torch.isnan(loss):
@@ -364,7 +364,7 @@ class TailClient:
             return 0.0, torch.zeros_like(body_activations)
         
         # Backward pass
-        total_loss.backward(retain_graph=True)
+        loss.backward(retain_graph=True)
         
         # Now safely access .grad
         body_grad = body_activations.grad.clone() if body_activations.grad is not None else torch.zeros_like(body_activations)
