@@ -866,7 +866,8 @@ class SplitLoRATrainer:
             "sch_head":   self.schedulers[0].state_dict() if self.schedulers else None,
             "sch_body":   self.schedulers[1].state_dict() if self.schedulers else None,
             "sch_tail":   self.schedulers[2].state_dict() if self.schedulers else None,
-            "rng_state":  torch.random.get_rng_state(),
+            "rng_state":  torch.random.get_rng_state().cpu(),
+            "cuda_states": torch.cuda.get_rng_state_all()
         }, path)
         print(f"✅ checkpoint saved to {path}")
     
@@ -904,6 +905,9 @@ class SplitLoRATrainer:
             self.schedulers[2].load_state_dict(ckpt["sch_tail"])
 
         torch.random.set_rng_state(ckpt["rng_state"].cpu())
+        if "cuda_states" in ckpt:
+            for dev_id, state in enumerate(ckpt["cuda_states"]):
+                torch.cuda.set_rng_state(state, device=dev_id)
         print(f"✅ checkpoint loaded from {path} – resuming training")
         return ckpt.get("epoch", 0) + 1
 
@@ -1676,7 +1680,7 @@ def main():
     # Load checkpoint if specified
     if args.load_checkpoint:
         start_epoch = trainer.load_checkpoint(args.load_checkpoint,
-                                            eval_only=args.eval_only) 
+                                        eval_only=args.eval_only) 
         diagnose_custom_token_embeddings(trainer)
     
     wrapper = SplitGPT2ForGeneration(
@@ -1755,7 +1759,8 @@ def main():
     print(f"EOS token: '{trainer.tokenizer.eos_token}' -> {trainer.tokenizer.eos_token_id}")
     for ep in range(start_epoch, start_epoch + args.epochs):
         trainer.train(train_dl, epochs=1)
-        trainer.save_checkpoint(args.save_path, epoch=ep)
+        ckpt_name = f"ckpt_ep{ep}.pt"
+        trainer.save_checkpoint(os.path.join(args.save_path, ckpt_name), epoch=ep)
     
     
     
