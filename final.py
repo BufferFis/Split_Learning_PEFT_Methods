@@ -153,10 +153,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
         def forward(self, hidden_states=None, attention_mask=None, **kwargs):
             dtype = hidden_states.dtype
             attn_mask = _expand_mask(attention_mask, dtype)
-            print("  attn_mask:(HEAD)", attn_mask.shape, attn_mask.dtype,
-                "min,max:", attn_mask.min().item(), attn_mask.max().item())
-            # And for a small sequence, visualize a 2×2 slice:
-            print(attn_mask[0,0,:3,:3])
+        
             for block in self.transformer.h:
                 hidden_states = block(hidden_states,attention_mask=attn_mask,use_cache=False)[0]
             return type('BodyOutput', (), {'last_hidden_state': hidden_states})()
@@ -315,13 +312,14 @@ class HeadClient:
 
 class TailClient:
     """Client component handling tail layers"""
-    def __init__(self, tail_model, learning_rate=2e-4):
+    def __init__(self, tail_model, learning_rate=2e-4, tokenizer=None):
         self.tail_model = tail_model.to(device)
         self.optimizer = optim.AdamW(
             [p for p in self.tail_model.parameters() if p.requires_grad], 
             lr=learning_rate
         )
         self.loss_fn = nn.CrossEntropyLoss(label_smoothing=0.05)
+        self.tokenizer = tokenizer
         
     def forward(self, body_activations, attention_mask=None):
         """Forward pass through tail layers"""
@@ -372,6 +370,72 @@ class TailClient:
         self.optimizer.step()
         
         return total_loss.item(), body_grad
+    
+    def extract_attributes(self, mr_text):
+        """Extract key attributes from E2E meaning representation"""
+        import re
+        
+        attributes = {}
+        pattern = r'(\w+)\[([^\]]+)\]'
+        matches = re.findall(pattern, mr_text)
+        
+        for attr_name, attr_value in matches:
+            attr_value = attr_value.lower().strip()
+            
+            if attr_name == 'priceRange':
+                if 'less than' in attr_value:
+                    attr_value = 'cheap'
+                elif 'more than' in attr_value:
+                    attr_value = 'expensive'
+            
+            attributes[attr_name] = attr_value
+        
+        return attributes
+    
+    def validate_coverage(self, mr_text, generated_text):
+        """Validate that all MR attributes are covered in generated text"""
+        attributes = self.extract_attributes(mr_text)
+        gen_text_lower = generated_text.lower()
+        
+        covered_attrs = []
+        missing_attrs = []
+        
+        for attr_name, attr_value in attributes.items():
+            if attr_value in gen_text_lower:
+                covered_attrs.append(f"{attr_name}={attr_value}")
+            else:
+                covered = False
+                
+                if attr_name == 'eatType':
+                    synonyms = {
+                        'coffee shop': ['coffee', 'café', 'cafe'],
+                        'restaurant': ['restaurant', 'place', 'establishment'],
+                        'pub': ['pub', 'bar']
+                    }
+                    if attr_value in synonyms:
+                        covered = any(syn in gen_text_lower for syn in synonyms[attr_value])
+                
+                elif attr_name == 'area':
+                    if attr_value in ['city centre', 'city center']:
+                        covered = any(phrase in gen_text_lower for phrase in ['city centre', 'city center', 'centre', 'center'])
+                
+                elif attr_name == 'familyFriendly':
+                    if attr_value == 'yes':
+                        covered = any(phrase in gen_text_lower for phrase in ['family', 'kid', 'child'])
+                
+                if covered:
+                    covered_attrs.append(f"{attr_name}={attr_value}")
+                else:
+                    missing_attrs.append(f"{attr_name}={attr_value}")
+        
+        coverage_ratio = len(covered_attrs) / len(attributes) if attributes else 1.0
+        
+        return {
+            'coverage_ratio': coverage_ratio,
+            'covered': covered_attrs,
+            'missing': missing_attrs,
+            'complete': len(missing_attrs) == 0
+        }
 
 class _DummyLoader:
     """
@@ -400,7 +464,7 @@ class SplitLoRATrainer:
         self.tokenizer.pad_token = self.tokenizer.eos_token
         full_model = AutoModelForCausalLM.from_pretrained("gpt2")
         full_model.config.pad_token_id = self.tokenizer.eos_token_id
-        self.max_seq_len = 256
+        self.max_seq_len = 150
 
         
         original_vocab_size = len(self.tokenizer)
@@ -446,7 +510,7 @@ class SplitLoRATrainer:
         # Initialize components
         self.server = ServerModel(body_model, learning_rate)
         self.head_client = HeadClient(head_model, learning_rate)
-        self.tail_client = TailClient(tail_model, learning_rate)
+        self.tail_client = TailClient(tail_model, learning_rate, tokenizer=self.tokenizer)
         
         self.metrics = {"loss": []}
         self._sched_steps = None
@@ -462,6 +526,27 @@ class SplitLoRATrainer:
             if seq[i:i + plen] == pat:
                 return i + plen - 1                # last token index
         return None
+
+    def smart_truncate(self, mr_tokens, delim_tokens, ref_tokens, max_len):
+        """Truncate MR first, then reference if needed"""
+        
+        # Reserve space for delimiter and minimum reference
+        min_ref_len = 20  # Minimum reference length
+        available_for_mr = max_len - len(delim_tokens) - min_ref_len
+        
+        # Truncate MR if too long
+        if len(mr_tokens) > available_for_mr:
+            mr_tokens = mr_tokens[:available_for_mr]
+        
+        # Calculate remaining space for reference
+        remaining_space = max_len - len(mr_tokens) - len(delim_tokens)
+        
+        # Truncate reference only if absolutely necessary
+        if len(ref_tokens) > remaining_space:
+            ref_tokens = ref_tokens[:remaining_space]
+        
+        return mr_tokens, delim_tokens, ref_tokens
+
 
 
     def preprocess(self, example, sequence_length=None):
@@ -569,7 +654,29 @@ class SplitLoRATrainer:
         return train_ds, test_ds
 
 
-
+    def analyze_truncation_impact(self, dataset):
+        """Analyze how much data is lost to truncation"""
+        
+        truncated_count = 0
+        total_loss = 0
+        
+        for example in dataset:
+            original_ref = example['human_reference']
+            
+            # Simulate preprocessing
+            processed = self.preprocess(example)
+            
+            # Extract actual target from labels
+            target_tokens = [t for t in processed['labels'] if t != -100]
+            reconstructed_ref = self.tokenizer.decode(target_tokens, skip_special_tokens=True)
+            
+            if len(reconstructed_ref) < len(original_ref):
+                truncated_count += 1
+                total_loss += len(original_ref) - len(reconstructed_ref)
+        
+        print(f"Truncation impact:")
+        print(f"  Truncated examples: {truncated_count}/{len(dataset)} ({truncated_count/len(dataset)*100:.1f}%)")
+        print(f"  Average characters lost: {total_loss/max(truncated_count, 1):.1f}")
     
     def create_dataloader(self, dataset, batch_size=8, shuffle=True, sequence_length=None):
         """FIXED: Consistent sequence length with debug support"""
@@ -577,7 +684,9 @@ class SplitLoRATrainer:
 
         def collate_fn(batch):
             # turn lists into tensors, but keep variable length
-            ids   = [torch.tensor(b["input_ids"],  dtype=torch.long) for b in batch]
+            max_len = max(len(item['input_ids']) for item in batch)
+            max_len = min(max_len, self.max_seq_len)  # Cap at max allowed
+            ids   = [torch.tensor(b["input_ids"][:max_len],  dtype=torch.long) for b in batch]
             lbls  = [torch.tensor(b["labels"],     dtype=torch.long) for b in batch]
 
             # right-pad to the longest sequence in *this* minibatch
@@ -1219,81 +1328,7 @@ class SplitLoRATrainer:
             else:
                 print(f"  ❌ Label masking wrong: expected {expected_mask_length}, got {actual_mask_length}")
 
-    def extract_attributes(self, mr_text):
-        """Extract key attributes from E2E meaning representation"""
-        import re
-        
-        # Parse E2E MR format: name[Blue Spice], eatType[coffee shop], area[city centre]
-        attributes = {}
-        pattern = r'(\w+)\[([^\]]+)\]'
-        matches = re.findall(pattern, mr_text)
-        
-        for attr_name, attr_value in matches:
-            # Clean and normalize attribute values
-            attr_value = attr_value.lower().strip()
-            
-            # Handle special cases for E2E dataset
-            if attr_name == 'priceRange':
-                # Normalize price ranges
-                if 'less than' in attr_value:
-                    attr_value = 'cheap'
-                elif 'more than' in attr_value:
-                    attr_value = 'expensive'
-            
-            attributes[attr_name] = attr_value
-        
-        return attributes
     
-
-    def validate_coverage(self, mr_text, generated_text):
-        """Validate that all MR attributes are covered in generated text"""
-        attributes = self.extract_attributes(mr_text)
-        gen_text_lower = generated_text.lower()
-        
-        covered_attrs = []
-        missing_attrs = []
-        
-        for attr_name, attr_value in attributes.items():
-            # Check direct value coverage
-            if attr_value in gen_text_lower:
-                covered_attrs.append(f"{attr_name}={attr_value}")
-            else:
-                # Check semantic equivalents for common attributes
-                covered = False
-                
-                if attr_name == 'eatType':
-                    # Check for restaurant type synonyms
-                    synonyms = {
-                        'coffee shop': ['coffee', 'café', 'cafe'],
-                        'restaurant': ['restaurant', 'place', 'establishment'],
-                        'pub': ['pub', 'bar']
-                    }
-                    if attr_value in synonyms:
-                        covered = any(syn in gen_text_lower for syn in synonyms[attr_value])
-                
-                elif attr_name == 'area':
-                    # Check for area mentions
-                    if attr_value in ['city centre', 'city center']:
-                        covered = any(phrase in gen_text_lower for phrase in ['city centre', 'city center', 'centre', 'center'])
-                
-                elif attr_name == 'familyFriendly':
-                    # Check for family-friendly mentions
-                    if attr_value == 'yes':
-                        covered = any(phrase in gen_text_lower for phrase in ['family', 'kid', 'child'])
-                
-                if covered:
-                    covered_attrs.append(f"{attr_name}={attr_value}")
-                else:
-                    missing_attrs.append(f"{attr_name}={attr_value}")
-        
-        coverage_ratio = len(covered_attrs) / len(attributes) if attributes else 1.0
-        
-        return {
-            'coverage_ratio': coverage_ratio,
-            'covered': covered_attrs,
-            'missing': missing_attrs,
-            'complete': len(missing_attrs) == 0
-        }
 
     def coverage_loss(self, mr_text, generated_text, base_loss):
         """Add coverage penalty to the loss function"""
