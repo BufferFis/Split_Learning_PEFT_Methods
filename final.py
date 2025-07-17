@@ -815,67 +815,228 @@ class SplitLoRATrainer:
 
     def save_checkpoint(self, path: str = "checkpoint.pt", epoch: int = 0):
         """
-        Save everything needed to  resume or to run inference later.
-        If `path` is a directory, a file called `checkpoint.pt` is written inside it.
+        FIXED: Save everything needed to resume training properly
         """
         if os.path.isdir(path):
             path = os.path.join(path, "checkpoint.pt")
+        
+        # Ensure models are in training mode for proper state saving
+        self.head_client.head_model.train()
+        self.server.body_model.train()
+        self.tail_client.tail_model.train()
+        
+        # Save complete training state
+        checkpoint = {
+            "epoch": epoch,
+            "metrics": self.metrics,
+            "max_seq_len": self.max_seq_len,
+            "vocab_size": len(self.tokenizer),
+            
+            # Model states (including PEFT adapters)
+            "head_model_state": self.head_client.head_model.state_dict(),
+            "body_model_state": self.server.body_model.state_dict(),
+            "tail_model_state": self.tail_client.tail_model.state_dict(),
+            
+            # Optimizer states
+            "head_optimizer_state": self.head_client.optimizer.state_dict(),
+            "body_optimizer_state": self.server.optimizer.state_dict(),
+            "tail_optimizer_state": self.tail_client.optimizer.state_dict(),
+            
+            # Scheduler states
+            "scheduler_states": [sched.state_dict() for sched in self.schedulers] if self.schedulers else [],
+            
+            # Training configuration
+            "training_config": {
+                "learning_rate": self.head_client.optimizer.param_groups[0]['lr'],
+                "warmup_steps": self.warmup_steps,
+                "max_epochs": self.max_epochs,
+            },
+            
+            # Random states for reproducibility
+            "rng_state": torch.random.get_rng_state().cpu(),
+            "cuda_rng_states": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            
+            # Tokenizer state
+            "tokenizer_config": {
+                "delim": self.DELIM,
+                "pad_token": self.PAD,
+                "delim_tokens": self.DELIM_TOKENS,
+            }
+        }
+        
+        # Save with error handling
+        try:
+            torch.save(checkpoint, path)
+            print(f"✅ Complete checkpoint saved to {path}")
+            print(f"   - Epoch: {epoch}")
+            print(f"   - Vocab size: {len(self.tokenizer)}")
+            print(f"   - Metrics: {len(self.metrics['loss'])} loss values")
+        except Exception as e:
+            print(f"❌ Error saving checkpoint: {e}")
+            raise
 
-        torch.save({
-            "epoch":      epoch,
-            "head":       self.head_client.head_model.state_dict(),
-            "body":       self.server.body_model.state_dict(),
-            "tail":       self.tail_client.tail_model.state_dict(),
-            "opt_head":   self.head_client.optimizer.state_dict(),
-            "opt_body":   self.server.optimizer.state_dict(),
-            "opt_tail":   self.tail_client.optimizer.state_dict(),
-            "sch_head":   self.schedulers[0].state_dict() if self.schedulers else None,
-            "sch_body":   self.schedulers[1].state_dict() if self.schedulers else None,
-            "sch_tail":   self.schedulers[2].state_dict() if self.schedulers else None,
-            "rng_state":  torch.random.get_rng_state().cpu(),
-            "cuda_states": torch.cuda.get_rng_state_all()
-        }, path)
-        print(f"✅ checkpoint saved to {path}")
     
     def load_checkpoint(self, path: str = "checkpoint.pt", *, eval_only: bool = False) -> int:
-        ckpt = torch.load(path, map_location=device)
+        """
+        FIXED: Load complete training state for proper resumption
+        """
+        if os.path.isdir(path):
+            path = os.path.join(path, "checkpoint.pt")
+        
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Checkpoint not found: {path}")
+        
+        print(f"Loading checkpoint from {path}...")
+        
+        try:
+            checkpoint = torch.load(path, map_location=device)
+            
+            # Verify checkpoint integrity
+            required_keys = ["head_model_state", "body_model_state", "tail_model_state"]
+            for key in required_keys:
+                if key not in checkpoint:
+                    raise KeyError(f"Missing required key in checkpoint: {key}")
+            
+            # Load model states
+            print("Loading model states...")
+            self.head_client.head_model.load_state_dict(checkpoint["head_model_state"])
+            self.server.body_model.load_state_dict(checkpoint["body_model_state"])
+            self.tail_client.tail_model.load_state_dict(checkpoint["tail_model_state"])
+            
+            # CRITICAL: Restore weight tying after loading
+            print("Restoring weight tying...")
+            if hasattr(self.head_client.head_model, 'base_model'):
+                # PEFT wrapped models
+                head_base = self.head_client.head_model.base_model
+                tail_base = self.tail_client.tail_model.base_model
+            else:
+                # Direct models
+                head_base = self.head_client.head_model
+                tail_base = self.tail_client.tail_model
+            
+            if hasattr(head_base, 'wte') and hasattr(tail_base, 'lm_head'):
+                tail_base.lm_head.weight = head_base.wte.weight
+                print("✅ Weight tying restored")
+            
+            # Load training configuration
+            if "training_config" in checkpoint:
+                config = checkpoint["training_config"]
+                self.warmup_steps = config.get("warmup_steps", self.warmup_steps)
+                self.max_epochs = config.get("max_epochs", self.max_epochs)
+            
+            # Load tokenizer configuration
+            if "tokenizer_config" in checkpoint:
+                tok_config = checkpoint["tokenizer_config"]
+                self.DELIM = tok_config.get("delim", self.DELIM)
+                self.PAD = tok_config.get("pad_token", self.PAD)
+                self.DELIM_TOKENS = tok_config.get("delim_tokens", self.DELIM_TOKENS)
+            
+            # Load metrics
+            if "metrics" in checkpoint:
+                self.metrics = checkpoint["metrics"]
+                print(f"✅ Loaded {len(self.metrics['loss'])} previous loss values")
+            
+            # Set sequence length
+            if "max_seq_len" in checkpoint:
+                self.max_seq_len = checkpoint["max_seq_len"]
+            
+            if eval_only:
+                # Set models to evaluation mode
+                self.head_client.head_model.eval()
+                self.server.body_model.eval()
+                self.tail_client.tail_model.eval()
+                print("✅ Models loaded in evaluation mode")
+                return checkpoint.get("epoch", 0)
+            
+            # Load optimizer states for training resumption
+            print("Loading optimizer states...")
+            if "head_optimizer_state" in checkpoint:
+                self.head_client.optimizer.load_state_dict(checkpoint["head_optimizer_state"])
+            if "body_optimizer_state" in checkpoint:
+                self.server.optimizer.load_state_dict(checkpoint["body_optimizer_state"])
+            if "tail_optimizer_state" in checkpoint:
+                self.tail_client.optimizer.load_state_dict(checkpoint["tail_optimizer_state"])
+            
+            # Load scheduler states
+            if "scheduler_states" in checkpoint and checkpoint["scheduler_states"]:
+                if not self.schedulers:
+                    # Create schedulers if they don't exist
+                    total_steps = checkpoint.get("_sched_steps", 1000)
+                    self.attach_schedulers(_DummyLoader(total_steps))
+                
+                for i, sched_state in enumerate(checkpoint["scheduler_states"]):
+                    if i < len(self.schedulers):
+                        self.schedulers[i].load_state_dict(sched_state)
+                print("✅ Scheduler states loaded")
+            
+            # Restore random states for reproducibility
+            if "rng_state" in checkpoint:
+                torch.random.set_rng_state(checkpoint["rng_state"])
+            if "cuda_rng_states" in checkpoint and checkpoint["cuda_rng_states"]:
+                torch.cuda.set_rng_state_all(checkpoint["cuda_rng_states"])
+            
+            # Set models to training mode
+            self.head_client.head_model.train()
+            self.server.body_model.train()
+            self.tail_client.tail_model.train()
+            
+            epoch = checkpoint.get("epoch", 0)
+            print(f"✅ Checkpoint loaded successfully!")
+            print(f"   - Resuming from epoch: {epoch}")
+            print(f"   - Vocab size: {checkpoint.get('vocab_size', 'unknown')}")
+            print(f"   - Previous loss values: {len(self.metrics.get('loss', []))}")
+            
+            return epoch
+            
+        except Exception as e:
+            print(f"❌ Error loading checkpoint: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+    
+    def verify_training_state(self):
+        """
+        Verify that the model is in proper training state after loading
+        """
+        print("=== TRAINING STATE VERIFICATION ===")
+        
+        # Check if models are in training mode
+        print(f"Head model training mode: {self.head_client.head_model.training}")
+        print(f"Body model training mode: {self.server.body_model.training}")
+        print(f"Tail model training mode: {self.tail_client.tail_model.training}")
+        
+        # Check if gradients are enabled
+        head_params = list(self.head_client.head_model.parameters())
+        body_params = list(self.server.body_model.parameters())
+        tail_params = list(self.tail_client.tail_model.parameters())
+        
+        head_requires_grad = sum(1 for p in head_params if p.requires_grad)
+        body_requires_grad = sum(1 for p in body_params if p.requires_grad)
+        tail_requires_grad = sum(1 for p in tail_params if p.requires_grad)
+        
+        print(f"Head parameters requiring gradients: {head_requires_grad}/{len(head_params)}")
+        print(f"Body parameters requiring gradients: {body_requires_grad}/{len(body_params)}")
+        print(f"Tail parameters requiring gradients: {tail_requires_grad}/{len(tail_params)}")
+        
+        # Check weight tying
+        if hasattr(self.head_client.head_model, 'base_model'):
+            head_base = self.head_client.head_model.base_model
+            tail_base = self.tail_client.tail_model.base_model
+        else:
+            head_base = self.head_client.head_model
+            tail_base = self.tail_client.tail_model
+        
+        if hasattr(head_base, 'wte') and hasattr(tail_base, 'lm_head'):
+            weight_tied = torch.equal(head_base.wte.weight, tail_base.lm_head.weight)
+            print(f"Weight tying intact: {weight_tied}")
+        
+        # Check optimizer states
+        print(f"Head optimizer state groups: {len(self.head_client.optimizer.param_groups)}")
+        print(f"Body optimizer state groups: {len(self.server.optimizer.param_groups)}")
+        print(f"Tail optimizer state groups: {len(self.tail_client.optimizer.param_groups)}")
+        
+        print("✅ Training state verification complete")
 
-        # ---- make sure schedulers exist before loading ----
-        if not self.schedulers and not eval_only:
-            # number of steps saved earlier (if available); else fallback to 1
-            saved_steps = ckpt.get("sch_head", {}).get("total_steps", 1)
-            self.attach_schedulers(train_dataloader=_DummyLoader(saved_steps))
-        # ---------------------------------------------------
-
-        # weights
-        self.head_client.head_model.load_state_dict(ckpt["head"])
-        self.server.body_model.load_state_dict(ckpt["body"])
-        self.tail_client.tail_model.load_state_dict(ckpt["tail"])
-
-        if eval_only:
-            self.head_client.head_model.eval()
-            self.server.body_model.eval()
-            self.tail_client.tail_model.eval()
-            print("✅ model loaded for evaluation only")
-            return ckpt.get("epoch", 0) + 1
-
-        # optimisers
-        self.head_client.optimizer.load_state_dict(ckpt["opt_head"])
-        self.server.optimizer.load_state_dict(ckpt["opt_body"])
-        self.tail_client.optimizer.load_state_dict(ckpt["opt_tail"])
-
-        # schedulers
-        if ckpt["sch_head"] is not None and self.schedulers:
-            self.schedulers[0].load_state_dict(ckpt["sch_head"])
-            self.schedulers[1].load_state_dict(ckpt["sch_body"])
-            self.schedulers[2].load_state_dict(ckpt["sch_tail"])
-
-        torch.random.set_rng_state(ckpt["rng_state"].cpu())
-        if "cuda_states" in ckpt:
-            for dev_id, state in enumerate(ckpt["cuda_states"]):
-                torch.cuda.set_rng_state(state, device=dev_id)
-        print(f"✅ checkpoint loaded from {path} – resuming training")
-        return ckpt.get("epoch", 0) + 1
 
     
     # def save_checkpoint(self, path="./splitlora_checkpoint"):
@@ -1662,7 +1823,8 @@ def main():
     # Load checkpoint if specified
     if args.load_checkpoint:
         start_epoch = trainer.load_checkpoint(args.load_checkpoint,
-                                        eval_only=args.eval_only) 
+                                        eval_only=args.eval_only)
+        trainer.verify_training_state() 
         diagnose_custom_token_embeddings(trainer)
     
     wrapper = SplitGPT2ForGeneration(
@@ -1742,8 +1904,16 @@ def main():
     for ep in range(start_epoch, start_epoch + args.epochs):
         trainer.train(train_dl, epochs=1)
         ckpt_name = f"ckpt_ep{ep}.pt"
-        trainer.save_checkpoint(os.path.join(args.save_path, ckpt_name), epoch=ep)
-    
+        ckpt_path = os.path.join(args.save_path, f"ckpt_ep{ep}.pt")
+        trainer.save_checkpoint(ckpt_path, epoch=ep)
+        if ep == start_epoch:  # Test on first epoch
+            print("Testing save/load cycle...")
+            temp_trainer = SplitLoRATrainer(
+                model_name="gpt2", head_layers=2, tail_layers=2,
+                learning_rate=args.learning_rate
+            )
+            loaded_epoch = temp_trainer.load_checkpoint(ckpt_path, eval_only=True)
+            print(f"✅ Save/load test passed: saved epoch {ep}, loaded epoch {loaded_epoch}")
     
     
 
