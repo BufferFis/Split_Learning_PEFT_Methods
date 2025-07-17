@@ -853,7 +853,7 @@ class SplitLoRATrainer:
             },
             
             # Random states for reproducibility
-            "rng_state": torch.random.get_rng_state().cpu(),
+            "rng_state": torch.random.get_rng_state(),
             "cuda_rng_states": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
             
             # Tokenizer state
@@ -972,6 +972,15 @@ class SplitLoRATrainer:
             # Restore random states for reproducibility
             if "rng_state" in checkpoint:
                 torch.random.set_rng_state(checkpoint["rng_state"])
+                state = checkpoint.get("rng_state", None)
+                if state is not None:
+                    # ensure ByteTensor on CPU
+                    state = state.to(device='cpu', dtype=torch.uint8)
+                    try:
+                        torch.random.set_rng_state(state)
+                        print("✅ RNG state restored")
+                    except TypeError:
+                        print("⚠️ Failed to restore RNG state; skipping")
             if "cuda_rng_states" in checkpoint and checkpoint["cuda_rng_states"]:
                 torch.cuda.set_rng_state_all(checkpoint["cuda_rng_states"])
             
