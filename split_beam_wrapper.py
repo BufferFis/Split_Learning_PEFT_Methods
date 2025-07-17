@@ -54,6 +54,14 @@ class SplitGPT2ForGeneration(PreTrainedModel, GenerationMixin):
 
         return CausalLMOutput(logits=logits)
 
+    def generate(self, input_ids=None, attention_mask=None, **kwargs):
+        if attention_mask is None:
+            pad = self.tokenizer.pad_token_id
+            attention_mask = (input_ids != pad)
+        return super().generate(input_ids=input_ids,
+                                attention_mask=attention_mask,
+                                **kwargs)
+
     # optional: if you ever want to swap lm_head
     def get_output_embeddings(self):
         return self.lm_head                                           # NEW
