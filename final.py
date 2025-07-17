@@ -408,7 +408,15 @@ class TailClient:
         
         return loss.item(), body_grad
 
-
+class _DummyLoader:
+    """
+    Pretend-loader used only to create schedulers before we have
+    a real DataLoader.  `len()` must return a positive int.
+    """
+    def __init__(self, n_steps: int = 1):
+        self._n = max(1, n_steps)          # at least one step
+    def __len__(self):
+        return self._n
 
 class SplitLoRATrainer:
     def __init__(self,
@@ -859,12 +867,16 @@ class SplitLoRATrainer:
         print(f"✅ checkpoint saved to {path}")
     
     def load_checkpoint(self, path: str = "checkpoint.pt", *, eval_only: bool = False) -> int:
-        """
-        Load weights; return the epoch *after* the one stored (for easy resumption).
-        Set `eval_only=True` to skip optimiser/scheduler and switch all parts to .eval().
-        """
         ckpt = torch.load(path, map_location=device)
 
+        # ---- make sure schedulers exist before loading ----
+        if not self.schedulers and not eval_only:
+            # number of steps saved earlier (if available); else fallback to 1
+            saved_steps = ckpt.get("sch_head", {}).get("total_steps", 1)
+            self.attach_schedulers(train_dataloader=_DummyLoader(saved_steps))
+        # ---------------------------------------------------
+
+        # weights
         self.head_client.head_model.load_state_dict(ckpt["head"])
         self.server.body_model.load_state_dict(ckpt["body"])
         self.tail_client.tail_model.load_state_dict(ckpt["tail"])
@@ -876,12 +888,13 @@ class SplitLoRATrainer:
             print("✅ model loaded for evaluation only")
             return ckpt.get("epoch", 0) + 1
 
-        # training resume: load optimiser & scheduler
+        # optimisers
         self.head_client.optimizer.load_state_dict(ckpt["opt_head"])
         self.server.optimizer.load_state_dict(ckpt["opt_body"])
         self.tail_client.optimizer.load_state_dict(ckpt["opt_tail"])
 
-        if ckpt["sch_head"] is not None:
+        # schedulers
+        if ckpt["sch_head"] is not None and self.schedulers:
             self.schedulers[0].load_state_dict(ckpt["sch_head"])
             self.schedulers[1].load_state_dict(ckpt["sch_body"])
             self.schedulers[2].load_state_dict(ckpt["sch_tail"])
@@ -889,6 +902,7 @@ class SplitLoRATrainer:
         torch.random.set_rng_state(ckpt["rng_state"])
         print(f"✅ checkpoint loaded from {path} – resuming training")
         return ckpt.get("epoch", 0) + 1
+
     
     # def save_checkpoint(self, path="./splitlora_checkpoint"):
     #     """FIXED: Save merged models using state dicts"""
