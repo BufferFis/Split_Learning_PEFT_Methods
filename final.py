@@ -104,6 +104,11 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             all_hidden_states = ()
             dtype = hidden_states.dtype
             attn_mask = _expand_mask(attention_mask, dtype)
+            print("  attn_mask:(HEAD)", attn_mask.shape, attn_mask.dtype,
+                "min,max:", attn_mask.min().item(), attn_mask.max().item())
+            # And for a small sequence, visualize a 2×2 slice:
+            print(attn_mask[0,0,:3,:3])
+
             for block in self.h:
                 # Convert attention_mask to the format GPT-2 blocks expect
                 hidden_states = block(hidden_states , attention_mask=attn_mask, use_cache=False)[0]
@@ -151,6 +156,10 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
         def forward(self, hidden_states=None, attention_mask=None, **kwargs):
             dtype = hidden_states.dtype
             attn_mask = _expand_mask(attention_mask, dtype)
+            print("  attn_mask:(HEAD)", attn_mask.shape, attn_mask.dtype,
+                "min,max:", attn_mask.min().item(), attn_mask.max().item())
+            # And for a small sequence, visualize a 2×2 slice:
+            print(attn_mask[0,0,:3,:3])
             for block in self.transformer.h:
                 hidden_states = block(hidden_states,attention_mask=attn_mask,use_cache=False)[0]
             return type('BodyOutput', (), {'last_hidden_state': hidden_states})()
@@ -201,7 +210,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
     head_model = HeadModel(model, head_layers)
     body_model = BodyModel(model, head_layers, body_layers)
     tail_model = TailModel(model, head_layers + body_layers)
-
+    
     tail_model.lm_head.weight = head_model.wte.weight
     
     return head_model, body_model, tail_model
@@ -242,7 +251,7 @@ class ServerModel:
         
         # Retain gradient for non-leaf tensors
         head_activations.retain_grad()
-        
+        print("🔍 Head activations retained for grad:", head_activations.shape)
         if body_grad is not None:
             # Compute gradients with proper error handling
             try:
@@ -365,10 +374,8 @@ class TailClient:
         
         # Backward pass
         loss.backward(retain_graph=True)
-        
         # Now safely access .grad
         body_grad = body_activations.grad.clone() if body_activations.grad is not None else torch.zeros_like(body_activations)
-        
         # Update tail parameters
         self.optimizer.step()
         
@@ -438,6 +445,8 @@ class SplitLoRATrainer:
         head_model = get_peft_model(head_model, lora_config)
         body_model = get_peft_model(body_model, lora_config)
         tail_model = get_peft_model(tail_model, lora_config)
+        tied = tail_model.lm_head.weight.data_ptr() == head_model.base_model.model.wte.weight.data_ptr()
+        print("✅ Weight tying correct (lm_head <-> wte):", tied)
         
         # Standard weight tying
         tail_model.base_model.lm_head.weight = head_model.base_model.wte.weight
@@ -721,6 +730,7 @@ class SplitLoRATrainer:
                     head_activations = self.head_client.forward(input_ids, attention_mask=attention_mask)  
                     body_activations, head_activations_stored = self.server.forward_train(head_activations, attention_mask)  
                     loss, body_grad = self.tail_client.compute_loss_and_backward(body_activations, labels, attention_mask)  
+                    print("Body grad norm:", body_activations.grad.norm().item())
 
                     
                     # FIX: Check for NaN loss
@@ -732,11 +742,13 @@ class SplitLoRATrainer:
                     
                     # FIXED: Use the correct variable name
                     head_grad = self.server.backward(body_activations, body_grad, head_activations_stored)
+                    print("Head grad norm (from server):", head_activations_stored.grad.norm().item())
 
                     self.head_client.backward(head_activations, head_grad)
                     for sched in self.schedulers:
                         sched.step()
-                    
+                    grad_norms = [p.grad.norm().item() for p in self.head_client.head_model.parameters() if p.grad is not None]
+                    print("Head param grad norms:", grad_norms[:5])
                     # FIX: Add gradient clipping to all components
                     torch.nn.utils.clip_grad_norm_(self.head_client.head_model.parameters(), max_norm=0.5)
                     torch.nn.utils.clip_grad_norm_(self.tail_client.tail_model.parameters(), max_norm=0.5)
@@ -904,7 +916,8 @@ class SplitLoRATrainer:
             self.head_client.head_model.load_state_dict(checkpoint["head_model_state"])
             self.server.body_model.load_state_dict(checkpoint["body_model_state"])
             self.tail_client.tail_model.load_state_dict(checkpoint["tail_model_state"])
-            
+            tied = self.tail_client.tail_model.lm_head.weight.data_ptr() == self.head_client.head_model.base_model.model.wte.weight.data_ptr()
+            print("🔁 Weight tying correct after loading:", tied)
             # CRITICAL: Restore weight tying after loading
             print("Restoring weight tying...")
             if hasattr(self.head_client.head_model, 'base_model'):
