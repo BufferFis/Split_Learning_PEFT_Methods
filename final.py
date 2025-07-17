@@ -146,11 +146,11 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
 
             # FIXED: Pass attention_mask to each block
             all_hidden_states = ()
+            dtype = hidden_states.dtype
+            attn_mask = _expand_mask(attention_mask, dtype)
             for block in self.h:
                 # Convert attention_mask to the format GPT-2 blocks expect
-                
-                    
-                hidden_states = block(hidden_states ,use_cache=False)[0]
+                hidden_states = block(hidden_states , attention_mask=attn_mask, use_cache=False)[0]
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
             if output_hidden_states:
@@ -193,9 +193,10 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             return {"input_ids": input_ids}
             
         def forward(self, hidden_states=None, attention_mask=None, **kwargs):
-    
+            dtype = hidden_states.dtype
+            attn_mask = _expand_mask(attention_mask, dtype)
             for block in self.transformer.h:
-                hidden_states = block(hidden_states,use_cache=False)[0]
+                hidden_states = block(hidden_states,attention_mask=attn_mask,use_cache=False)[0]
             return type('BodyOutput', (), {'last_hidden_state': hidden_states})()
 
     # Tail Model (last few layers + LM head)
@@ -611,7 +612,7 @@ class SplitLoRATrainer:
 
             # build attention mask on-the-fly (1 = real token, 0 = pad/eos padding)
             
-            attn = (ids != self.tokenizer.pad_token_id).long()
+            attn = (ids != self.tokenizer.pad_token_id)
 
             return {"input_ids": ids,
                     "attention_mask": attn,
@@ -1200,7 +1201,17 @@ def debug_full_tokenization(trainer, example):
         return None
 
 
-
+def _expand_mask(mask, dtype):
+    """
+    GPT-2 expects [B, 1, 1, L] float mask with 0.0 keep, -inf mask.
+    Converts bool / int64 mask of shape [B, L].
+    """
+    if mask is None:
+        return None
+    #  [B, L]        ->  [B, 1, 1, L]
+    mask = (~mask.bool()).to(dtype)         # 1 → keep, 0 → pad  -> 0/1  -> invert
+    mask = mask * torch.finfo(dtype).min    # 0 -> 0.0   1 -> -inf
+    return mask[:, None, None, :]           # broadcast dims
 # ─── Beam-search helpers ──────────────────────────────────────────────
 from evaluate import load as load_metric
 
