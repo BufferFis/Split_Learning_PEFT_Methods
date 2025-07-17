@@ -849,6 +849,11 @@ class SplitLoRATrainer:
                     
                     if batch_idx % 50 == 0:
                         print(f"Batch {batch_idx}, Loss: {loss:.4f}")
+
+                    if batch_idx % 500 == 0:
+                        if not self.validate_model_sanity():
+                            print("Stopping training due to gibberish generation")
+                            break
                         
                 except Exception as e:
                     print(f"Training error: {e}")
