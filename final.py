@@ -104,10 +104,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             all_hidden_states = ()
             dtype = hidden_states.dtype
             attn_mask = _expand_mask(attention_mask, dtype)
-            print("  attn_mask:(HEAD)", attn_mask.shape, attn_mask.dtype,
-                "min,max:", attn_mask.min().item(), attn_mask.max().item())
-            # And for a small sequence, visualize a 2×2 slice:
-            print(attn_mask[0,0,:3,:3])
+            
 
             for block in self.h:
                 # Convert attention_mask to the format GPT-2 blocks expect
@@ -254,7 +251,6 @@ class ServerModel:
         
         # Retain gradient for non-leaf tensors
         head_activations.retain_grad()
-        print("🔍 Head activations retained for grad:", head_activations.shape)
         if body_grad is not None:
             # Compute gradients with proper error handling
             try:
@@ -333,56 +329,49 @@ class TailClient:
                                  attention_mask=attention_mask)
         return output.logits
     
-    def compute_loss_and_backward(self, body_activations, labels, attention_mask=None):
-        """FIXED: Add retain_grad() for non-leaf tensors"""
+    def compute_loss_and_backward(self, body_activations, labels, attention_mask=None, mr_texts=None):
+        """Enhanced loss computation with coverage awareness"""
         self.optimizer.zero_grad()
-        
-        # FIX: Add retain_grad() BEFORE accessing .grad
         body_activations.requires_grad_(True)
-        body_activations.retain_grad()  # CRITICAL: Add this line
+        body_activations.retain_grad()
         
         # Forward pass
         logits = self.tail_model(inputs_embeds=body_activations).logits
         logits = torch.clamp(logits, -50.0, 50.0)
-
-        # Compute loss 
+        
+        # Compute base loss
         shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()               # existing
+        shift_labels = labels[..., 1:].contiguous()
         shift_labels[shift_labels == -100] = self.loss_fn.ignore_index
-
         
-        # Check for NaN in logits
-        if torch.isnan(shift_logits).any():
-            print("WARNING: NaN detected in logits!")
-            return 0.0, torch.zeros_like(body_activations)
-        
-        loss = self.loss_fn(
+        base_loss = self.loss_fn(
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1)
         )
-
-        # ADD: Entropy regularization for better diversity
-        log_probs = torch.log_softmax(shift_logits, dim=-1)
-        entropy = -torch.sum(log_probs * torch.softmax(shift_logits, dim=-1), dim=-1)
-        entropy_loss = -torch.mean(entropy)  # Encourage high entropy
         
-        # OPTIMIZED: Stronger entropy weight for E2E NLG
-        # beta = 0.01 
-        # total_loss = loss + beta * entropy_loss
-        
-        # Check for NaN loss
-        if torch.isnan(loss):
-            print("WARNING: NaN loss detected!")
-            return 0.0, torch.zeros_like(body_activations)
+        # Add coverage penalty if MR texts are provided
+        if mr_texts is not None:
+            coverage_penalty = 0.0
+            for i, mr_text in enumerate(mr_texts):
+                # Generate prediction for coverage check
+                pred_tokens = torch.argmax(shift_logits[i], dim=-1)
+                pred_text = self.tokenizer.decode(pred_tokens, skip_special_tokens=True)
+                
+                # Add coverage penalty
+                coverage = self.validate_coverage(mr_text, pred_text)
+                coverage_penalty += (1.0 - coverage['coverage_ratio']) * 0.1
+            
+            total_loss = base_loss + coverage_penalty / len(mr_texts)
+        else:
+            total_loss = base_loss
         
         # Backward pass
-        loss.backward(retain_graph=True)
-        # Now safely access .grad
+        total_loss.backward(retain_graph=True)
+        
         body_grad = body_activations.grad.clone() if body_activations.grad is not None else torch.zeros_like(body_activations)
-        # Update tail parameters
         self.optimizer.step()
         
-        return loss.item(), body_grad
+        return total_loss.item(), body_grad
 
 class _DummyLoader:
     """
@@ -687,7 +676,128 @@ class SplitLoRATrainer:
             print(f"⚠️ Sanity check failed: {e}")
             return True  # Continue training anyway
 
+    def train_with_coverage(self, train_dataloader, epochs=1):
+        """Enhanced training with coverage monitoring"""
+        print(f"Starting coverage-aware training for {epochs} epochs...")
         
+        for epoch in range(epochs):
+            total_loss = 0.0
+            total_coverage = 0.0
+            num_batches = 0
+            
+            for batch_idx, batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{epochs}")):
+                # Debug label masking on first batch
+                if batch_idx == 0:
+                    self.debug_label_masking(batch)
+                
+                try:
+                    input_ids = batch["input_ids"].to(device)
+                    attention_mask = batch["attention_mask"].to(device).bool()
+                    labels = batch["labels"].to(device)
+                    
+                    # Extract MR texts for coverage computation
+                    mr_texts = []
+                    for i in range(len(input_ids)):
+                        # Find delimiter and extract MR
+                        input_seq = input_ids[i]
+                        delim_pos = None
+                        for j in range(len(input_seq) - len(self.DELIM_TOKENS) + 1):
+                            if input_seq[j:j+len(self.DELIM_TOKENS)].tolist() == self.DELIM_TOKENS:
+                                delim_pos = j
+                                break
+                        
+                        if delim_pos is not None:
+                            mr_tokens = input_seq[:delim_pos]
+                            mr_text = self.tokenizer.decode(mr_tokens, skip_special_tokens=True)
+                            mr_texts.append(mr_text)
+                        else:
+                            mr_texts.append("")
+                    
+                    # Forward pass with coverage
+                    head_activations = self.head_client.forward(input_ids, attention_mask=attention_mask)
+                    body_activations, head_activations_stored = self.server.forward_train(head_activations, attention_mask)
+                    loss, body_grad = self.tail_client.compute_loss_and_backward(
+                        body_activations, labels, attention_mask, mr_texts
+                    )
+                    
+                    # Backward pass
+                    head_grad = self.server.backward(body_activations, body_grad, head_activations_stored)
+                    self.head_client.backward(head_activations, head_grad)
+                    
+                    # Update schedulers
+                    for sched in self.schedulers:
+                        sched.step()
+                    
+                    # Gradient clipping
+                    torch.nn.utils.clip_grad_norm_(self.head_client.head_model.parameters(), max_norm=1.0)
+                    torch.nn.utils.clip_grad_norm_(self.tail_client.tail_model.parameters(), max_norm=1.0)
+                    
+                    total_loss += loss
+                    num_batches += 1
+                    
+                    if batch_idx % 50 == 0:
+                        print(f"Batch {batch_idx}, Loss: {loss:.4f}")
+                        
+                except Exception as e:
+                    print(f"Training error: {e}")
+                    continue
+            
+            avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+            self.metrics["loss"].append(avg_loss)
+            print(f"Epoch {epoch+1} average loss: {avg_loss:.4f}")
+
+
+    def evaluate_with_coverage(self, wrapper, dataset, n_samples=100):
+        """Enhanced evaluation with coverage tracking"""
+        eval_split = dataset.select(range(min(n_samples, len(dataset))))
+        
+        total_coverage = 0.0
+        complete_outputs = 0
+        predictions = []
+        references = []
+        
+        for sample in tqdm(eval_split, desc="Evaluating with coverage"):
+            mr = sample["meaning_representation"]
+            ref = sample["human_reference"]
+            
+            # Generate prediction
+            pred = generate_with_beam(self, wrapper, mr, max_new_tokens=64)
+            
+            # Check coverage
+            coverage = self.validate_coverage(mr, pred)
+            total_coverage += coverage['coverage_ratio']
+            
+            if coverage['complete']:
+                complete_outputs += 1
+            
+            # Print examples of incomplete coverage
+            if not coverage['complete'] and len(predictions) < 5:
+                print(f"Incomplete coverage example:")
+                print(f"  MR: {mr}")
+                print(f"  Pred: {pred}")
+                print(f"  Missing: {coverage['missing']}")
+            
+            predictions.append(pred)
+            references.append(ref)
+        
+        # Compute metrics
+        avg_coverage = total_coverage / len(eval_split)
+        complete_ratio = complete_outputs / len(eval_split)
+        
+        # Official E2E metrics
+        official_metrics = evaluate_official(predictions)
+        
+        print(f"Coverage Results:")
+        print(f"  Average coverage: {avg_coverage:.3f}")
+        print(f"  Complete outputs: {complete_ratio:.3f}")
+        print(f"  BLEU: {official_metrics['bleu']:.3f}")
+        
+        return {
+            **official_metrics,
+            "coverage": avg_coverage,
+            "completeness": complete_ratio
+        }
+
     def train(self, train_dataloader, epochs=1):
         print(f"Starting training for {epochs} epochs...")
         example_inputs = None
@@ -733,7 +843,7 @@ class SplitLoRATrainer:
                     head_activations = self.head_client.forward(input_ids, attention_mask=attention_mask)  
                     body_activations, head_activations_stored = self.server.forward_train(head_activations, attention_mask)  
                     loss, body_grad = self.tail_client.compute_loss_and_backward(body_activations, labels, attention_mask)  
-                    print("Body grad norm:", body_activations.grad.norm().item())
+                    
 
                     
                     # FIX: Check for NaN loss
@@ -745,13 +855,11 @@ class SplitLoRATrainer:
                     
                     # FIXED: Use the correct variable name
                     head_grad = self.server.backward(body_activations, body_grad, head_activations_stored)
-                    print("Head grad norm (from server):", head_activations_stored.grad.norm().item())
 
                     self.head_client.backward(head_activations, head_grad)
                     for sched in self.schedulers:
                         sched.step()
                     grad_norms = [p.grad.norm().item() for p in self.head_client.head_model.parameters() if p.grad is not None]
-                    print("Head param grad norms:", grad_norms[:5])
                     # FIX: Add gradient clipping to all components
                     torch.nn.utils.clip_grad_norm_(self.head_client.head_model.parameters(), max_norm=0.5)
                     torch.nn.utils.clip_grad_norm_(self.tail_client.tail_model.parameters(), max_norm=0.5)
@@ -1064,8 +1172,137 @@ class SplitLoRATrainer:
         
         print("✅ Training state verification complete")
 
+    def debug_label_masking(self, batch):
+        """Debug label masking to ensure it's working correctly"""
+        print("=== LABEL MASKING DEBUG ===")
+        
+        for i in range(min(3, len(batch["input_ids"]))):
+            input_ids = batch["input_ids"][i]
+            labels = batch["labels"][i]
+            
+            # Find delimiter position
+            delim_pos = None
+            for j in range(len(input_ids) - len(self.DELIM_TOKENS) + 1):
+                if input_ids[j:j+len(self.DELIM_TOKENS)].tolist() == self.DELIM_TOKENS:
+                    delim_pos = j
+                    break
+            
+            if delim_pos is None:
+                print(f"❌ Sample {i}: No delimiter found!")
+                continue
+            
+            # Check masking
+            masked_tokens = sum(1 for label in labels if label == -100)
+            target_tokens = sum(1 for label in labels if label != -100)
+            
+            print(f"Sample {i}:")
+            print(f"  Delimiter position: {delim_pos}")
+            print(f"  Masked tokens: {masked_tokens}")
+            print(f"  Target tokens: {target_tokens}")
+            
+            # Decode parts
+            mr_part = input_ids[:delim_pos]
+            ref_part = input_ids[delim_pos+len(self.DELIM_TOKENS):]
+            
+            mr_text = self.tokenizer.decode(mr_part, skip_special_tokens=True)
+            ref_text = self.tokenizer.decode(ref_part, skip_special_tokens=True)
+            
+            print(f"  MR: '{mr_text}'")
+            print(f"  REF: '{ref_text}'")
+            
+            # Check if masking is correct
+            expected_mask_length = len(mr_part) + len(self.DELIM_TOKENS)
+            actual_mask_length = sum(1 for j, label in enumerate(labels) if label == -100)
+            
+            if expected_mask_length == actual_mask_length:
+                print("  ✅ Label masking is correct")
+            else:
+                print(f"  ❌ Label masking wrong: expected {expected_mask_length}, got {actual_mask_length}")
 
+    def extract_attributes(self, mr_text):
+        """Extract key attributes from E2E meaning representation"""
+        import re
+        
+        # Parse E2E MR format: name[Blue Spice], eatType[coffee shop], area[city centre]
+        attributes = {}
+        pattern = r'(\w+)\[([^\]]+)\]'
+        matches = re.findall(pattern, mr_text)
+        
+        for attr_name, attr_value in matches:
+            # Clean and normalize attribute values
+            attr_value = attr_value.lower().strip()
+            
+            # Handle special cases for E2E dataset
+            if attr_name == 'priceRange':
+                # Normalize price ranges
+                if 'less than' in attr_value:
+                    attr_value = 'cheap'
+                elif 'more than' in attr_value:
+                    attr_value = 'expensive'
+            
+            attributes[attr_name] = attr_value
+        
+        return attributes
     
+
+    def validate_coverage(self, mr_text, generated_text):
+        """Validate that all MR attributes are covered in generated text"""
+        attributes = self.extract_attributes(mr_text)
+        gen_text_lower = generated_text.lower()
+        
+        covered_attrs = []
+        missing_attrs = []
+        
+        for attr_name, attr_value in attributes.items():
+            # Check direct value coverage
+            if attr_value in gen_text_lower:
+                covered_attrs.append(f"{attr_name}={attr_value}")
+            else:
+                # Check semantic equivalents for common attributes
+                covered = False
+                
+                if attr_name == 'eatType':
+                    # Check for restaurant type synonyms
+                    synonyms = {
+                        'coffee shop': ['coffee', 'café', 'cafe'],
+                        'restaurant': ['restaurant', 'place', 'establishment'],
+                        'pub': ['pub', 'bar']
+                    }
+                    if attr_value in synonyms:
+                        covered = any(syn in gen_text_lower for syn in synonyms[attr_value])
+                
+                elif attr_name == 'area':
+                    # Check for area mentions
+                    if attr_value in ['city centre', 'city center']:
+                        covered = any(phrase in gen_text_lower for phrase in ['city centre', 'city center', 'centre', 'center'])
+                
+                elif attr_name == 'familyFriendly':
+                    # Check for family-friendly mentions
+                    if attr_value == 'yes':
+                        covered = any(phrase in gen_text_lower for phrase in ['family', 'kid', 'child'])
+                
+                if covered:
+                    covered_attrs.append(f"{attr_name}={attr_value}")
+                else:
+                    missing_attrs.append(f"{attr_name}={attr_value}")
+        
+        coverage_ratio = len(covered_attrs) / len(attributes) if attributes else 1.0
+        
+        return {
+            'coverage_ratio': coverage_ratio,
+            'covered': covered_attrs,
+            'missing': missing_attrs,
+            'complete': len(missing_attrs) == 0
+        }
+
+    def coverage_loss(self, mr_text, generated_text, base_loss):
+        """Add coverage penalty to the loss function"""
+        coverage = self.validate_coverage(mr_text, generated_text)
+        
+        # Coverage penalty: penalize missing attributes
+        coverage_penalty = (1.0 - coverage['coverage_ratio']) * 0.5
+        
+        return base_loss + coverage_penalty
     # def save_checkpoint(self, path="./splitlora_checkpoint"):
     #     """FIXED: Save merged models using state dicts"""
     #     os.makedirs(path, exist_ok=True)
@@ -1899,7 +2136,7 @@ def main():
 
         test_single_token_delimiters(trainer.tokenizer)
         # Run evaluation
-        results = evaluate_beam(trainer, wrapper, test_ds, n_samples=len(test_ds))
+        results = trainer.evaluate_with_coverage(trainer, wrapper, test_ds, n_samples=len(test_ds))
         results_file = os.path.join(args.save_path, "evaluation_results.json")
         with open(results_file, "w") as f:
             json.dump(results, f, indent=2)
@@ -1929,7 +2166,7 @@ def main():
     print(f"PAD token: '{trainer.PAD}' -> {trainer.tokenizer.pad_token_id}")
     print(f"EOS token: '{trainer.tokenizer.eos_token}' -> {trainer.tokenizer.eos_token_id}")
     for ep in range(start_epoch, start_epoch + args.epochs):
-        trainer.train(train_dl, epochs=1)
+        trainer.train_with_coverage(train_dl, epochs=1)
         ckpt_name = f"ckpt_ep{ep}.pt"
         ckpt_path = os.path.join(args.save_path, f"ckpt_ep{ep}.pt")
         trainer.save_checkpoint(ckpt_path, epoch=ep)
