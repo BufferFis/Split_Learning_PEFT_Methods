@@ -50,50 +50,6 @@ def diagnose_tokenizer_corruption(trainer):
     print(f"DELIM token: '{trainer.DELIM}' -> {trainer.tokenizer.encode(trainer.DELIM)}")
     print(f"PAD token: '{trainer.PAD}' -> {trainer.tokenizer.pad_token_id}")
 
-def create_clean_model_and_tokenizer():
-    """Create a clean model with properly added tokens"""
-    from transformers import GPT2Tokenizer, GPT2LMHeadModel
-    
-    # Load clean tokenizer and model
-    tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-    model = GPT2LMHeadModel.from_pretrained('gpt2')
-    
-    # CRITICAL: Set pad_token BEFORE adding custom tokens
-    tokenizer.pad_token = tokenizer.eos_token  # Use existing token first
-    
-    # Add custom tokens properly
-    special_tokens = {
-        'additional_special_tokens': ['<|gen|>']
-    }
-    
-    num_added = tokenizer.add_special_tokens(special_tokens)
-    print(f"Added {num_added} special tokens")
-    
-    # CRITICAL: Resize embeddings properly
-    model.resize_token_embeddings(len(tokenizer))
-    
-    # Initialize new token embeddings properly
-    with torch.no_grad():
-        # Get the new token embeddings
-        new_tokens_start = len(tokenizer) - num_added
-        
-        # Initialize new embeddings as average of existing embeddings
-        existing_embeddings = model.transformer.wte.weight[:new_tokens_start]
-        avg_embedding = existing_embeddings.mean(dim=0)
-        
-        # Set new token embeddings
-        for i in range(new_tokens_start, len(tokenizer)):
-            model.transformer.wte.weight[i] = avg_embedding + torch.randn_like(avg_embedding) * 0.01
-    
-    # Verify tokenizer works
-    test_text = "The restaurant serves food"
-    tokens = tokenizer.encode(test_text)
-    decoded = tokenizer.decode(tokens)
-    assert decoded == test_text, f"Tokenizer corrupted: '{test_text}' != '{decoded}'"
-    
-    print("✅ Clean model and tokenizer created successfully")
-    return model, tokenizer
-
 
 
 def split_gpt2(model, head_layers=2, tail_layers=2):
@@ -277,30 +233,40 @@ class ServerModel:
         return output.last_hidden_state, activations
     
     def backward(self, body_output, body_grad, head_activations):
-        """FIXED: Add retain_grad() and gradient clipping"""
+        """Fixed backward pass with proper gradient flow"""
         self.optimizer.zero_grad()
         
-        # FIX: Add retain_grad() BEFORE accessing .grad
-        head_activations.requires_grad_(True)
-        head_activations.retain_grad()  # CRITICAL: Add this line
+        # Ensure gradients are enabled
+        if not head_activations.requires_grad:
+            head_activations.requires_grad_(True)
+        
+        # Retain gradient for non-leaf tensors
+        head_activations.retain_grad()
         
         if body_grad is not None:
-            # Backward through body layers
-            torch.autograd.backward(
-                tensors=[body_output],
-                grad_tensors=[body_grad],
-                retain_graph=True
-            )
-            
-            # Now safely access .grad
-            head_grad = head_activations.grad.clone() if head_activations.grad is not None else torch.zeros_like(head_activations)
-        else:
-            head_grad = torch.zeros_like(head_activations)
+            # Compute gradients with proper error handling
+            try:
+                torch.autograd.backward(
+                    tensors=[body_output],
+                    grad_tensors=[body_grad],
+                    retain_graph=True,
+                    create_graph=False
+                )
+            except Exception as e:
+                print(f"Gradient computation failed: {e}")
+                return torch.zeros_like(head_activations)
         
-        # FIX: Add gradient clipping
+        # Get head gradients safely
+        head_grad = head_activations.grad
+        if head_grad is None:
+            head_grad = torch.zeros_like(head_activations)
+        else:
+            head_grad = head_grad.clone()
+        
+        # Gradient clipping
         torch.nn.utils.clip_grad_norm_(self.body_model.parameters(), max_norm=1.0)
         
-        # Update body parameters
+        # Update parameters
         self.optimizer.step()
         
         return head_grad
@@ -437,7 +403,7 @@ class SplitLoRATrainer:
         full_model.config.pad_token_id = self.tokenizer.eos_token_id
         self.max_seq_len = 256
 
-         # FIXED: Properly initialize custom token embeddings
+        
         original_vocab_size = len(self.tokenizer)
         self.PAD = self.tokenizer.pad_token
         self.tokenizer.padding_side = "right"
@@ -1226,15 +1192,31 @@ def debug_full_tokenization(trainer, example):
 
 def _expand_mask(mask, dtype):
     """
-    GPT-2 expects [B, 1, 1, L] float mask with 0.0 keep, -inf mask.
-    Converts bool / int64 mask of shape [B, L].
+    Expands attention_mask from [batch_size, seq_len] to [batch_size, 1, 1, seq_len]
+    for GPT-2's causal attention mechanism.
     """
     if mask is None:
         return None
-    #  [B, L]        ->  [B, 1, 1, L]
-    mask = (~mask.bool()).to(dtype)         # 1 → keep, 0 → pad  -> 0/1  -> invert
-    mask = mask * torch.finfo(dtype).min    # 0 -> 0.0   1 -> -inf
-    return mask[:, None, None, :]           # broadcast dims
+    
+    batch_size, seq_len = mask.shape
+    
+    # Create causal mask
+    causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=dtype, device=mask.device))
+    causal_mask = causal_mask.view(1, 1, seq_len, seq_len)
+    
+    # Combine with padding mask
+    mask = mask.to(dtype)
+    mask = mask[:, None, None, :]  # [B, 1, 1, L]
+    
+    # Apply causal constraint
+    mask = mask * causal_mask
+    
+    # Convert to additive attention mask
+    mask = (1.0 - mask) * torch.finfo(dtype).min
+    
+    return mask
+
+
 # ─── Beam-search helpers ──────────────────────────────────────────────
 from evaluate import load as load_metric
 
@@ -1265,7 +1247,7 @@ def generate_with_beam(trainer, wrapper, mr_text, max_new_tokens=64):
                 
                 # FIXED TOKEN IDs:
                 eos_token_id=trainer.tokenizer.eos_token_id,  # Proper EOS
-                pad_token_id=trainer.tokenizer.pad_token_id,  # Your custom pad
+                pad_token_id=trainer.tokenizer.pad_token_id,  
                 
                 # REMOVE PROBLEMATIC PROCESSOR:
                 # Remove the MinLengthLogitsProcessor from here

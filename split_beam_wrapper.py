@@ -43,16 +43,28 @@ class SplitGPT2ForGeneration(PreTrainedModel, GenerationMixin):
         return True
 
     # ---------- standard forward ---------------------------------------
-    def forward(self,
-                input_ids: torch.LongTensor,
-                attention_mask: Optional[torch.FloatTensor] = None,
-                **ignored):
+    def forward(self, input_ids: torch.LongTensor, attention_mask: Optional[torch.FloatTensor] = None, **ignored):
+        """Fixed forward pass with proper attention mask handling"""
+        
+        # Create attention mask if not provided
+        if attention_mask is None:
+            attention_mask = (input_ids != self.tokenizer.pad_token_id).float()
+        
+        # Ensure attention mask is boolean
+        attention_mask = attention_mask.bool()
+        
         with torch.no_grad():
-            h = self.head_client.forward(input_ids, attention_mask)
-            b = self.server.forward(h, attention_mask)  # Pass attention_mask
-            logits = self.tail_client.forward(b, attention_mask)  
+            # Forward through head
+            head_out = self.head_client.forward(input_ids, attention_mask=attention_mask)
+            
+            # Forward through body
+            body_out = self.server.forward(head_out, attention_mask=attention_mask)
+            
+            # Forward through tail
+            logits = self.tail_client.forward(body_out, attention_mask=attention_mask)
+            
+            return CausalLMOutput(logits=logits)
 
-        return CausalLMOutput(logits=logits)
 
     def generate(self, input_ids=None, attention_mask=None, **kwargs):
         if attention_mask is None:
