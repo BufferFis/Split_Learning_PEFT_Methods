@@ -99,27 +99,32 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             position_embeds = self.wpe(position_ids)
             hidden_states = inputs_embeds + position_embeds
             hidden_states = self.drop(hidden_states)
-
-            # FIXED: Pass attention_mask to each block
+            
             all_hidden_states = ()
+            
             dtype = hidden_states.dtype
             attn_mask = _expand_mask(attention_mask, dtype)
             if attention_mask is None:
                 attention_mask = (input_ids != self.tokenizer.pad_token_id)
             
-
             for block in self.h:
-                # Convert attention_mask to the format GPT-2 blocks expect
-                hidden_states = block(hidden_states , attention_mask=attn_mask, use_cache=False)[0]
+                hidden_states = block(hidden_states, attention_mask=attn_mask, use_cache=False)[0]
                 all_hidden_states = all_hidden_states + (hidden_states,)
-
+            
             if output_hidden_states:
                 return type('HeadOutput', (), {
                     'last_hidden_state': hidden_states,
-                    'hidden_states': all_hidden_states
+                    'hidden_states': all_hidden_states,
+                    'past_key_values': None,  # ADD THIS
+                    'attentions': None        # ADD THIS
                 })()
             else:
-                return type('HeadOutput', (), {'last_hidden_state': hidden_states})()
+                return type('HeadOutput', (), {
+                    'last_hidden_state': hidden_states,
+                    'past_key_values': None,  # ADD THIS
+                    'attentions': None        # ADD THIS
+                })()
+
             
     
     # Body Model (middle layers)
@@ -156,10 +161,15 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             dtype = hidden_states.dtype
             attn_mask = _expand_mask(attention_mask, dtype)
             
-        
             for block in self.transformer.h:
-                hidden_states = block(hidden_states,attention_mask=attn_mask,use_cache=False)[0]
-            return type('BodyOutput', (), {'last_hidden_state': hidden_states})()
+                hidden_states = block(hidden_states, attention_mask=attn_mask, use_cache=False)[0]
+            
+            return type('BodyOutput', (), {
+                'last_hidden_state': hidden_states,
+                'past_key_values': None,  # ADD THIS
+                'attentions': None        # ADD THIS
+            })()
+
 
     # Tail Model (last few layers + LM head)
     class TailModel(nn.Module):
@@ -193,15 +203,22 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             
         def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
             hidden_states = inputs_embeds
+            
             dtype = hidden_states.dtype
             attn_mask = _expand_mask(attention_mask, dtype)
-            for block in self.transformer.h:   
-                hidden_states = block(hidden_states,attention_mask=attn_mask,use_cache=False)[0]
-
+            
+            for block in self.transformer.h:
+                hidden_states = block(hidden_states, attention_mask=attn_mask, use_cache=False)[0]
+            
             hidden_states = self.transformer.ln_f(hidden_states)
             logits = self.lm_head(hidden_states)
-
-            return type('TailOutput', (), {'logits': logits})()
+            
+            return type('TailOutput', (), {
+                'logits': logits,
+                'past_key_values': None,  # ADD THIS
+                'hidden_states': None,    # ADD THIS
+                'attentions': None        # ADD THIS
+            })()
 
     
     head_model = HeadModel(model, head_layers)
@@ -295,7 +312,10 @@ class HeadClient:
             attention_mask=attention_mask, 
             output_hidden_states=True
         )
-        return output.hidden_states[-1]
+        if hasattr(output, 'hidden_states') and output.hidden_states is not None:
+            return output.hidden_states[-1]
+        else:
+            return output.last_hidden_state
     
     def backward(self, head_activations, head_grad):
         """ESSENTIAL: Backward pass for split learning"""
