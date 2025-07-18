@@ -274,13 +274,28 @@ class ServerModel:
             output = self.body_model(hidden_states=activations)
             return output.last_hidden_state
     
-    def forward_train(self, activations, attention_mask=None):
-        """Forward pass during training"""
+    def forward_train(self, activations, attention_mask=None, past_key_values=None, position_ids=None):
+        """Forward pass during training with context passing"""
         self.body_model.train()
         # Don't detach - maintain gradient connection
         activations.requires_grad_(True)
-        output = self.body_model(hidden_states=activations, attention_mask=attention_mask)
-        return output.last_hidden_state, activations
+        
+        # Pass context to body model forward
+        output = self.body_model(
+            hidden_states=activations, 
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            position_ids=position_ids
+        )
+        
+        # Return output with context for next split
+        return type('BodyOutput', (), {
+            'last_hidden_state': output.last_hidden_state,
+            'past_key_values': past_key_values,  # Pass through
+            'position_ids': position_ids,        # Pass through
+            'attentions': None
+        })(), activations
+
     
     def backward(self, body_output, body_grad, head_activations):
         """Fixed backward pass with proper gradient flow"""
@@ -386,14 +401,20 @@ class TailClient:
                                  attention_mask=attention_mask)
         return output.logits
     
-    def compute_loss_and_backward(self, body_activations, labels, attention_mask=None, mr_texts=None):
+    def compute_loss_and_backward(self, body_activations, labels, attention_mask=None, mr_texts=None, past_key_values=None, position_ids=None):
         """Enhanced loss computation with coverage awareness"""
         self.optimizer.zero_grad()
         body_activations.requires_grad_(True)
         body_activations.retain_grad()
         
         # Forward pass
-        logits = self.tail_model(inputs_embeds=body_activations).logits
+        logits = self.tail_model(
+        inputs_embeds=body_activations,
+        attention_mask=attention_mask,
+        past_key_values=past_key_values,
+        position_ids=position_ids
+        ).logits
+        
         logits = torch.clamp(logits, -50.0, 50.0)
         
         # Compute base loss
