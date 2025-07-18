@@ -102,15 +102,15 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
 
             # FIXED: Pass attention_mask to each block
             all_hidden_states = ()
-            #dtype = hidden_states.dtype
-            #attn_mask = _expand_mask(attention_mask, dtype)
+            dtype = hidden_states.dtype
+            attn_mask = _expand_mask(attention_mask, dtype)
             if attention_mask is None:
                 attention_mask = (input_ids != self.tokenizer.pad_token_id)
             
 
             for block in self.h:
                 # Convert attention_mask to the format GPT-2 blocks expect
-                hidden_states = block(hidden_states , attention_mask=attention_mask, use_cache=False)[0]
+                hidden_states = block(hidden_states , attention_mask=attn_mask, use_cache=False)[0]
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
             if output_hidden_states:
@@ -153,12 +153,12 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             return {"input_ids": input_ids}
             
         def forward(self, hidden_states=None, attention_mask=None, **kwargs):
-            #dtype = hidden_states.dtype
-            #attn_mask = _expand_mask(attention_mask, dtype)
+            dtype = hidden_states.dtype
+            attn_mask = _expand_mask(attention_mask, dtype)
             
         
             for block in self.transformer.h:
-                hidden_states = block(hidden_states,attention_mask=attention_mask,use_cache=False)[0]
+                hidden_states = block(hidden_states,attention_mask=attn_mask,use_cache=False)[0]
             return type('BodyOutput', (), {'last_hidden_state': hidden_states})()
 
     # Tail Model (last few layers + LM head)
@@ -193,10 +193,10 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             
         def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
             hidden_states = inputs_embeds
-            #dtype = hidden_states.dtype
-            #attn_mask = _expand_mask(attention_mask, dtype)
+            dtype = hidden_states.dtype
+            attn_mask = _expand_mask(attention_mask, dtype)
             for block in self.transformer.h:   
-                hidden_states = block(hidden_states,attention_mask=attention_mask,use_cache=False)[0]
+                hidden_states = block(hidden_states,attention_mask=attn_mask,use_cache=False)[0]
 
             hidden_states = self.transformer.ln_f(hidden_states)
             logits = self.lm_head(hidden_states)
