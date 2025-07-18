@@ -216,7 +216,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
 
 class ServerModel:
     """Server component handling the body layers"""
-    def __init__(self, body_model, learning_rate=2e-4):
+    def __init__(self, body_model, learning_rate=5e-4):
         self.body_model = body_model.to(device)
         self.optimizer = optim.AdamW(
             [p for p in self.body_model.parameters() if p.requires_grad], 
@@ -278,7 +278,7 @@ class ServerModel:
 
 class HeadClient:
     """Client component handling head layers"""
-    def __init__(self, head_model, learning_rate=2e-4):
+    def __init__(self, head_model, learning_rate=5e-4):
         self.head_model = head_model.to(device)
         self.optimizer = optim.AdamW(
             [p for p in self.head_model.parameters() if p.requires_grad], 
@@ -312,7 +312,7 @@ class HeadClient:
 
 class TailClient:
     """Client component handling tail layers"""
-    def __init__(self, tail_model, learning_rate=2e-4, tokenizer=None):
+    def __init__(self, tail_model, learning_rate=5e-4, tokenizer=None):
         self.tail_model = tail_model.to(device)
         self.optimizer = optim.AdamW(
             [p for p in self.tail_model.parameters() if p.requires_grad], 
@@ -357,7 +357,7 @@ class TailClient:
                 
                 # Add coverage penalty
                 coverage = self.validate_coverage(mr_text, pred_text)
-                coverage_penalty += (1.0 - coverage['coverage_ratio']) * 0.1
+                coverage_penalty += (1.0 - coverage['coverage_ratio']) * 0.2
             
             total_loss = base_loss + coverage_penalty / len(mr_texts)
         else:
@@ -492,7 +492,7 @@ class SplitLoRATrainer:
                 model_name="gpt2",
                 head_layers=2,
                 tail_layers=2,
-                learning_rate=2e-4,
+                learning_rate=5e-4,
                 warmup_steps=500,
                 max_epochs=5):
         
@@ -529,9 +529,9 @@ class SplitLoRATrainer:
         tail_model.lm_head.weight = head_model.wte.weight 
         # Apply LoRA/DoRA to clean models
         lora_config = LoraConfig(
-            r=2,
+            r=4,
             lora_alpha=32,
-            lora_dropout=0.1,
+            lora_dropout=0.5,
             bias="lora_only",
             use_dora=True,
             task_type="CAUSAL_LM",
@@ -779,14 +779,17 @@ class SplitLoRATrainer:
 
         # 2. Create one cosine scheduler per optimiser
         from transformers import get_cosine_schedule_with_warmup
+        from transformers import get_constant_schedule_with_warmup
+        from transformers import get_linear_schedule_with_warmup
+        scheduler_epochs = 6
+        total_steps = len(train_dataloader) * scheduler_epochs
         for opt in (self.head_client.optimizer,
                     self.server.optimizer,
                     self.tail_client.optimizer):
-            sched = get_cosine_schedule_with_warmup(
+            sched = get_linear_schedule_with_warmup(
                 opt,
-                num_warmup_steps=self.warmup_steps,
+                num_warmup_steps=1000,      # ~3% of total steps
                 num_training_steps=total_steps,
-                num_cycles=0.5,
                 last_epoch=-1
             )
             self.schedulers.append(sched)
@@ -855,7 +858,8 @@ class SplitLoRATrainer:
                 # Debug label masking on first batch
                 if batch_idx == 0:
                     self.debug_label_masking(batch)
-                
+                if batch_idx % 100 == 0:
+                    torch.cuda.empty_cache()  # Clear GPU memory
                 try:
                     input_ids = batch["input_ids"].to(device)
                     attention_mask = batch["attention_mask"].to(device).bool()
@@ -1409,177 +1413,7 @@ class SplitLoRATrainer:
         coverage_penalty = (1.0 - coverage['coverage_ratio']) * 0.5
         
         return base_loss + coverage_penalty
-    # def save_checkpoint(self, path="./splitlora_checkpoint"):
-    #     """FIXED: Save merged models using state dicts"""
-    #     os.makedirs(path, exist_ok=True)
-        
-    #     try:
-    #         print("Merging and saving models with custom embeddings...")
-            
-    #         # Merge PEFT adapters into base models
-    #         head_merged = self.head_client.head_model.merge_and_unload()
-    #         body_merged = self.server.body_model.merge_and_unload()
-    #         tail_merged = self.tail_client.tail_model.merge_and_unload()
-            
-    #         # FIXED: Save state dicts instead of using save_pretrained
-    #         torch.save(head_merged.state_dict(), os.path.join(path, "head_model_merged.pt"))
-    #         torch.save(body_merged.state_dict(), os.path.join(path, "body_model_merged.pt"))
-    #         torch.save(tail_merged.state_dict(), os.path.join(path, "tail_model_merged.pt"))
-            
-    #         # Save model configurations
-    #         torch.save(head_merged.config, os.path.join(path, "head_config.pt"))
-    #         torch.save(body_merged.config, os.path.join(path, "body_config.pt"))
-    #         torch.save(tail_merged.config, os.path.join(path, "tail_config.pt"))
-            
-    #         # Save tokenizer
-    #         self.tokenizer.save_pretrained(os.path.join(path, "tokenizer"))
-            
-    #         # Save training metadata including custom token info
-    #         metadata = {
-    #             "vocab_size": len(self.tokenizer),
-    #             "original_vocab_size": 50257,
-    #             "custom_tokens": {
-    #                 "delim_token": self.DELIM,
-    #                 "delim_id": self.tokenizer.encode(self.DELIM, add_special_tokens=False)[0],
-    #                 "pad_token": self.PAD,
-    #                 "pad_id": self.tokenizer.pad_token_id
-    #             },
-    #             "metrics": self.metrics,
-    #             "model_config": {
-    #                 "head_layers": 2,
-    #                 "tail_layers": 2,
-    #                 "body_layers": 8
-    #             }
-    #         }
-            
-    #         with open(os.path.join(path, "training_metadata.json"), "w") as f:
-    #             json.dump(metadata, f, indent=2)
-            
-    #         print(f"✅ Merged checkpoint with custom embeddings saved to {path}")
-    #         return path
-            
-    #     except Exception as e:
-    #         print(f"❌ Error saving merged checkpoint: {e}")
-    #         traceback.print_exc()
-    #         return None
-
-    # def load_checkpoint(self, path="./splitlora_checkpoint"):
-    #     from transformers.models.gpt2.configuration_gpt2 import GPT2Config
-    #     """FIXED: Load merged models from state dicts"""
-    #     if not os.path.exists(path):
-    #         print(f"❌ Checkpoint path {path} does not exist")
-    #         return False
-
-    #     try:
-    #         # Load metadata first
-    #         with open(os.path.join(path, "training_metadata.json"), "r") as f:
-    #             metadata = json.load(f)
-            
-    #         print(f"Loading merged checkpoint with vocab_size: {metadata['vocab_size']}")
-            
-    #         # Load tokenizer (preserves custom tokens)
-    #         self.tokenizer = AutoTokenizer.from_pretrained(os.path.join(path, "tokenizer"))
-            
-    #         # FIXED: Create fresh full model with correct vocab size
-    #         from transformers import GPT2LMHeadModel
-    #         full_model = GPT2LMHeadModel.from_pretrained('gpt2')
-            
-    #         # Resize to match saved model
-    #         full_model.resize_token_embeddings(metadata['vocab_size'])
-            
-    #         # Load the merged head model state dict to get the embeddings
-    #         head_state = torch.load(os.path.join(path, "head_model_merged.pt"), map_location=device)
-            
-    #         # Extract embedding weights and copy to full model
-    #         if 'wte.weight' in head_state:
-    #             full_model.transformer.wte.weight.data = head_state['wte.weight']
-    #         if 'wpe.weight' in head_state:
-    #             full_model.transformer.wpe.weight.data = head_state['wpe.weight']
-            
-    #         with torch.serialization.safe_globals([GPT2Config]):
-    #             head_config = torch.load(os.path.join(path, "head_config.pt"), 
-    #                                     map_location=device, weights_only=True)
-    #             body_state = torch.load(os.path.join(path, "body_model_merged.pt"), 
-    #                                 map_location=device, weights_only=True) 
-    #             tail_state = torch.load(os.path.join(path, "tail_model_merged.pt"), 
-    #                                 map_location=device, weights_only=True)
-    #             # Reconstruct layer weights in full model
-    #         layer_idx = 0
-            
-    #         # Head layers
-    #         for i in range(2):  # head_layers
-    #             if f'h.{i}.ln_1.weight' in head_state:
-    #                 full_model.transformer.h[layer_idx].load_state_dict({
-    #                     k[len(f'h.{i}.'):]: v for k, v in head_state.items() 
-    #                     if k.startswith(f'h.{i}.')
-    #                 }, strict=False)
-    #             layer_idx += 1
-            
-    #         # Body layers  
-    #         for i in range(8):  # body_layers
-    #             body_layer_key = f'transformer.h.{i}'
-    #             if f'{body_layer_key}.ln_1.weight' in body_state:
-    #                 full_model.transformer.h[layer_idx].load_state_dict({
-    #                     k[len(f'{body_layer_key}.'):]: v for k, v in body_state.items()
-    #                     if k.startswith(f'{body_layer_key}.')
-    #                 }, strict=False)
-    #             layer_idx += 1
-            
-    #         # Tail layers
-    #         for i in range(2):  # tail_layers
-    #             tail_layer_key = f'transformer.h.{i}'
-    #             if f'{tail_layer_key}.ln_1.weight' in tail_state:
-    #                 full_model.transformer.h[layer_idx].load_state_dict({
-    #                     k[len(f'{tail_layer_key}.'):]: v for k, v in tail_state.items()
-    #                     if k.startswith(f'{tail_layer_key}.')
-    #                 }, strict=False)
-    #             layer_idx += 1
-            
-    #         # Load final layer norm and LM head from tail
-    #         if 'transformer.ln_f.weight' in tail_state:
-    #             full_model.transformer.ln_f.weight.data = tail_state['transformer.ln_f.weight']
-    #             full_model.transformer.ln_f.bias.data = tail_state['transformer.ln_f.bias']
-            
-    #         if 'lm_head.weight' in tail_state:
-    #             full_model.lm_head.weight.data = tail_state['lm_head.weight']
-            
-    #         print("✅ Merged models loaded successfully with custom embeddings")
-            
-    #         # Verify custom token embeddings were preserved
-    #         delim_id = metadata["custom_tokens"]["delim_id"]
-    #         delim_embedding = full_model.transformer.wte.weight[delim_id]
-    #         print(f"Loaded DELIM embedding norm: {delim_embedding.norm().item():.4f}")
-            
-    #         # Recreate split models from loaded full model
-    #         head_model, body_model, tail_model = split_gpt2(full_model, 2, 2)
-            
-    #         # Re-apply PEFT to the loaded models
-    #         lora_config = LoraConfig(
-    #             r=2, lora_alpha=32, lora_dropout=0.1,
-    #             bias="lora_only", use_dora=True, task_type="CAUSAL_LM",
-    #             target_modules=["c_attn", "c_proj", "c_fc"]
-    #         )
-            
-    #         head_model = get_peft_model(head_model, lora_config)
-    #         body_model = get_peft_model(body_model, lora_config)
-    #         tail_model = get_peft_model(tail_model, lora_config)
-            
-    #         # Update components with loaded models
-    #         self.head_client.head_model = head_model.to(device)
-    #         self.server.body_model = body_model.to(device)
-    #         self.tail_client.tail_model = tail_model.to(device)
-            
-    #         # Ensure weight tying
-    #         self.tail_client.tail_model.base_model.lm_head.weight = self.head_client.head_model.base_model.wte.weight
-            
-    #         print(f"✅ Checkpoint loaded successfully from {path}")
-    #         return True
-
-    #     except Exception as e:
-    #         print(f"❌ Error loading checkpoint: {e}")
-    #         traceback.print_exc()
-    #         return False
-
+    
 def analyze_sequence_lengths(trainer, dataset):
     """Analyze your actual data to choose optimal fixed length"""
     lengths = []
@@ -2135,23 +1969,6 @@ def test_simple_greedy(trainer, wrapper, mr_text):
     return result
 
 
-def test_single_token_delimiters(tokenizer):
-    """Find good single-token delimiters"""
-    candidates = [
-        ":",      # Colon
-        ";",      # Semicolon  
-        "=",      # Equals
-        "|",      # Pipe
-        "###",    # Triple hash (from search result [2])
-        ">>",     # Double arrow
-        "=>",     # Arrow equals
-        ":",      # Just colon
-    ]
-    
-    print("=== TESTING SINGLE-TOKEN DELIMITERS ===")
-    for delim in candidates:
-        tokens = tokenizer.encode(delim, add_special_tokens=False)
-        print(f"'{delim}' -> {tokens} ({len(tokens)} tokens) {'✅ SINGLE' if len(tokens) == 1 else '❌ MULTI'}")
 
 def count_zero_target_rows(dataset):
     """
@@ -2240,7 +2057,6 @@ def main():
         else:
             print("✅ Generating normal text - period prediction might be normal")
 
-        test_single_token_delimiters(trainer.tokenizer)
         # Run evaluation
         results = trainer.evaluate_with_coverage(trainer, wrapper, test_ds, n_samples=len(test_ds))
         results_file = os.path.join(args.save_path, "evaluation_results.json")
