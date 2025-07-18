@@ -1639,32 +1639,42 @@ def debug_full_tokenization(trainer, example):
         print(f"Unique tokens in sequence: {set(input_ids[:60])}")  # Show first 60 unique tokens
         return None
 
-
 def _expand_mask(mask, dtype):
     """
     Expands attention_mask from [batch_size, seq_len] to [batch_size, 1, 1, seq_len]
-    for GPT-2's causal attention mechanism.
+    for GPT-2's causal attention mechanism in split model setup.
     """
     if mask is None:
         return None
     
     batch_size, seq_len = mask.shape
     
-    # Create causal mask
-    causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=dtype, device=mask.device))
-    causal_mask = causal_mask.view(1, 1, seq_len, seq_len)
-    
-    # Combine with padding mask
+    # Convert mask to the target dtype
     mask = mask.to(dtype)
-    mask = mask[:, None, None, :]  # [B, 1, 1, L]
     
-    # Apply causal constraint
-    mask = mask * causal_mask
+    # Create causal mask - lower triangular matrix
+    causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=dtype, device=mask.device))
     
-    # Convert to additive attention mask
-    mask = (1.0 - mask) * torch.finfo(dtype).min
+    # Expand padding mask to [batch_size, 1, 1, seq_len]
+    expanded_mask = mask.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, L]
     
-    return mask
+    # Expand causal mask to [batch_size, 1, seq_len, seq_len]
+    causal_mask = causal_mask.unsqueeze(0).unsqueeze(1)  # [1, 1, L, L]
+    causal_mask = causal_mask.expand(batch_size, 1, seq_len, seq_len)  # [B, 1, L, L]
+    
+    # Apply padding mask to each position in the causal mask
+    # We need to mask out padded positions in both query and key dimensions
+    padding_mask_expanded = expanded_mask.expand(batch_size, 1, 1, seq_len)  # [B, 1, 1, L]
+    key_mask = padding_mask_expanded.transpose(-1, -2)  # [B, 1, L, 1]
+    
+    # Combine causal mask with padding constraints
+    final_mask = causal_mask * padding_mask_expanded * key_mask
+    
+    # Convert to additive attention mask (0 for attend, -inf for mask)
+    final_mask = (1.0 - final_mask) * torch.finfo(dtype).min
+    
+    return final_mask
+
 
 
 # ─── Beam-search helpers ──────────────────────────────────────────────
