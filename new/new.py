@@ -1,8 +1,3 @@
-# ==============================================================================
-#
-# Full End-to-End Pipeline for Training and Evaluating a
-# U-Shaped Split-DoRA GPT-2 Model on the E2E Refined NLG Dataset
-#
 # Description:
 # This script merges two advanced concepts:
 #   1. A U-shaped split architecture for GPT-2 (ClientHead, Server, ClientTail)
@@ -620,7 +615,16 @@ def main(args):
             shift_labels = labels[..., 1:].contiguous()
             loss = loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
             
+            # Check for NaN loss before backward pass
+            if torch.isnan(loss):
+                print("Warning: NaN loss detected. Skipping batch.")
+                continue
+
             loss.backward()
+
+            # Gradient Clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(client_params, 1.0)
+            torch.nn.utils.clip_grad_norm_(server.parameters(), 1.0)
 
             client_optimizer.step()
             server_optimizer.step()
@@ -662,7 +666,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda", help="Device to train on ('cuda' or 'cpu').")
     
     # Training Hyperparameters
-    parser.add_argument("--learning_rate", type=float, default=2e-4, help="Peak learning rate for the AdamW optimizer.")
+    parser.add_argument("--learning_rate", type=float, default=5e-5, help="Peak learning rate for the AdamW optimizer.")
     parser.add_argument("--batch_size", type=int, default=8, help="Training batch size per device.")
     parser.add_argument("--num_epochs", type=int, default=5, help="Total number of training epochs.")
     parser.add_argument("--max_seq_length", type=int, default=128, help="Maximum sequence length for tokenization.")
