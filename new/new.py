@@ -113,6 +113,21 @@ class ClientHead(nn.Module):
                 presents.append(outputs[1])
 
         return hidden_states, tuple(presents) if use_cache else None
+        
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
+        """
+        A required method for PEFT compatibility with CausalLM tasks.
+        This formats inputs for the `generate` method.
+        """
+        if past_key_values:
+            input_ids = input_ids[:, -1:]
+
+        return {
+            "input_ids": input_ids,
+            "past_key_values": past_key_values,
+            "attention_mask": kwargs.get("attention_mask"),
+            "use_cache": kwargs.get("use_cache", True),
+        }
 
 class Server(nn.Module):
     """The middle part of the split GPT-2 model, executed on the server."""
@@ -160,6 +175,10 @@ class Server(nn.Module):
                 presents.append(outputs[1])
             
         return hidden_states, tuple(presents) if use_cache else None
+
+    def prepare_inputs_for_generation(self, *args, **kwargs):
+        """A dummy method for PEFT compatibility. It's not called in our custom loop."""
+        return kwargs
 
 class ClientTail(nn.Module):
     """The final part of the split GPT-2 model, executed on the client."""
@@ -212,6 +231,10 @@ class ClientTail(nn.Module):
         logits = self.lm_head(hidden_states)
         
         return logits, tuple(presents) if use_cache else None
+
+    def prepare_inputs_for_generation(self, *args, **kwargs):
+        """A dummy method for PEFT compatibility. It's not called in our custom loop."""
+        return kwargs
 
 # ==============================================================================
 # SECTION 2: DATA PREPARATION FOR E2E REFINED DATASET
