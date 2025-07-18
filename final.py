@@ -102,8 +102,8 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
 
             # FIXED: Pass attention_mask to each block
             all_hidden_states = ()
-            dtype = hidden_states.dtype
-            attn_mask = _expand_mask(attention_mask, dtype)
+            #dtype = hidden_states.dtype
+            #attn_mask = _expand_mask(attention_mask, dtype)
             if attention_mask is None:
                 attention_mask = (input_ids != self.tokenizer.pad_token_id)
             
@@ -153,8 +153,8 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             return {"input_ids": input_ids}
             
         def forward(self, hidden_states=None, attention_mask=None, **kwargs):
-            dtype = hidden_states.dtype
-            attn_mask = _expand_mask(attention_mask, dtype)
+            #dtype = hidden_states.dtype
+            #attn_mask = _expand_mask(attention_mask, dtype)
             
         
             for block in self.transformer.h:
@@ -193,8 +193,8 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             
         def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
             hidden_states = inputs_embeds
-            dtype = hidden_states.dtype
-            attn_mask = _expand_mask(attention_mask, dtype)
+            #dtype = hidden_states.dtype
+            #attn_mask = _expand_mask(attention_mask, dtype)
             for block in self.transformer.h:   
                 hidden_states = block(hidden_states,attention_mask=attention_mask,use_cache=False)[0]
 
