@@ -248,9 +248,9 @@ def prepare_data(data_dir):
     """
     print(f"Loading E2E Refined Dataset from: {data_dir}")
     # Use the filenames you specified: e2e-train.json, etc.
-    train_file = os.path.join(data_dir, "e2e-train.json")
-    valid_file = os.path.join(data_dir, "e2e-valid.json")
-    test_file = os.path.join(data_dir, "e2e-test.json")
+    train_file = os.path.join(data_dir, "e2e_train.json")
+    valid_file = os.path.join(data_dir, "e2e_valid.json")
+    test_file = os.path.join(data_dir, "e2e_test.json")
 
     # Check for dataset files and provide instructions if they are missing
     if not all(os.path.exists(f) for f in [train_file, valid_file, test_file]):
