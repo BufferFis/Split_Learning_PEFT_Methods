@@ -3,9 +3,6 @@
 # Full End-to-End Pipeline for Training and Evaluating a
 # U-Shaped Split-DoRA GPT-2 Model on the E2E Refined NLG Dataset
 #
-# Author: Gemini
-# Date: July 18, 2025
-#
 # Description:
 # This script merges two advanced concepts:
 #   1. A U-shaped split architecture for GPT-2 (ClientHead, Server, ClientTail)
@@ -152,7 +149,8 @@ class Server(nn.Module):
         extended_attention_mask = (1.0 - extended_attention_mask) * torch.finfo(dtype).min
         return extended_attention_mask
 
-    def forward(self, hidden_states, past_key_values=None, attention_mask=None, use_cache=True, **kwargs):
+    def forward(self, inputs_embeds, past_key_values=None, attention_mask=None, use_cache=True, **kwargs):
+        hidden_states = inputs_embeds
         if past_key_values is None:
             past_key_values = tuple([None] * len(self.h))
         
@@ -205,7 +203,8 @@ class ClientTail(nn.Module):
         extended_attention_mask = (1.0 - extended_attention_mask) * torch.finfo(dtype).min
         return extended_attention_mask
 
-    def forward(self, hidden_states, past_key_values=None, attention_mask=None, use_cache=True, **kwargs):
+    def forward(self, inputs_embeds, past_key_values=None, attention_mask=None, use_cache=True, **kwargs):
+        hidden_states = inputs_embeds
         if past_key_values is None:
             past_key_values = tuple([None] * len(self.h))
         
@@ -343,8 +342,8 @@ def beam_search_generate(models, tokenizer, input_ids, max_new_tokens, beam_widt
     with torch.no_grad():
         prompt_attention_mask = torch.ones_like(input_ids)
         head_out, head_past = client_head(input_ids, attention_mask=prompt_attention_mask)
-        server_out, server_past = server(head_out, past_key_values=head_past, attention_mask=prompt_attention_mask)
-        logits, tail_past = client_tail(server_out, past_key_values=server_past, attention_mask=prompt_attention_mask)
+        server_out, server_past = server(inputs_embeds=head_out, past_key_values=head_past, attention_mask=prompt_attention_mask)
+        logits, tail_past = client_tail(inputs_embeds=server_out, past_key_values=server_past, attention_mask=prompt_attention_mask)
 
         next_token_logits = logits[:, -1, :]
         log_probs = torch.nn.functional.log_softmax(next_token_logits, dim=-1)
@@ -374,8 +373,8 @@ def beam_search_generate(models, tokenizer, input_ids, max_new_tokens, beam_widt
                 full_sequence_attention_mask = torch.ones_like(beam["sequence"])
 
                 head_out, new_head_past = client_head(last_token, past_key_values=beam["head_past"], attention_mask=full_sequence_attention_mask)
-                server_out, new_server_past = server(head_out, past_key_values=beam["server_past"], attention_mask=full_sequence_attention_mask)
-                logits, new_tail_past = client_tail(server_out, past_key_values=beam["tail_past"], attention_mask=full_sequence_attention_mask)
+                server_out, new_server_past = server(inputs_embeds=head_out, past_key_values=beam["server_past"], attention_mask=full_sequence_attention_mask)
+                logits, new_tail_past = client_tail(inputs_embeds=server_out, past_key_values=beam["tail_past"], attention_mask=full_sequence_attention_mask)
 
                 next_token_logits = logits[:, -1, :]
                 log_probs = torch.nn.functional.log_softmax(next_token_logits, dim=-1)
@@ -614,8 +613,8 @@ def main(args):
             server_optimizer.zero_grad()
 
             head_output, _ = client_head(input_ids, attention_mask=attention_mask, use_cache=False)
-            server_output, _ = server(head_output, attention_mask=attention_mask, use_cache=False)
-            logits, _ = client_tail(server_output, attention_mask=attention_mask, use_cache=False)
+            server_output, _ = server(inputs_embeds=head_output, attention_mask=attention_mask, use_cache=False)
+            logits, _ = client_tail(inputs_embeds=server_output, attention_mask=attention_mask, use_cache=False)
 
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
