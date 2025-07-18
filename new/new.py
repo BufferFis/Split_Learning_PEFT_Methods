@@ -11,7 +11,7 @@
 #   1. A U-shaped split architecture for GPT-2 (ClientHead, Server, ClientTail)
 #      with a custom training loop, dual optimizers, and weight tying.
 #   2. A robust data pipeline for the high-fidelity E2E Refined Dataset,
-#      which requires generating data from source scripts.
+#      which is loaded from the official release's JSON files.
 #
 # It applies Weight-Decomposed Low-Rank Adaptation (DoRA) to all model parts
 # and includes a bespoke beam search algorithm for generation with the split model,
@@ -40,7 +40,7 @@ warnings.filterwarnings("ignore", message=".*Could not find the quantized model 
 try:
     from transformers import GPT2LMHeadModel, GPT2Tokenizer, GPT2Config
     from peft import LoraConfig, get_peft_model, TaskType, PeftModel
-    from datasets import Dataset, DatasetDict
+    from datasets import Dataset, DatasetDict, load_dataset
 except ImportError as e:
     print(f"Error: A required library is not installed. Please run 'pip install transformers peft datasets pandas torch tqdm'. Details: {e}")
     exit(1)
@@ -48,7 +48,6 @@ except ImportError as e:
 # ==============================================================================
 # SECTION 1: MODEL ARCHITECTURE DEFINITION
 # Defines the ClientHead, Server, and ClientTail modules for the split model.
-# This entire section is preserved from your original script.
 # ==============================================================================
 
 class ClientHead(nn.Module):
@@ -216,8 +215,7 @@ class ClientTail(nn.Module):
 
 # ==============================================================================
 # SECTION 2: DATA PREPARATION FOR E2E REFINED DATASET
-# This section replaces the original data pipeline to use the high-fidelity
-# E2E Refined Dataset loaded from local CSV files.
+# This section is updated to load the official release's JSON files.
 # ==============================================================================
 
 def linearize_mr(mr_string):
@@ -241,35 +239,26 @@ def linearize_mr(mr_string):
 
 def prepare_data(data_dir):
     """
-    Loads, parses, and prepares the E2E Refined Dataset from CSV files.
+    Loads, parses, and prepares the E2E Refined Dataset from JSON files.
     Returns a Hugging Face DatasetDict.
     """
     print(f"Loading E2E Refined Dataset from: {data_dir}")
-    train_file = os.path.join(data_dir, "train.csv")
-    valid_file = os.path.join(data_dir, "valid.csv")
-    test_file = os.path.join(data_dir, "test.csv")
+    # Use the filenames you specified: e2e-train.json, etc.
+    train_file = os.path.join(data_dir, "e2e-train.json")
+    valid_file = os.path.join(data_dir, "e2e-valid.json")
+    test_file = os.path.join(data_dir, "e2e-test.json")
 
     # Check for dataset files and provide instructions if they are missing
     if not all(os.path.exists(f) for f in [train_file, valid_file, test_file]):
         print("="*80)
         print("ERROR: Dataset files not found.")
-        print(f"Please ensure you have cloned the 'KSKTYM/E2E-refined-dataset' repository")
-        print("and run the generation scripts (EXE0 to EXE4) as described in its README.")
-        print(f"The resulting 'train.csv', 'valid.csv', and 'test.csv' files should be in the directory specified by --data_dir ('{data_dir}').")
+        print(f"Please ensure you have downloaded and unzipped the release from the 'KSKTYM/E2E-refined-dataset' repository.")
+        print(f"The resulting 'e2e-train.json', 'e2e-valid.json', and 'e2e-test.json' files should be in the directory specified by --data_dir ('{data_dir}').")
         print("="*80)
         exit(1)
 
-    # Load data from CSV files
-    df_train = pd.read_csv(train_file)
-    df_valid = pd.read_csv(valid_file)
-    df_test = pd.read_csv(test_file)
-
-    # Convert pandas DataFrames to Hugging Face Dataset objects
-    raw_datasets = DatasetDict({
-        'train': Dataset.from_pandas(df_train),
-        'validation': Dataset.from_pandas(df_valid),
-        'test': Dataset.from_pandas(df_test)
-    })
+    # Load data directly from JSON files using the datasets library
+    raw_datasets = load_dataset('json', data_files={'train': train_file, 'validation': valid_file, 'test': test_file})
     
     print("\n--- Raw Datasets Info ---")
     print(raw_datasets)
@@ -639,7 +628,7 @@ if __name__ == "__main__":
     
     # Path and Device Arguments
     parser.add_argument("--model_name", type=str, default="gpt2", help="Base GPT-2 model from Hugging Face.")
-    parser.add_argument("--data_dir", type=str, default="./e2e-refined-dataset/", help="Directory containing train.csv, valid.csv, and test.csv from the E2E Refined Dataset.")
+    parser.add_argument("--data_dir", type=str, default="./e2e-refined-dataset/", help="Directory containing train.json, valid.json, and test.json from the E2E Refined Dataset release.")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save checkpoints and evaluation results.")
     parser.add_argument("--e2e_metrics_path", type=str, required=True, help="Path to the official 'measure_scores.py' script.")
     parser.add_argument("--device", type=str, default="cuda", help="Device to train on ('cuda' or 'cpu').")

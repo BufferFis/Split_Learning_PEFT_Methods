@@ -329,17 +329,29 @@ class HeadClient:
             lr=learning_rate
         )
         
-    def forward(self, input_ids, attention_mask=None):
+    def forward(self, input_ids, attention_mask=None, use_cache=False):
         """Forward pass through head layers"""
         output = self.head_model(
-            input_ids=input_ids, 
-            attention_mask=attention_mask, 
+            input_ids=input_ids,
+            attention_mask=attention_mask,
             output_hidden_states=True
         )
+        
+        # Return proper output object with required attributes
         if hasattr(output, 'hidden_states') and output.hidden_states is not None:
-            return output.hidden_states[-1]
+            last_hidden_state = output.hidden_states[-1]
         else:
-            return output.last_hidden_state
+            last_hidden_state = output.last_hidden_state
+        
+        # Create output object with required attributes for context passing
+        return type('HeadOutput', (), {
+            'last_hidden_state': last_hidden_state,
+            'past_key_values': None,  # Add this for context passing
+            'position_ids': None,     # Add this for context passing
+            'hidden_states': output.hidden_states if hasattr(output, 'hidden_states') else None,
+            'attentions': None
+        })()
+
     
     def backward(self, head_activations, head_grad):
         """ESSENTIAL: Backward pass for split learning"""
