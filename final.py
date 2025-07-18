@@ -267,11 +267,16 @@ class ServerModel:
             lr=learning_rate
         )
         
-    def forward(self, activations, attention_mask=None):
-        """Forward pass through body layers (inference mode)"""
+    def forward(self, activations, attention_mask=None, past_key_values=None, position_ids=None):
+        """Forward pass through body layers (inference mode) with context"""
         self.body_model.eval()
         with torch.no_grad():
-            output = self.body_model(hidden_states=activations)
+            output = self.body_model(
+                hidden_states=activations,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                position_ids=position_ids
+            )
             return output.last_hidden_state
     
     def forward_train(self, activations, attention_mask=None, past_key_values=None, position_ids=None):
@@ -395,10 +400,14 @@ class TailClient:
         self.loss_fn = nn.CrossEntropyLoss(label_smoothing=0.05)
         self.tokenizer = tokenizer
         
-    def forward(self, body_activations, attention_mask=None):
-        """Forward pass through tail layers"""
-        output = self.tail_model(inputs_embeds=body_activations, 
-                                 attention_mask=attention_mask)
+    def forward(self, body_activations, attention_mask=None, past_key_values=None, position_ids=None):
+        """Forward pass through tail layers with context"""
+        output = self.tail_model(
+            inputs_embeds=body_activations,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            position_ids=position_ids
+        )
         return output.logits
     
     def compute_loss_and_backward(self, body_activations, labels, attention_mask=None, mr_texts=None, past_key_values=None, position_ids=None):
