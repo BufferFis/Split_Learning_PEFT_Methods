@@ -247,7 +247,7 @@ def prepare_data(data_dir):
     Returns a Hugging Face DatasetDict.
     """
     print(f"Loading E2E Refined Dataset from: {data_dir}")
-    # Use the filenames you specified: e2e-train.json, etc.
+    # Use the filenames you specified: e2e_train.json, etc.
     train_file = os.path.join(data_dir, "e2e_train.json")
     valid_file = os.path.join(data_dir, "e2e_valid.json")
     test_file = os.path.join(data_dir, "e2e_test.json")
@@ -257,7 +257,7 @@ def prepare_data(data_dir):
         print("="*80)
         print("ERROR: Dataset files not found.")
         print(f"Please ensure you have downloaded and unzipped the release from the 'KSKTYM/E2E-refined-dataset' repository.")
-        print(f"The resulting 'e2e-train.json', 'e2e-valid.json', and 'e2e-test.json' files should be in the directory specified by --data_dir ('{data_dir}').")
+        print(f"The resulting 'e2e_train.json', 'e2e_valid.json', and 'e2e_test.json' files should be in the directory specified by --data_dir ('{data_dir}').")
         print("="*80)
         exit(1)
 
@@ -270,8 +270,9 @@ def prepare_data(data_dir):
 
 def preprocess_function(examples, tokenizer, max_length):
     """Tokenizes and formats the E2E dataset for training the causal LM."""
+    # The reference text is in the 'txt' column, not 'ref'
     inputs = [linearize_mr(mr) for mr in examples['mr']]
-    targets = [str(ref) for ref in examples['ref']]
+    targets = [str(txt) for txt in examples['txt']]
     
     # Format for causal LM: input_mr <eos> target_ref <eos>
     model_inputs = tokenizer(
@@ -385,7 +386,8 @@ def run_evaluation(models, tokenizer, test_dataset, args):
         if not mr: continue
         if mr not in ref_map:
             ref_map[mr] = []
-        ref_map[mr].append(str(item['ref']))
+        # The reference text is in the 'txt' column
+        ref_map[mr].append(str(item['txt']))
     
     ref_file_path = os.path.join(args.output_dir, "eval_references.txt")
     with open(ref_file_path, "w", encoding="utf-8") as f:
