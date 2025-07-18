@@ -104,11 +104,13 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             all_hidden_states = ()
             dtype = hidden_states.dtype
             attn_mask = _expand_mask(attention_mask, dtype)
+            if attention_mask is None:
+                attention_mask = (input_ids != self.tokenizer.pad_token_id)
             
 
             for block in self.h:
                 # Convert attention_mask to the format GPT-2 blocks expect
-                hidden_states = block(hidden_states , attention_mask=attn_mask, use_cache=False)[0]
+                hidden_states = block(hidden_states , attention_mask=attention_mask, use_cache=False)[0]
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
             if output_hidden_states:
@@ -153,9 +155,10 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
         def forward(self, hidden_states=None, attention_mask=None, **kwargs):
             dtype = hidden_states.dtype
             attn_mask = _expand_mask(attention_mask, dtype)
+            
         
             for block in self.transformer.h:
-                hidden_states = block(hidden_states,attention_mask=attn_mask,use_cache=False)[0]
+                hidden_states = block(hidden_states,attention_mask=attention_mask,use_cache=False)[0]
             return type('BodyOutput', (), {'last_hidden_state': hidden_states})()
 
     # Tail Model (last few layers + LM head)
@@ -193,7 +196,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             dtype = hidden_states.dtype
             attn_mask = _expand_mask(attention_mask, dtype)
             for block in self.transformer.h:   
-                hidden_states = block(hidden_states,attention_mask=attn_mask,use_cache=False)[0]
+                hidden_states = block(hidden_states,attention_mask=attention_mask,use_cache=False)[0]
 
             hidden_states = self.transformer.ln_f(hidden_states)
             logits = self.lm_head(hidden_states)
@@ -532,7 +535,7 @@ class SplitLoRATrainer:
             r=4,
             lora_alpha=32,
             lora_dropout=0.5,
-            bias="lora_only",
+            bias="none",
             use_dora=True,
             task_type="CAUSAL_LM",
             target_modules=["c_attn", "c_proj", "c_fc"]
@@ -920,6 +923,68 @@ class SplitLoRATrainer:
             avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
             self.metrics["loss"].append(avg_loss)
             print(f"Epoch {epoch+1} average loss: {avg_loss:.4f}")
+
+    def train_with_wrapper(self, train_dataloader, epochs=1):
+        """Train using the wrapper to maintain consistency"""
+        from split_beam_wrapper import SplitGPT2ForGeneration
+        
+        wrapper = SplitGPT2ForGeneration(
+            tokenizer=self.tokenizer,
+            head_client=self.head_client,
+            server=self.server,
+            tail_client=self.tail_client,
+            base_config=self.head_client.head_model.config
+        ).to(device)
+        
+        # Set all components to training mode
+        wrapper.train()
+        
+        for epoch in range(epochs):
+            total_loss = 0.0
+            num_batches = 0
+            
+            for batch_idx, batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{epochs}")):
+                # Zero gradients for all components
+                self.head_client.optimizer.zero_grad()
+                self.server.optimizer.zero_grad()
+                self.tail_client.optimizer.zero_grad()
+                
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                labels = batch["labels"].to(device)
+                
+                # Forward pass through wrapper (no caching during training)
+                outputs = wrapper(input_ids=input_ids, attention_mask=attention_mask)
+                logits = outputs.logits
+                
+                # Compute loss
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                
+                loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+                loss = loss_fn(shift_logits.view(-1, shift_logits.size(-1)), 
+                            shift_labels.view(-1))
+                
+                # Backward pass
+                loss.backward()
+                
+                # Clip gradients
+                torch.nn.utils.clip_grad_norm_(wrapper.parameters(), max_norm=1.0)
+                
+                # Update all optimizers
+                self.head_client.optimizer.step()
+                self.server.optimizer.step()
+                self.tail_client.optimizer.step()
+                
+                # Update schedulers
+                for sched in self.schedulers:
+                    sched.step()
+                
+                total_loss += loss.item()
+                num_batches += 1
+                
+                if batch_idx % 50 == 0:
+                    print(f"Batch {batch_idx}, Loss: {loss.item():.4f}")
 
 
     def evaluate_with_coverage(self, wrapper, dataset, n_samples=100):
@@ -1584,6 +1649,29 @@ def _expand_mask(mask, dtype):
 
 # ─── Beam-search helpers ──────────────────────────────────────────────
 from evaluate import load as load_metric
+def generate_fixed(trainer, wrapper, mr_text, max_new_tokens=32):
+    """Fixed generation with proper parameters"""
+    prompt = mr_text + " " + trainer.DELIM + " "
+    enc = trainer.tokenizer(prompt, return_tensors="pt")
+    ids = enc["input_ids"].to(device)
+    
+    # Ensure weight tying before generation
+    trainer.ensure_weight_tying()
+    
+    with torch.no_grad():
+        output = wrapper.generate(
+            ids,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
+            repetition_penalty=1.2,
+            eos_token_id=trainer.tokenizer.eos_token_id,
+            pad_token_id=trainer.tokenizer.pad_token_id,
+            # NO caching parameters - let it handle internally
+        )
+    
+    return trainer.tokenizer.decode(output[0, ids.size(1):], skip_special_tokens=True).strip()
 
 def generate_with_beam(trainer, wrapper, mr_text, max_new_tokens=64):
     """Return one realisation for a single MR using SplitFM-style beam search."""
@@ -1999,7 +2087,7 @@ def main():
                            head_layers=2,
                            tail_layers=2,
                            learning_rate=args.learning_rate,
-                           warmup_steps=args.warmup_steps,
+                           warmup_steps=100,
                            max_epochs=args.max_epochs)
     
     print("Analyzing sequence lengths to optimize training...")
