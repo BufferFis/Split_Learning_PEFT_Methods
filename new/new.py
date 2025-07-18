@@ -79,7 +79,7 @@ class ClientHead(nn.Module):
         extended_attention_mask = (1.0 - extended_attention_mask) * torch.finfo(dtype).min
         return extended_attention_mask
 
-    def forward(self, input_ids, past_key_values=None, attention_mask=None, use_cache=True):
+    def forward(self, input_ids, past_key_values=None, attention_mask=None, use_cache=True, **kwargs):
         if past_key_values is None:
             past_length = 0
             past_key_values = tuple([None] * len(self.transformer.h))
@@ -152,7 +152,7 @@ class Server(nn.Module):
         extended_attention_mask = (1.0 - extended_attention_mask) * torch.finfo(dtype).min
         return extended_attention_mask
 
-    def forward(self, hidden_states, past_key_values=None, attention_mask=None, use_cache=True):
+    def forward(self, hidden_states, past_key_values=None, attention_mask=None, use_cache=True, **kwargs):
         if past_key_values is None:
             past_key_values = tuple([None] * len(self.h))
         
@@ -205,7 +205,7 @@ class ClientTail(nn.Module):
         extended_attention_mask = (1.0 - extended_attention_mask) * torch.finfo(dtype).min
         return extended_attention_mask
 
-    def forward(self, hidden_states, past_key_values=None, attention_mask=None, use_cache=True):
+    def forward(self, hidden_states, past_key_values=None, attention_mask=None, use_cache=True, **kwargs):
         if past_key_values is None:
             past_key_values = tuple([None] * len(self.h))
         
