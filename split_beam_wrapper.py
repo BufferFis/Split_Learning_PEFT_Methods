@@ -12,11 +12,10 @@ from typing import Optional, Tuple
 
 from transformers import (
     PreTrainedModel,
-    GenerationMixin,
-    CausalLMOutput,
+    GenerationMixin
 )
 
-
+from transformers.modeling_outputs import CausalLMOutput 
 class SplitGPT2ForGeneration(PreTrainedModel, GenerationMixin):
     """
     Bridges three separately-instantiated sub-models
