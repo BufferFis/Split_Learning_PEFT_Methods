@@ -95,35 +95,33 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
         def forward(self, input_ids=None, attention_mask=None, output_hidden_states=False, **kwargs):
             inputs_embeds = self.wte(input_ids)
             seq_length = input_ids.size(-1)
+            
+            # FIXED: Store position_ids to pass to next split
             position_ids = torch.arange(0, seq_length, dtype=torch.long, device=input_ids.device)
             position_embeds = self.wpe(position_ids)
             hidden_states = inputs_embeds + position_embeds
             hidden_states = self.drop(hidden_states)
             
             all_hidden_states = ()
+            past_key_values = () if kwargs.get('use_cache', False) else None
             
-            dtype = hidden_states.dtype
-            attn_mask = _expand_mask(attention_mask, dtype)
-            if attention_mask is None:
-                attention_mask = (input_ids != self.tokenizer.pad_token_id)
-            
-            for block in self.h:
-                hidden_states = block(hidden_states, attention_mask=attn_mask, use_cache=False)[0]
+            for i, block in enumerate(self.h):
+                if past_key_values is not None:
+                    outputs = block(hidden_states, attention_mask=attention_mask, use_cache=True)
+                    hidden_states = outputs[0]
+                    past_key_values = past_key_values + (outputs[1],)
+                else:
+                    hidden_states = block(hidden_states, attention_mask=attention_mask, use_cache=False)[0]
                 all_hidden_states = all_hidden_states + (hidden_states,)
             
-            if output_hidden_states:
-                return type('HeadOutput', (), {
-                    'last_hidden_state': hidden_states,
-                    'hidden_states': all_hidden_states,
-                    'past_key_values': None,  # ADD THIS
-                    'attentions': None        # ADD THIS
-                })()
-            else:
-                return type('HeadOutput', (), {
-                    'last_hidden_state': hidden_states,
-                    'past_key_values': None,  # ADD THIS
-                    'attentions': None        # ADD THIS
-                })()
+            return type('HeadOutput', (), {
+                'last_hidden_state': hidden_states,
+                'hidden_states': all_hidden_states if output_hidden_states else None,
+                'past_key_values': past_key_values,  # FIXED: Actually store KV cache
+                'position_ids': position_ids,        # FIXED: Pass position context
+                'attentions': None
+            })()
+
 
             
     
@@ -157,18 +155,31 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             """Default implementation for prepare_inputs_for_generation"""
             return {"input_ids": input_ids}
             
-        def forward(self, hidden_states=None, attention_mask=None, **kwargs):
-            dtype = hidden_states.dtype
-            attn_mask = _expand_mask(attention_mask, dtype)
+        def forward(self, hidden_states=None, attention_mask=None, past_key_values=None, position_ids=None, **kwargs):
+            # FIXED: Use past_key_values from head if available
+            if past_key_values is None:
+                past_key_values = tuple([None] * len(self.transformer.h))
             
-            for block in self.transformer.h:
-                hidden_states = block(hidden_states, attention_mask=attn_mask, use_cache=False)[0]
+            all_past_key_values = ()
+            
+            for i, (block, past_key_value) in enumerate(zip(self.transformer.h, past_key_values)):
+                if past_key_value is not None:
+                    # Continue from head's KV cache
+                    outputs = block(hidden_states, attention_mask=attention_mask, 
+                                past_key_value=past_key_value, use_cache=True)
+                    hidden_states = outputs[0]
+                    all_past_key_values = all_past_key_values + (outputs[1],)
+                else:
+                    hidden_states = block(hidden_states, attention_mask=attention_mask, use_cache=False)[0]
+                    all_past_key_values = all_past_key_values + (None,)
             
             return type('BodyOutput', (), {
                 'last_hidden_state': hidden_states,
-                'past_key_values': None,  # ADD THIS
-                'attentions': None        # ADD THIS
+                'past_key_values': all_past_key_values,  # FIXED: Pass KV cache to tail
+                'position_ids': position_ids,            # FIXED: Pass position context
+                'attentions': None
             })()
+
 
 
     # Tail Model (last few layers + LM head)
@@ -201,24 +212,31 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             """Default implementation for prepare_inputs_for_generation"""
             return {"input_ids": input_ids}
             
-        def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
+        def forward(self, inputs_embeds=None, attention_mask=None, past_key_values=None, position_ids=None, **kwargs):
             hidden_states = inputs_embeds
             
-            dtype = hidden_states.dtype
-            attn_mask = _expand_mask(attention_mask, dtype)
+            # FIXED: Use context from previous splits
+            if past_key_values is None:
+                past_key_values = tuple([None] * len(self.transformer.h))
             
-            for block in self.transformer.h:
-                hidden_states = block(hidden_states, attention_mask=attn_mask, use_cache=False)[0]
+            for i, (block, past_key_value) in enumerate(zip(self.transformer.h, past_key_values)):
+                if past_key_value is not None:
+                    outputs = block(hidden_states, attention_mask=attention_mask, 
+                                past_key_value=past_key_value, use_cache=True)
+                    hidden_states = outputs[0]
+                else:
+                    hidden_states = block(hidden_states, attention_mask=attention_mask, use_cache=False)[0]
             
             hidden_states = self.transformer.ln_f(hidden_states)
             logits = self.lm_head(hidden_states)
             
             return type('TailOutput', (), {
                 'logits': logits,
-                'past_key_values': None,  # ADD THIS
-                'hidden_states': None,    # ADD THIS
-                'attentions': None        # ADD THIS
+                'past_key_values': None,  # End of chain
+                'hidden_states': None,
+                'attentions': None
             })()
+
 
     
     head_model = HeadModel(model, head_layers)
@@ -907,10 +925,23 @@ class SplitLoRATrainer:
                             mr_texts.append("")
                     
                     # Forward pass with coverage
-                    head_activations = self.head_client.forward(input_ids, attention_mask=attention_mask)
-                    body_activations, head_activations_stored = self.server.forward_train(head_activations, attention_mask)
+                    head_output = self.head_client.forward(input_ids, attention_mask=attention_mask, use_cache=True)
+                    head_activations = head_output.last_hidden_state
+                    body_output = self.server.forward_train(
+                        head_activations, 
+                        attention_mask=attention_mask,
+                        past_key_values=head_output.past_key_values,  # FIXED: Pass KV cache
+                        position_ids=head_output.position_ids         # FIXED: Pass position context
+                    )
+                    body_activations = body_output.last_hidden_state
+                    
                     loss, body_grad = self.tail_client.compute_loss_and_backward(
-                        body_activations, labels, attention_mask, mr_texts
+                        body_activations, 
+                        labels, 
+                        attention_mask, 
+                        mr_texts,
+                        past_key_values=body_output.past_key_values,  # FIXED: Pass KV cache
+                        position_ids=body_output.position_ids         # FIXED: Pass position context
                     )
                     
                     # Backward pass
