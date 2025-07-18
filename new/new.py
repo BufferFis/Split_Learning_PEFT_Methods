@@ -218,24 +218,28 @@ class ClientTail(nn.Module):
 # This section is updated to load the official release's JSON files.
 # ==============================================================================
 
-def linearize_mr(mr_string):
-    """Converts the raw MR string to a linearized format."""
-    mr_string = str(mr_string)
-    pairs = mr_string.split(', ')
+def linearize_mr(mr_object):
+    """
+    Converts an MR object (dictionary) into a linearized string.
+    This is robust to the JSON format of the E2E Refined Dataset release.
+    Example: {'name': 'The Vaults', 'eatType': 'pub'} -> 'name: The Vaults | eatType: pub'
+    """
+    # The MR from the JSON files is already a dictionary.
+    if not isinstance(mr_object, dict):
+        # Fallback for safety, in case the input is not a dictionary.
+        print(f"Warning: linearize_mr expected a dictionary, but got {type(mr_object)}. Returning empty string.")
+        return ""
+        
     linearized = []
-    for pair in pairs:
-        try:
-            # Find the first occurrence of '[' to correctly split key and value
-            split_index = pair.index('[')
-            key = pair[:split_index].strip()
-            value = pair[split_index+1:-1].strip()
-            if value: # Only add if the value is not empty
-                linearized.append(f"{key}: {value}")
-        except ValueError:
-            # Skip malformed pairs
-            print(f"Warning: Could not parse MR pair '{pair}'. Skipping.")
-            continue
-    return " | ".join(linearized)
+    for key, value in mr_object.items():
+        # Ensure key and value are strings and stripped of whitespace
+        key_str = str(key).strip()
+        value_str = str(value).strip()
+        if value_str: # Only add if the value is not empty
+            linearized.append(f"{key_str}: {value_str}")
+            
+    # Sorting provides a canonical representation of the MR, which is good practice
+    return " | ".join(sorted(linearized))
 
 def prepare_data(data_dir):
     """
@@ -244,9 +248,9 @@ def prepare_data(data_dir):
     """
     print(f"Loading E2E Refined Dataset from: {data_dir}")
     # Use the filenames you specified: e2e-train.json, etc.
-    train_file = os.path.join(data_dir, "e2e_train.json")
-    valid_file = os.path.join(data_dir, "e2e_valid.json")
-    test_file = os.path.join(data_dir, "e2e_test.json")
+    train_file = os.path.join(data_dir, "e2e-train.json")
+    valid_file = os.path.join(data_dir, "e2e-valid.json")
+    test_file = os.path.join(data_dir, "e2e-test.json")
 
     # Check for dataset files and provide instructions if they are missing
     if not all(os.path.exists(f) for f in [train_file, valid_file, test_file]):
