@@ -1,16 +1,3 @@
-# Description:
-# This script merges two advanced concepts:
-#   1. A U-shaped split architecture for GPT-2 (ClientHead, Server, ClientTail)
-#      with a custom training loop, dual optimizers, and weight tying.
-#   2. A robust data pipeline for the high-fidelity E2E Refined Dataset,
-#      which is loaded from the official release's JSON files.
-#
-# It applies Weight-Decomposed Low-Rank Adaptation (DoRA) to all model parts
-# and includes a bespoke beam search algorithm for generation with the split model,
-# along with full checkpointing and evaluation capabilities.
-#
-# ==============================================================================
-
 import os
 import torch
 import torch.nn as nn
@@ -611,7 +598,7 @@ def main(args):
             server_optimizer.zero_grad()
 
             # Use autocast for mixed precision
-            with torch.cuda.amp.autocast(enabled=(args.device == "cuda")):
+            with torch.amp.autocast(device_type=args.device, enabled=(args.device == "cuda")):
                 head_output, _ = client_head(input_ids, attention_mask=attention_mask, use_cache=False)
                 server_output, _ = server(inputs_embeds=head_output, attention_mask=attention_mask, use_cache=False)
                 logits, _ = client_tail(inputs_embeds=server_output, attention_mask=attention_mask, use_cache=False)
@@ -679,7 +666,7 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=5e-5, help="Peak learning rate for the AdamW optimizer.")
     parser.add_argument("--batch_size", type=int, default=8, help="Training batch size per device.")
     parser.add_argument("--num_epochs", type=int, default=5, help="Total number of training epochs.")
-    parser.add_argument("--max_seq_length", type=int, default=128, help="Maximum sequence length for tokenization.")
+    parser.add_argument("--max_seq_length", type=int, default=256, help="Maximum sequence length for tokenization.")
     
     # Model & DoRA Hyperparameters
     parser.add_argument("--split_points", type=str, default="3,9", help="Comma-separated layer indices to split the model at (e.g., '3,9' for gpt2-small).")
