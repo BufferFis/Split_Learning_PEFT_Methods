@@ -1,3 +1,24 @@
+# ==============================================================================
+#
+# Full End-to-End Pipeline for Training and Evaluating a
+# U-Shaped Split-DoRA GPT-2 Model on the E2E Refined NLG Dataset
+#
+# Author: Gemini
+# Date: July 18, 2025
+#
+# Description:
+# This script merges two advanced concepts:
+#   1. A U-shaped split architecture for GPT-2 (ClientHead, Server, ClientTail)
+#      with a custom training loop, dual optimizers, and weight tying.
+#   2. A robust data pipeline for the high-fidelity E2E Refined Dataset,
+#      which is loaded from the official release's JSON files.
+#
+# It applies Weight-Decomposed Low-Rank Adaptation (DoRA) to all model parts
+# and includes a bespoke beam search algorithm for generation with the split model,
+# along with full checkpointing and evaluation capabilities.
+#
+# ==============================================================================
+
 import os
 import torch
 import torch.nn as nn
@@ -323,9 +344,9 @@ def beam_search_generate(models, tokenizer, input_ids, max_new_tokens, beam_widt
 
     with torch.no_grad():
         prompt_attention_mask = torch.ones_like(input_ids)
-        head_out, head_past = client_head(input_ids, attention_mask=prompt_attention_mask)
-        server_out, server_past = server(inputs_embeds=head_out, past_key_values=head_past, attention_mask=prompt_attention_mask)
-        logits, tail_past = client_tail(inputs_embeds=server_out, past_key_values=server_past, attention_mask=prompt_attention_mask)
+        head_out, head_past = client_head(input_ids, attention_mask=prompt_attention_mask, use_cache=True)
+        server_out, server_past = server(inputs_embeds=head_out, past_key_values=head_past, attention_mask=prompt_attention_mask, use_cache=True)
+        logits, tail_past = client_tail(inputs_embeds=server_out, past_key_values=server_past, attention_mask=prompt_attention_mask, use_cache=True)
 
         next_token_logits = logits[:, -1, :]
         log_probs = torch.nn.functional.log_softmax(next_token_logits, dim=-1)
@@ -354,9 +375,9 @@ def beam_search_generate(models, tokenizer, input_ids, max_new_tokens, beam_widt
                 last_token = beam["sequence"][:, -1].unsqueeze(-1)
                 full_sequence_attention_mask = torch.ones_like(beam["sequence"])
 
-                head_out, new_head_past = client_head(last_token, past_key_values=beam["head_past"], attention_mask=full_sequence_attention_mask)
-                server_out, new_server_past = server(inputs_embeds=head_out, past_key_values=beam["server_past"], attention_mask=full_sequence_attention_mask)
-                logits, new_tail_past = client_tail(inputs_embeds=server_out, past_key_values=beam["tail_past"], attention_mask=full_sequence_attention_mask)
+                head_out, new_head_past = client_head(last_token, past_key_values=beam["head_past"], attention_mask=full_sequence_attention_mask, use_cache=True)
+                server_out, new_server_past = server(inputs_embeds=head_out, past_key_values=beam["server_past"], attention_mask=full_sequence_attention_mask, use_cache=True)
+                logits, new_tail_past = client_tail(inputs_embeds=server_out, past_key_values=beam["tail_past"], attention_mask=full_sequence_attention_mask, use_cache=True)
 
                 next_token_logits = logits[:, -1, :]
                 log_probs = torch.nn.functional.log_softmax(next_token_logits, dim=-1)
@@ -506,6 +527,45 @@ def main(args):
 
     # Load and Prepare E2E Refined Dataset
     raw_datasets = prepare_data(args.data_dir)
+    
+    # --- EVALUATION-ONLY MODE ---
+    if args.eval_only:
+        if not args.checkpoint_path:
+            raise ValueError("--checkpoint_path must be provided when using --eval_only")
+
+        print(f"--- Running in Evaluation-Only Mode ---")
+        print(f"Loading model from: {args.checkpoint_path}")
+
+        # Initialize base models
+        base_model = GPT2LMHeadModel.from_pretrained(args.model_name)
+        split_points = [int(p.strip()) for p in args.split_points.split(',')]
+        client_head_base = ClientHead(base_model, split_points[0])
+        server_base = Server(base_model, split_points[0], split_points[1])
+        client_tail_base = ClientTail(base_model, split_points[1])
+        
+        # Load the trained adapters
+        client_head = PeftModel.from_pretrained(client_head_base, os.path.join(args.checkpoint_path, "client_head_dora"))
+        server = PeftModel.from_pretrained(server_base, os.path.join(args.checkpoint_path, "server_dora"))
+        client_tail = PeftModel.from_pretrained(client_tail_base, os.path.join(args.checkpoint_path, "client_tail_dora"))
+        
+        # Move to device
+        client_head.to(device)
+        server.to(device)
+        client_tail.to(device)
+        
+        final_models = [client_head, server, client_tail]
+        scores = run_evaluation(final_models, tokenizer, raw_datasets["test"], args)
+        if scores:
+            print("\n--- Final Evaluation Scores ---")
+            print(json.dumps(scores, indent=2))
+            with open(os.path.join(args.output_dir, "final_scores.json"), "w") as f:
+                json.dump(scores, f, indent=2)
+            print(f"Final scores saved to {os.path.join(args.output_dir, 'final_scores.json')}")
+        else:
+            print("Evaluation failed. Please check logs for errors.")
+        return # Exit after evaluation
+
+    # --- TRAINING MODE ---
     tokenized_datasets = raw_datasets.map(
         lambda x: preprocess_function(x, tokenizer, args.max_seq_length),
         batched=True,
@@ -676,9 +736,11 @@ if __name__ == "__main__":
     # Generation Hyperparameters
     parser.add_argument("--beam_width", type=int, default=5, help="Beam width for beam search generation during evaluation.")
     
-    # Checkpointing Arguments
+    # Checkpointing & Evaluation Arguments
     parser.add_argument("--save_interval", type=int, default=1, help="Save a checkpoint every N epochs.")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to a checkpoint directory to resume training from.")
+    parser.add_argument("--eval_only", action="store_true", help="If set, skip training and only run evaluation on a trained model.")
+    parser.add_argument("--checkpoint_path", type=str, default=None, help="Path to the trained model checkpoint to use for evaluation-only mode.")
 
     args = parser.parse_args()
     main(args)
