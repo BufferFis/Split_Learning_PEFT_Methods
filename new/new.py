@@ -573,6 +573,9 @@ def main(args):
     
     loss_fn = nn.CrossEntropyLoss()
 
+    # Initialize Gradient Scaler for stable mixed-precision training
+    scaler = torch.cuda.amp.GradScaler(enabled=(args.device == "cuda"))
+
     # Load from checkpoint if specified
     start_epoch = 0
     if args.resume_from_checkpoint:
@@ -607,29 +610,36 @@ def main(args):
             client_optimizer.zero_grad()
             server_optimizer.zero_grad()
 
-            head_output, _ = client_head(input_ids, attention_mask=attention_mask, use_cache=False)
-            server_output, _ = server(inputs_embeds=head_output, attention_mask=attention_mask, use_cache=False)
-            logits, _ = client_tail(inputs_embeds=server_output, attention_mask=attention_mask, use_cache=False)
+            # Use autocast for mixed precision
+            with torch.cuda.amp.autocast(enabled=(args.device == "cuda")):
+                head_output, _ = client_head(input_ids, attention_mask=attention_mask, use_cache=False)
+                server_output, _ = server(inputs_embeds=head_output, attention_mask=attention_mask, use_cache=False)
+                logits, _ = client_tail(inputs_embeds=server_output, attention_mask=attention_mask, use_cache=False)
 
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                loss = loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+            # Scale the loss and perform backward pass
+            scaler.scale(loss).backward()
+
+            # Unscale gradients before clipping
+            scaler.unscale_(client_optimizer)
+            scaler.unscale_(server_optimizer)
             
-            # Check for NaN loss before backward pass
-            if torch.isnan(loss):
-                print("Warning: NaN loss detected. Skipping batch.")
-                continue
-
-            loss.backward()
-
-            # Gradient Clipping to prevent exploding gradients
+            # Gradient Clipping
             torch.nn.utils.clip_grad_norm_(client_params, 1.0)
             torch.nn.utils.clip_grad_norm_(server.parameters(), 1.0)
 
-            client_optimizer.step()
-            server_optimizer.step()
+            # Optimizer step
+            scaler.step(client_optimizer)
+            scaler.step(server_optimizer)
 
-            total_loss += loss.item()
+            # Update the scale for next iteration
+            scaler.update()
+
+            if not torch.isnan(loss):
+                total_loss += loss.item()
             progress_bar.set_postfix({"loss": total_loss / (progress_bar.n + 1)})
             
         avg_loss = total_loss / len(train_dataloader)
