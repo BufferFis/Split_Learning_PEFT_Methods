@@ -82,7 +82,7 @@ class ClientHead(nn.Module):
     def forward(self, input_ids, past_key_values=None, attention_mask=None, use_cache=None, **kwargs):
         final_use_cache = use_cache if use_cache is not None else self.config.use_cache
         
-        if past_key_values is None:
+        if past_key_values is None or past_key_values[0] is None:
             past_length = 0
             past_key_values = tuple([None] * len(self.transformer.h))
         else:
@@ -160,10 +160,12 @@ class Server(nn.Module):
         final_use_cache = use_cache if use_cache is not None else self.config.use_cache
         hidden_states = inputs_embeds
         
-        if past_key_values is None:
+        if past_key_values is None or past_key_values[0] is None:
+            past_length = 0
             past_key_values = tuple([None] * len(self.h))
+        else:
+            past_length = past_key_values[0][0].size(-2)
         
-        past_length = past_key_values[0][0].size(-2) if past_key_values[0] is not None else 0
         device = hidden_states.device
         
         if attention_mask is not None:
@@ -218,10 +220,12 @@ class ClientTail(nn.Module):
         final_use_cache = use_cache if use_cache is not None else self.config.use_cache
         hidden_states = inputs_embeds
         
-        if past_key_values is None:
+        if past_key_values is None or past_key_values[0] is None:
+            past_length = 0
             past_key_values = tuple([None] * len(self.h))
+        else:
+            past_length = past_key_values[0][0].size(-2)
         
-        past_length = past_key_values[0][0].size(-2) if past_key_values[0] is not None else 0
         device = hidden_states.device
         
         if attention_mask is not None:
@@ -417,15 +421,6 @@ def run_evaluation(models, tokenizer, test_dataset, args):
     """Generates predictions and runs the official E2E evaluation script."""
     print("\nRunning evaluation on the test set...")
     
-    client_head, server, client_tail = models
-
-    # Merge adapters into the base model for stable, predictable inference
-    print("Merging DoRA adapters into the base model for evaluation...")
-    client_head_merged = client_head.merge_and_unload()
-    server_merged = server.merge_and_unload()
-    client_tail_merged = client_tail.merge_and_unload()
-    merged_models = [client_head_merged, server_merged, client_tail_merged]
-
     ref_map = {}
     for item in test_dataset:
         mr = linearize_mr(item['mr'])
@@ -452,7 +447,7 @@ def run_evaluation(models, tokenizer, test_dataset, args):
                 generated_text = ""
             else:
                 output_ids = beam_search_generate(
-                    merged_models, tokenizer, input_ids, max_new_tokens=max_gen_len, beam_width=args.beam_width
+                    models, tokenizer, input_ids, max_new_tokens=max_gen_len, beam_width=args.beam_width
                 )
                 generated_text = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=True)
             
