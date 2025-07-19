@@ -4,7 +4,7 @@
 # U-Shaped Split-DoRA GPT-2 Model on the E2E Refined NLG Dataset
 #
 # Author: Gemini
-# Date: July 18, 2025
+# Date: July 19, 2025
 #
 # Description:
 # This script merges two advanced concepts:
@@ -79,7 +79,9 @@ class ClientHead(nn.Module):
         extended_attention_mask = (1.0 - extended_attention_mask) * torch.finfo(dtype).min
         return extended_attention_mask
 
-    def forward(self, input_ids, past_key_values=None, attention_mask=None, use_cache=True, **kwargs):
+    def forward(self, input_ids, past_key_values=None, attention_mask=None, use_cache=None, **kwargs):
+        final_use_cache = use_cache if use_cache is not None else self.config.use_cache
+        
         if past_key_values is None:
             past_length = 0
             past_key_values = tuple([None] * len(self.transformer.h))
@@ -100,19 +102,19 @@ class ClientHead(nn.Module):
         hidden_states = inputs_embeds + position_embeds
         hidden_states = self.transformer.drop(hidden_states)
 
-        presents = [] if use_cache else None
+        presents = [] if final_use_cache else None
         for i, (block, layer_past) in enumerate(zip(self.transformer.h, past_key_values)):
             outputs = block(
                 hidden_states,
                 layer_past=layer_past,
                 attention_mask=attention_mask,
-                use_cache=use_cache
+                use_cache=final_use_cache
             )
             hidden_states = outputs[0]
-            if use_cache:
+            if final_use_cache:
                 presents.append(outputs[1])
 
-        return hidden_states, tuple(presents) if use_cache else None
+        return hidden_states, tuple(presents) if final_use_cache else None
         
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
         """
@@ -152,8 +154,10 @@ class Server(nn.Module):
         extended_attention_mask = (1.0 - extended_attention_mask) * torch.finfo(dtype).min
         return extended_attention_mask
 
-    def forward(self, inputs_embeds, past_key_values=None, attention_mask=None, use_cache=True, **kwargs):
+    def forward(self, inputs_embeds, past_key_values=None, attention_mask=None, use_cache=None, **kwargs):
+        final_use_cache = use_cache if use_cache is not None else self.config.use_cache
         hidden_states = inputs_embeds
+        
         if past_key_values is None:
             past_key_values = tuple([None] * len(self.h))
         
@@ -163,19 +167,19 @@ class Server(nn.Module):
         if attention_mask is not None:
             attention_mask = self._prepare_attention_mask(attention_mask, (hidden_states.shape[0], hidden_states.shape[1] + past_length), device, hidden_states.dtype)
             
-        presents = [] if use_cache else None
+        presents = [] if final_use_cache else None
         for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
             outputs = block(
                 hidden_states,
                 layer_past=layer_past,
                 attention_mask=attention_mask,
-                use_cache=use_cache
+                use_cache=final_use_cache
             )
             hidden_states = outputs[0]
-            if use_cache:
+            if final_use_cache:
                 presents.append(outputs[1])
             
-        return hidden_states, tuple(presents) if use_cache else None
+        return hidden_states, tuple(presents) if final_use_cache else None
 
     def prepare_inputs_for_generation(self, *args, **kwargs):
         """A dummy method for PEFT compatibility. It's not called in our custom loop."""
@@ -206,8 +210,10 @@ class ClientTail(nn.Module):
         extended_attention_mask = (1.0 - extended_attention_mask) * torch.finfo(dtype).min
         return extended_attention_mask
 
-    def forward(self, inputs_embeds, past_key_values=None, attention_mask=None, use_cache=True, **kwargs):
+    def forward(self, inputs_embeds, past_key_values=None, attention_mask=None, use_cache=None, **kwargs):
+        final_use_cache = use_cache if use_cache is not None else self.config.use_cache
         hidden_states = inputs_embeds
+        
         if past_key_values is None:
             past_key_values = tuple([None] * len(self.h))
         
@@ -217,22 +223,22 @@ class ClientTail(nn.Module):
         if attention_mask is not None:
             attention_mask = self._prepare_attention_mask(attention_mask, (hidden_states.shape[0], hidden_states.shape[1] + past_length), device, hidden_states.dtype)
 
-        presents = [] if use_cache else None
+        presents = [] if final_use_cache else None
         for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
             outputs = block(
                 hidden_states,
                 layer_past=layer_past,
                 attention_mask=attention_mask,
-                use_cache=use_cache
+                use_cache=final_use_cache
             )
             hidden_states = outputs[0]
-            if use_cache:
+            if final_use_cache:
                 presents.append(outputs[1])
             
         hidden_states = self.ln_f(hidden_states)
         logits = self.lm_head(hidden_states)
         
-        return logits, tuple(presents) if use_cache else None
+        return logits, tuple(presents) if final_use_cache else None
 
     def prepare_inputs_for_generation(self, *args, **kwargs):
         """A dummy method for PEFT compatibility. It's not called in our custom loop."""
@@ -344,9 +350,9 @@ def beam_search_generate(models, tokenizer, input_ids, max_new_tokens, beam_widt
 
     with torch.no_grad():
         prompt_attention_mask = torch.ones_like(input_ids)
-        head_out, head_past = client_head(input_ids, attention_mask=prompt_attention_mask, use_cache=True)
-        server_out, server_past = server(inputs_embeds=head_out, past_key_values=head_past, attention_mask=prompt_attention_mask, use_cache=True)
-        logits, tail_past = client_tail(inputs_embeds=server_out, past_key_values=server_past, attention_mask=prompt_attention_mask, use_cache=True)
+        head_out, head_past = client_head(input_ids, attention_mask=prompt_attention_mask)
+        server_out, server_past = server(inputs_embeds=head_out, past_key_values=head_past, attention_mask=prompt_attention_mask)
+        logits, tail_past = client_tail(inputs_embeds=server_out, past_key_values=server_past, attention_mask=prompt_attention_mask)
 
         next_token_logits = logits[:, -1, :]
         log_probs = torch.nn.functional.log_softmax(next_token_logits, dim=-1)
@@ -375,9 +381,9 @@ def beam_search_generate(models, tokenizer, input_ids, max_new_tokens, beam_widt
                 last_token = beam["sequence"][:, -1].unsqueeze(-1)
                 full_sequence_attention_mask = torch.ones_like(beam["sequence"])
 
-                head_out, new_head_past = client_head(last_token, past_key_values=beam["head_past"], attention_mask=full_sequence_attention_mask, use_cache=True)
-                server_out, new_server_past = server(inputs_embeds=head_out, past_key_values=beam["server_past"], attention_mask=full_sequence_attention_mask, use_cache=True)
-                logits, new_tail_past = client_tail(inputs_embeds=server_out, past_key_values=beam["tail_past"], attention_mask=full_sequence_attention_mask, use_cache=True)
+                head_out, new_head_past = client_head(last_token, past_key_values=beam["head_past"], attention_mask=full_sequence_attention_mask)
+                server_out, new_server_past = server(inputs_embeds=head_out, past_key_values=beam["server_past"], attention_mask=full_sequence_attention_mask)
+                logits, new_tail_past = client_tail(inputs_embeds=server_out, past_key_values=beam["tail_past"], attention_mask=full_sequence_attention_mask)
 
                 next_token_logits = logits[:, -1, :]
                 log_probs = torch.nn.functional.log_softmax(next_token_logits, dim=-1)
@@ -405,6 +411,12 @@ def run_evaluation(models, tokenizer, test_dataset, args):
     """Generates predictions and runs the official E2E evaluation script."""
     print("\nRunning evaluation on the test set...")
     
+    client_head, server, client_tail = models
+    # Explicitly set config to use cache for generation
+    client_head.config.use_cache = True
+    server.config.use_cache = True
+    client_tail.config.use_cache = True
+
     ref_map = {}
     for item in test_dataset:
         mr = linearize_mr(item['mr'])
