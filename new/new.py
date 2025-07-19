@@ -319,38 +319,58 @@ def prepare_data(data_dir):
     return raw_datasets
 
 def preprocess_function(examples, tokenizer, max_length):
-    """Tokenizes and formats the E2E dataset for training the causal LM."""
-    # The reference text is in the 'txt' column, not 'ref'
+    """
+    Tokenizes and formats the E2E dataset for training the causal LM.
+    This version uses a robust method for creating labels to prevent errors.
+    """
+    # The reference text is in the 'txt' column
     inputs = [linearize_mr(mr) for mr in examples['mr']]
     targets = [str(txt) for txt in examples['txt']]
-    
-    # Format for causal LM: input_mr <eos> target_ref <eos>
-    model_inputs = tokenizer(
-        [inp + tokenizer.eos_token + tar + tokenizer.eos_token for inp, tar in zip(inputs, targets)],
-        max_length=max_length,
-        padding="max_length",
-        truncation=True,
-    )
-    
-    # Create labels by cloning input_ids
-    labels = torch.tensor(model_inputs["input_ids"]).clone()
-    
-    # Mask out the input part of the labels so loss is only calculated on the target text.
-    input_only_tokens = tokenizer(
-        [inp + tokenizer.eos_token for inp in inputs],
-        max_length=max_length,
-        padding=False,
-        truncation=True
-    )
-    
-    for i in range(len(labels)):
-        input_len = len(input_only_tokens['input_ids'][i])
-        labels[i, :input_len] = -100
-        
-    # Also mask out padding tokens in the labels
-    labels[labels == tokenizer.pad_token_id] = -100
 
-    model_inputs["labels"] = labels.tolist()
+    # Tokenize inputs and targets separately to ensure correct lengths
+    # Add the eos_token to the input to signal where the generation should start
+    tokenized_inputs = tokenizer(
+        [inp + tokenizer.eos_token for inp in inputs],
+        truncation=True,
+        max_length=max_length // 2
+    )
+    # Add the eos_token to the target to signal the end of the sentence
+    tokenized_targets = tokenizer(
+        [t + tokenizer.eos_token for t in targets],
+        truncation=True,
+        max_length=max_length // 2
+    )
+
+    model_inputs = {"input_ids": [], "attention_mask": [], "labels": []}
+
+    for i in range(len(tokenized_inputs['input_ids'])):
+        input_ids = tokenized_inputs['input_ids'][i]
+        target_ids = tokenized_targets['input_ids'][i]
+
+        # The model's input is the concatenation of the MR and the target
+        combined_input_ids = input_ids + target_ids
+        
+        # The labels are the same, but with the input part masked out
+        labels = ([-100] * len(input_ids)) + target_ids
+
+        # Pad or truncate to max_length
+        padding_length = max_length - len(combined_input_ids)
+        
+        if padding_length >= 0:
+            # Pad sequences
+            final_input_ids = combined_input_ids + [tokenizer.pad_token_id] * padding_length
+            final_attention_mask = [1] * len(combined_input_ids) + [0] * padding_length
+            final_labels = labels + [-100] * padding_length
+        else:
+            # Truncate sequences
+            final_input_ids = combined_input_ids[:max_length]
+            final_attention_mask = [1] * max_length
+            final_labels = labels[:max_length]
+        
+        model_inputs["input_ids"].append(final_input_ids)
+        model_inputs["attention_mask"].append(final_attention_mask)
+        model_inputs["labels"].append(final_labels)
+
     return model_inputs
 
 # ==============================================================================
