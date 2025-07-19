@@ -351,7 +351,7 @@ def preprocess_function(examples, tokenizer, max_length):
         final_labels = labels + [-100] * padding_length
 
         model_inputs["input_ids"].append(final_input_ids)
-        model_inputs["attention_mask"].append(final_attention_mask)
+        model_inputs["attention_mask"].append(attention_mask)
         model_inputs["labels"].append(final_labels)
         
     return model_inputs
