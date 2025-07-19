@@ -350,10 +350,9 @@ def beam_search_generate(models, tokenizer, input_ids, max_new_tokens, beam_widt
 
     with torch.no_grad():
         prompt_attention_mask = torch.ones_like(input_ids)
-        # Directly call the underlying model's forward pass, explicitly enabling the cache
-        head_out, head_past = client_head.base_model.model(input_ids, attention_mask=prompt_attention_mask, use_cache=True)
-        server_out, server_past = server.base_model.model(inputs_embeds=head_out, past_key_values=head_past, attention_mask=prompt_attention_mask, use_cache=True)
-        logits, tail_past = client_tail.base_model.model(inputs_embeds=server_out, past_key_values=server_past, attention_mask=prompt_attention_mask, use_cache=True)
+        head_out, head_past = client_head(input_ids, attention_mask=prompt_attention_mask, use_cache=True)
+        server_out, server_past = server(inputs_embeds=head_out, past_key_values=head_past, attention_mask=prompt_attention_mask, use_cache=True)
+        logits, tail_past = client_tail(inputs_embeds=server_out, past_key_values=server_past, attention_mask=prompt_attention_mask, use_cache=True)
 
         next_token_logits = logits[:, -1, :]
         log_probs = torch.nn.functional.log_softmax(next_token_logits, dim=-1)
@@ -382,9 +381,9 @@ def beam_search_generate(models, tokenizer, input_ids, max_new_tokens, beam_widt
                 last_token = beam["sequence"][:, -1].unsqueeze(-1)
                 full_sequence_attention_mask = torch.ones_like(beam["sequence"])
 
-                head_out, new_head_past = client_head.base_model.model(last_token, past_key_values=beam["head_past"], attention_mask=full_sequence_attention_mask, use_cache=True)
-                server_out, new_server_past = server.base_model.model(inputs_embeds=head_out, past_key_values=beam["server_past"], attention_mask=full_sequence_attention_mask, use_cache=True)
-                logits, new_tail_past = client_tail.base_model.model(inputs_embeds=server_out, past_key_values=beam["tail_past"], attention_mask=full_sequence_attention_mask, use_cache=True)
+                head_out, new_head_past = client_head(last_token, past_key_values=beam["head_past"], attention_mask=full_sequence_attention_mask, use_cache=True)
+                server_out, new_server_past = server(inputs_embeds=head_out, past_key_values=beam["server_past"], attention_mask=full_sequence_attention_mask, use_cache=True)
+                logits, new_tail_past = client_tail(inputs_embeds=server_out, past_key_values=beam["tail_past"], attention_mask=full_sequence_attention_mask, use_cache=True)
 
                 next_token_logits = logits[:, -1, :]
                 log_probs = torch.nn.functional.log_softmax(next_token_logits, dim=-1)
@@ -412,6 +411,15 @@ def run_evaluation(models, tokenizer, test_dataset, args):
     """Generates predictions and runs the official E2E evaluation script."""
     print("\nRunning evaluation on the test set...")
     
+    client_head, server, client_tail = models
+
+    # Merge adapters into the base model for stable, predictable inference
+    print("Merging DoRA adapters into the base model for evaluation...")
+    client_head_merged = client_head.merge_and_unload()
+    server_merged = server.merge_and_unload()
+    client_tail_merged = client_tail.merge_and_unload()
+    merged_models = [client_head_merged, server_merged, client_tail_merged]
+
     ref_map = {}
     for item in test_dataset:
         mr = linearize_mr(item['mr'])
@@ -438,7 +446,7 @@ def run_evaluation(models, tokenizer, test_dataset, args):
                 generated_text = ""
             else:
                 output_ids = beam_search_generate(
-                    models, tokenizer, input_ids, max_new_tokens=max_gen_len, beam_width=args.beam_width
+                    merged_models, tokenizer, input_ids, max_new_tokens=max_gen_len, beam_width=args.beam_width
                 )
                 generated_text = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=True)
             
