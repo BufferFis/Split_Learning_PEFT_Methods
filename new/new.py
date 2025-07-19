@@ -350,9 +350,10 @@ def beam_search_generate(models, tokenizer, input_ids, max_new_tokens, beam_widt
 
     with torch.no_grad():
         prompt_attention_mask = torch.ones_like(input_ids)
-        head_out, head_past = client_head(input_ids, attention_mask=prompt_attention_mask)
-        server_out, server_past = server(inputs_embeds=head_out, past_key_values=head_past, attention_mask=prompt_attention_mask)
-        logits, tail_past = client_tail(inputs_embeds=server_out, past_key_values=server_past, attention_mask=prompt_attention_mask)
+        # Directly call the underlying model's forward pass, explicitly enabling the cache
+        head_out, head_past = client_head.base_model.model(input_ids, attention_mask=prompt_attention_mask, use_cache=True)
+        server_out, server_past = server.base_model.model(inputs_embeds=head_out, past_key_values=head_past, attention_mask=prompt_attention_mask, use_cache=True)
+        logits, tail_past = client_tail.base_model.model(inputs_embeds=server_out, past_key_values=server_past, attention_mask=prompt_attention_mask, use_cache=True)
 
         next_token_logits = logits[:, -1, :]
         log_probs = torch.nn.functional.log_softmax(next_token_logits, dim=-1)
@@ -381,9 +382,9 @@ def beam_search_generate(models, tokenizer, input_ids, max_new_tokens, beam_widt
                 last_token = beam["sequence"][:, -1].unsqueeze(-1)
                 full_sequence_attention_mask = torch.ones_like(beam["sequence"])
 
-                head_out, new_head_past = client_head(last_token, past_key_values=beam["head_past"], attention_mask=full_sequence_attention_mask)
-                server_out, new_server_past = server(inputs_embeds=head_out, past_key_values=beam["server_past"], attention_mask=full_sequence_attention_mask)
-                logits, new_tail_past = client_tail(inputs_embeds=server_out, past_key_values=beam["tail_past"], attention_mask=full_sequence_attention_mask)
+                head_out, new_head_past = client_head.base_model.model(last_token, past_key_values=beam["head_past"], attention_mask=full_sequence_attention_mask, use_cache=True)
+                server_out, new_server_past = server.base_model.model(inputs_embeds=head_out, past_key_values=beam["server_past"], attention_mask=full_sequence_attention_mask, use_cache=True)
+                logits, new_tail_past = client_tail.base_model.model(inputs_embeds=server_out, past_key_values=beam["tail_past"], attention_mask=full_sequence_attention_mask, use_cache=True)
 
                 next_token_logits = logits[:, -1, :]
                 log_probs = torch.nn.functional.log_softmax(next_token_logits, dim=-1)
@@ -411,12 +412,6 @@ def run_evaluation(models, tokenizer, test_dataset, args):
     """Generates predictions and runs the official E2E evaluation script."""
     print("\nRunning evaluation on the test set...")
     
-    client_head, server, client_tail = models
-    # Explicitly set config to use cache for generation
-    client_head.base_model.model.config.use_cache = True
-    server.base_model.model.config.use_cache = True
-    client_tail.base_model.model.config.use_cache = True
-
     ref_map = {}
     for item in test_dataset:
         mr = linearize_mr(item['mr'])
