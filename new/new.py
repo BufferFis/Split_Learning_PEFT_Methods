@@ -417,6 +417,39 @@ def beam_search_generate(models, tokenizer, input_ids, max_new_tokens, beam_widt
         best_beam = sorted(beams, key=lambda x: x["log_prob"].item(), reverse=True)[0]
         return best_beam["sequence"]
 
+def run_sanity_check(models, tokenizer, test_dataset, args):
+    """Generates and prints a few sample predictions for a quick qualitative check."""
+    print("\n--- Running Sanity Check ---")
+    client_head, server, client_tail = models
+    client_head.eval()
+    server.eval()
+    client_tail.eval()
+
+    for i in range(args.sanity_check_samples):
+        item = test_dataset[i]
+        mr = linearize_mr(item['mr'])
+        reference_text = item['txt']
+
+        input_text = mr + tokenizer.eos_token
+        input_ids = tokenizer.encode(input_text, return_tensors="pt").to(args.device)
+
+        max_gen_len = args.max_seq_length - input_ids.shape[1]
+        if max_gen_len <= 0:
+            generated_text = "[SKIPPED: MR too long]"
+        else:
+            output_ids = beam_search_generate(
+                models, tokenizer, input_ids, max_new_tokens=max_gen_len, beam_width=args.beam_width
+            )
+            generated_text = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=True)
+
+        print("-" * 50)
+        print(f"Sample {i+1}")
+        print(f"  MR       : {mr}")
+        print(f"  Reference: {reference_text}")
+        print(f"  Generated: {generated_text}")
+    print("-" * 50)
+    print("--- Sanity Check Complete ---\n")
+
 def run_evaluation(models, tokenizer, test_dataset, args):
     """Generates predictions and runs the official E2E evaluation script."""
     print("\nRunning evaluation on the test set...")
@@ -570,6 +603,11 @@ def main(args):
         client_tail.to(device)
         
         final_models = [client_head, server, client_tail]
+        
+        # Run Sanity Check
+        run_sanity_check(final_models, tokenizer, raw_datasets["test"], args)
+        
+        # Run Full Evaluation
         scores = run_evaluation(final_models, tokenizer, raw_datasets["test"], args)
         if scores:
             print("\n--- Final Evaluation Scores ---")
@@ -716,8 +754,9 @@ def main(args):
                 args
             )
 
-    # Final Evaluation
+    # Final Sanity Check and Evaluation
     final_models = [client_head, server, client_tail]
+    run_sanity_check(final_models, tokenizer, raw_datasets["test"], args)
     scores = run_evaluation(final_models, tokenizer, raw_datasets["test"], args)
     if scores:
         print("\n--- Final Evaluation Scores ---")
@@ -757,6 +796,7 @@ if __name__ == "__main__":
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to a checkpoint directory to resume training from.")
     parser.add_argument("--eval_only", action="store_true", help="If set, skip training and only run evaluation on a trained model.")
     parser.add_argument("--checkpoint_path", type=str, default=None, help="Path to the trained model checkpoint to use for evaluation-only mode.")
+    parser.add_argument("--sanity_check_samples", type=int, default=5, help="Number of samples for the quick sanity check.")
 
     args = parser.parse_args()
     main(args)
