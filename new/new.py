@@ -82,17 +82,17 @@ class ClientHead(nn.Module):
     def forward(self, input_ids, past_key_values=None, attention_mask=None, use_cache=None, **kwargs):
         final_use_cache = use_cache if use_cache is not None else self.config.use_cache
         
-        if past_key_values is None or past_key_values is None:
+        if past_key_values is None or past_key_values[0] is None:
             past_length = 0
             past_key_values = tuple([None] * len(self.transformer.h))
         else:
-            past_length = past_key_values.size(-2)
+            past_length = past_key_values[0][0].size(-2)
 
         device = input_ids.device
         
         # Prepare attention mask
         if attention_mask is not None:
-            attention_mask = self._prepare_attention_mask(attention_mask, (input_ids.shape, input_ids.shape[1] + past_length), device, self.transformer.wte.weight.dtype)
+            attention_mask = self._prepare_attention_mask(attention_mask, (input_ids.shape[0], input_ids.shape[1] + past_length), device, self.transformer.wte.weight.dtype)
 
         inputs_embeds = self.transformer.wte(input_ids)
         position_ids = torch.arange(past_length, input_ids.size(-1) + past_length, dtype=torch.long, device=device)
@@ -102,7 +102,7 @@ class ClientHead(nn.Module):
         hidden_states = inputs_embeds + position_embeds
         hidden_states = self.transformer.drop(hidden_states)
 
-        presents = if final_use_cache else None
+        presents = [] if final_use_cache else None
         for i, (block, layer_past) in enumerate(zip(self.transformer.h, past_key_values)):
             outputs = block(
                 hidden_states,
@@ -110,7 +110,7 @@ class ClientHead(nn.Module):
                 attention_mask=attention_mask,
                 use_cache=final_use_cache
             )
-            hidden_states = outputs
+            hidden_states = outputs[0]
             if final_use_cache:
                 # Safely handle the output tuple which may or may not contain past_key_values
                 present = outputs[1] if len(outputs) > 1 else None
@@ -160,18 +160,18 @@ class Server(nn.Module):
         final_use_cache = use_cache if use_cache is not None else self.config.use_cache
         hidden_states = inputs_embeds
         
-        if past_key_values is None or past_key_values is None:
+        if past_key_values is None or past_key_values[0] is None:
             past_length = 0
             past_key_values = tuple([None] * len(self.h))
         else:
-            past_length = past_key_values.size(-2)
+            past_length = past_key_values[0][0].size(-2)
         
         device = hidden_states.device
         
         if attention_mask is not None:
-            attention_mask = self._prepare_attention_mask(attention_mask, (hidden_states.shape, hidden_states.shape[1] + past_length), device, hidden_states.dtype)
+            attention_mask = self._prepare_attention_mask(attention_mask, (hidden_states.shape[0], hidden_states.shape[1] + past_length), device, hidden_states.dtype)
             
-        presents = if final_use_cache else None
+        presents = [] if final_use_cache else None
         for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
             outputs = block(
                 hidden_states,
@@ -179,7 +179,7 @@ class Server(nn.Module):
                 attention_mask=attention_mask,
                 use_cache=final_use_cache
             )
-            hidden_states = outputs
+            hidden_states = outputs[0]
             if final_use_cache:
                 # Safely handle the output tuple which may or may not contain past_key_values
                 present = outputs[1] if len(outputs) > 1 else None
@@ -220,18 +220,18 @@ class ClientTail(nn.Module):
         final_use_cache = use_cache if use_cache is not None else self.config.use_cache
         hidden_states = inputs_embeds
         
-        if past_key_values is None or past_key_values is None:
+        if past_key_values is None or past_key_values[0] is None:
             past_length = 0
             past_key_values = tuple([None] * len(self.h))
         else:
-            past_length = past_key_values.size(-2)
+            past_length = past_key_values[0][0].size(-2)
         
         device = hidden_states.device
         
         if attention_mask is not None:
-            attention_mask = self._prepare_attention_mask(attention_mask, (hidden_states.shape, hidden_states.shape[1] + past_length), device, hidden_states.dtype)
+            attention_mask = self._prepare_attention_mask(attention_mask, (hidden_states.shape[0], hidden_states.shape[1] + past_length), device, hidden_states.dtype)
 
-        presents = if final_use_cache else None
+        presents = [] if final_use_cache else None
         for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
             outputs = block(
                 hidden_states,
@@ -239,7 +239,7 @@ class ClientTail(nn.Module):
                 attention_mask=attention_mask,
                 use_cache=final_use_cache
             )
-            hidden_states = outputs
+            hidden_states = outputs[0]
             if final_use_cache:
                 # Safely handle the output tuple which may or may not contain past_key_values
                 present = outputs[1] if len(outputs) > 1 else None
@@ -271,14 +271,23 @@ def linearize_mr(mr_object):
         print(f"Warning: linearize_mr expected a dictionary, but got {type(mr_object)}. Returning empty string.")
         return ""
         
-    linearized =
-    for key, value in mr_object.items():
-        # Ensure key and value are strings and stripped of whitespace
-        key_str = str(key).strip()
-        value_str = str(value).strip()
-        if value_str: # Only add if the value is not empty
-            linearized.append(f"{key_str}: {value_str}")
-            
+    linearized = []
+    # Use only the 'value' sub-dictionary for linearization
+    if 'value' in mr_object and isinstance(mr_object['value'], dict):
+        for key, value in mr_object['value'].items():
+            # Ensure key and value are strings and stripped of whitespace
+            key_str = str(key).strip()
+            value_str = str(value).strip()
+            if value_str: # Only add if the value is not empty
+                linearized.append(f"{key_str}: {value_str}")
+    else:
+        # Fallback for older data formats or unexpected structures
+        for key, value in mr_object.items():
+            key_str = str(key).strip()
+            value_str = str(value).strip()
+            if value_str and key not in ['idx_sen', 'num_sen', 'order', 'value_lex']:
+                linearized.append(f"{key_str}: {value_str}")
+
     # Sorting provides a canonical representation of the MR, which is good practice
     return " | ".join(sorted(linearized))
 
@@ -368,7 +377,7 @@ def beam_search_generate(models, tokenizer, input_ids, max_new_tokens, beam_widt
         log_probs = torch.nn.functional.log_softmax(next_token_logits, dim=-1)
         top_log_probs, top_indices = torch.topk(log_probs, beam_width, dim=-1)
 
-        beams =
+        beams = []
         for i in range(beam_width):
             token_id = top_indices[:, i].unsqueeze(-1)
             log_prob = top_log_probs[:, i]
@@ -380,7 +389,7 @@ def beam_search_generate(models, tokenizer, input_ids, max_new_tokens, beam_widt
             })
 
         for _ in range(max_new_tokens - 1):
-            new_beams =
+            new_beams = []
             any_beam_active = False
             for beam in beams:
                 if beam["finished"]:
@@ -414,13 +423,17 @@ def beam_search_generate(models, tokenizer, input_ids, max_new_tokens, beam_widt
             
             beams = sorted(new_beams, key=lambda x: x["log_prob"].item(), reverse=True)[:beam_width]
 
-        best_beam = sorted(beams, key=lambda x: x["log_prob"].item(), reverse=True)
+        best_beam = sorted(beams, key=lambda x: x["log_prob"].item(), reverse=True)[0]
         return best_beam["sequence"]
 
 def run_sanity_check(models, tokenizer, test_dataset, args):
     """Generates and prints a few sample predictions for a quick qualitative check."""
     print("\n--- Running Sanity Check ---")
-    
+    client_head, server, client_tail = models
+    client_head.eval()
+    server.eval()
+    client_tail.eval()
+
     for i in range(args.sanity_check_samples):
         item = test_dataset[i]
         mr = linearize_mr(item['mr'])
@@ -431,7 +444,7 @@ def run_sanity_check(models, tokenizer, test_dataset, args):
 
         max_gen_len = args.max_seq_length - input_ids.shape[1]
         if max_gen_len <= 0:
-            generated_text = ""
+            generated_text = "[SKIPPED: MR too long]"
         else:
             output_ids = beam_search_generate(
                 models, tokenizer, input_ids, max_new_tokens=max_gen_len, beam_width=args.beam_width
@@ -455,7 +468,7 @@ def run_evaluation(models, tokenizer, test_dataset, args):
         mr = linearize_mr(item['mr'])
         if not mr: continue
         if mr not in ref_map:
-            ref_map[mr] =
+            ref_map[mr] = []
         # The reference text is in the 'txt' column
         ref_map[mr].append(str(item['txt']))
     
@@ -506,7 +519,7 @@ def run_evaluation(models, tokenizer, test_dataset, args):
     print("------------------------------")
     
     scores = {}
-    metrics_to_find =
+    metrics_to_find = ["BLEU", "NIST", "METEOR", "ROUGE_L", "CIDEr"]
     for metric in metrics_to_find:
         match = re.search(rf"{metric}:\s*([\d.]+)", output)
         if match:
@@ -584,8 +597,8 @@ def main(args):
         # Initialize base models
         base_model = GPT2LMHeadModel.from_pretrained(args.model_name)
         split_points = [int(p.strip()) for p in args.split_points.split(',')]
-        client_head_base = ClientHead(base_model, split_points)
-        server_base = Server(base_model, split_points, split_points[1])
+        client_head_base = ClientHead(base_model, split_points[0])
+        server_base = Server(base_model, split_points[0], split_points[1])
         client_tail_base = ClientTail(base_model, split_points[1])
         
         # Load the trained adapters
@@ -631,8 +644,8 @@ def main(args):
     base_model = GPT2LMHeadModel.from_pretrained(args.model_name)
     split_points = [int(p.strip()) for p in args.split_points.split(',')]
     
-    client_head_base = ClientHead(base_model, split_points)
-    server_base = Server(base_model, split_points, split_points[1])
+    client_head_base = ClientHead(base_model, split_points[0])
+    server_base = Server(base_model, split_points[0], split_points[1])
     client_tail_base = ClientTail(base_model, split_points[1])
     
     # Apply DoRA Adapters
@@ -691,13 +704,18 @@ def main(args):
 
     # Training Loop
     print("Starting training...")
-    for epoch in range(start_epoch, args.num_epochs):
+    
+    end_epoch = args.num_epochs
+    if args.resume_from_checkpoint and args.add_epochs > 0:
+        end_epoch = start_epoch + args.add_epochs
+
+    for epoch in range(start_epoch, end_epoch):
         client_head.train()
         server.train()
         client_tail.train()
         
         total_loss = 0
-        progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{args.num_epochs}", unit="batch")
+        progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{end_epoch}", unit="batch")
         
         for batch in progress_bar:
             input_ids = batch['input_ids'].to(device)
@@ -790,6 +808,7 @@ if __name__ == "__main__":
     # Checkpointing & Evaluation Arguments
     parser.add_argument("--save_interval", type=int, default=1, help="Save a checkpoint every N epochs.")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to a checkpoint directory to resume training from.")
+    parser.add_argument("--add_epochs", type=int, default=0, help="Number of additional epochs to train for when resuming from a checkpoint.")
     parser.add_argument("--eval_only", action="store_true", help="If set, skip training and only run evaluation on a trained model.")
     parser.add_argument("--checkpoint_path", type=str, default=None, help="Path to the trained model checkpoint to use for evaluation-only mode.")
     parser.add_argument("--sanity_check_samples", type=int, default=5, help="Number of samples for the quick sanity check.")
