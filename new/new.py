@@ -112,7 +112,9 @@ class ClientHead(nn.Module):
             )
             hidden_states = outputs[0]
             if final_use_cache:
-                presents.append(outputs[1])
+                # Safely handle the output tuple which may or may not contain past_key_values
+                present = outputs[1] if len(outputs) > 1 else None
+                presents.append(present)
 
         return hidden_states, tuple(presents) if final_use_cache else None
         
@@ -177,7 +179,9 @@ class Server(nn.Module):
             )
             hidden_states = outputs[0]
             if final_use_cache:
-                presents.append(outputs[1])
+                # Safely handle the output tuple which may or may not contain past_key_values
+                present = outputs[1] if len(outputs) > 1 else None
+                presents.append(present)
             
         return hidden_states, tuple(presents) if final_use_cache else None
 
@@ -233,7 +237,9 @@ class ClientTail(nn.Module):
             )
             hidden_states = outputs[0]
             if final_use_cache:
-                presents.append(outputs[1])
+                # Safely handle the output tuple which may or may not contain past_key_values
+                present = outputs[1] if len(outputs) > 1 else None
+                presents.append(present)
             
         hidden_states = self.ln_f(hidden_states)
         logits = self.lm_head(hidden_states)
