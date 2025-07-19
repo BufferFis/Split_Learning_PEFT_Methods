@@ -323,54 +323,37 @@ def preprocess_function(examples, tokenizer, max_length):
     Tokenizes and formats the E2E dataset for training the causal LM.
     This version uses a robust method for creating labels to prevent errors.
     """
-    # The reference text is in the 'txt' column
+    model_inputs = {"input_ids": [], "attention_mask": [], "labels": []}
+
     inputs = [linearize_mr(mr) for mr in examples['mr']]
     targets = [str(txt) for txt in examples['txt']]
 
-    # Tokenize inputs and targets separately to ensure correct lengths
-    # Add the eos_token to the input to signal where the generation should start
-    tokenized_inputs = tokenizer(
-        [inp + tokenizer.eos_token for inp in inputs],
-        truncation=True,
-        max_length=max_length // 2
-    )
-    # Add the eos_token to the target to signal the end of the sentence
-    tokenized_targets = tokenizer(
-        [t + tokenizer.eos_token for t in targets],
-        truncation=True,
-        max_length=max_length // 2
-    )
+    for i in range(len(inputs)):
+        # Tokenize the input and target separately
+        input_tokens = tokenizer(inputs[i] + tokenizer.eos_token, add_special_tokens=False).input_ids
+        target_tokens = tokenizer(targets[i] + tokenizer.eos_token, add_special_tokens=False).input_ids
 
-    model_inputs = {"input_ids": [], "attention_mask": [], "labels": []}
-
-    for i in range(len(tokenized_inputs['input_ids'])):
-        input_ids = tokenized_inputs['input_ids'][i]
-        target_ids = tokenized_targets['input_ids'][i]
-
-        # The model's input is the concatenation of the MR and the target
-        combined_input_ids = input_ids + target_ids
+        # Concatenate for the model's input
+        combined_tokens = input_tokens + target_tokens
         
-        # The labels are the same, but with the input part masked out
-        labels = ([-100] * len(input_ids)) + target_ids
+        # Create labels: mask the input part, keep the target part
+        labels = ([-100] * len(input_tokens)) + target_tokens
 
-        # Pad or truncate to max_length
-        padding_length = max_length - len(combined_input_ids)
-        
-        if padding_length >= 0:
-            # Pad sequences
-            final_input_ids = combined_input_ids + [tokenizer.pad_token_id] * padding_length
-            final_attention_mask = [1] * len(combined_input_ids) + [0] * padding_length
-            final_labels = labels + [-100] * padding_length
-        else:
-            # Truncate sequences
-            final_input_ids = combined_input_ids[:max_length]
-            final_attention_mask = [1] * max_length
-            final_labels = labels[:max_length]
-        
+        # Truncate if the combined length is too long
+        if len(combined_tokens) > max_length:
+            combined_tokens = combined_tokens[:max_length]
+            labels = labels[:max_length]
+
+        # Pad to max_length
+        padding_length = max_length - len(combined_tokens)
+        attention_mask = [1] * len(combined_tokens) + [0] * padding_length
+        final_input_ids = combined_tokens + [tokenizer.pad_token_id] * padding_length
+        final_labels = labels + [-100] * padding_length
+
         model_inputs["input_ids"].append(final_input_ids)
         model_inputs["attention_mask"].append(final_attention_mask)
         model_inputs["labels"].append(final_labels)
-
+        
     return model_inputs
 
 # ==============================================================================
