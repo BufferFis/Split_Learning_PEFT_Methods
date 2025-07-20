@@ -455,37 +455,56 @@ def beam_search_generate(models, tokenizer, input_ids, max_new_tokens, beam_widt
         return best_beam["sequence"]
 
 def run_sanity_check(models, tokenizer, test_dataset, args):
-    """Generates and prints a few sample predictions for a quick qualitative check."""
+    """FIXED: Better sanity check with proper input formatting"""
     print("\n--- Running Sanity Check ---")
     client_head, server, client_tail = models
     client_head.eval()
     server.eval()
     client_tail.eval()
 
-    for i in range(args.sanity_check_samples):
+    for i in range(min(args.sanity_check_samples, len(test_dataset))):
         item = test_dataset[i]
         mr = linearize_mr(item['mr'])
         reference_text = item['txt']
-
-        input_text = mr + tokenizer.eos_token
-        input_ids = tokenizer.encode(input_text, return_tensors="pt").to(args.device)
-
-        max_gen_len = args.max_seq_length - input_ids.shape[1]
-        if max_gen_len <= 0:
-            generated_text = "[SKIPPED: MR too long]"
-        else:
-            output_ids = beam_search_generate(
-                models, tokenizer, input_ids, max_new_tokens=max_gen_len, beam_width=args.beam_width
-            )
-            generated_text = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=True)
-
+        
+        # FIXED: Use same separator as in training
+        separator = " | "
+        input_text = mr + separator  # NOT mr + tokenizer.eos_token
+        
         print("-" * 50)
         print(f"Sample {i+1}")
-        print(f"  MR       : {mr}")
-        print(f"  Reference: {reference_text}")
-        print(f"  Generated: {generated_text}")
-    print("-" * 50)
+        print(f" MR: {mr}")
+        print(f" Input for generation: '{input_text}'")
+        print(f" Reference: {reference_text}")
+        
+        input_ids = tokenizer.encode(input_text, return_tensors="pt").to(args.device)
+        max_gen_len = min(args.max_seq_length - input_ids.shape[1], 50)  # Limit generation length
+        
+        if max_gen_len <= 0:
+            generated_text = "[SKIPPED: Input too long]"
+        else:
+            try:
+                output_ids = beam_search_generate(
+                    models, tokenizer, input_ids, 
+                    max_new_tokens=max_gen_len, 
+                    beam_width=args.beam_width
+                )
+                generated_text = tokenizer.decode(
+                    output_ids[0, input_ids.shape[1]:], 
+                    skip_special_tokens=True
+                ).strip()
+                
+                if not generated_text:
+                    generated_text = "[EMPTY GENERATION - CHECK MODEL]"
+                    
+            except Exception as e:
+                generated_text = f"[ERROR: {str(e)}]"
+        
+        print(f" Generated: {generated_text}")
+        print("-" * 50)
+    
     print("--- Sanity Check Complete ---\n")
+
 
 def run_evaluation(models, tokenizer, test_dataset, args):
     """Generates predictions and runs the official E2E evaluation script."""
@@ -509,17 +528,26 @@ def run_evaluation(models, tokenizer, test_dataset, args):
     pred_file_path = os.path.join(args.output_dir, "eval_predictions.txt")
     with open(pred_file_path, "w", encoding="utf-8") as f:
         for mr in tqdm(ref_map.keys(), desc="Generating Predictions"):
-            input_text = mr + tokenizer.eos_token
+            seperator = " | "
+            input_text = mr + seperator
             input_ids = tokenizer.encode(input_text, return_tensors="pt").to(args.device)
             
             max_gen_len = args.max_seq_length - input_ids.shape[1]
             if max_gen_len <= 0:
                 generated_text = ""
             else:
-                output_ids = beam_search_generate(
-                    models, tokenizer, input_ids, max_new_tokens=max_gen_len, beam_width=args.beam_width
-                )
-                generated_text = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=True)
+                try:
+                    output_ids = beam_search_generate(
+                        models, tokenizer, input_ids, 
+                        max_new_tokens=max_gen_len, 
+                        beam_width=args.beam_width
+                    )
+                    generated_text = tokenizer.decode(
+                        output_ids[0, input_ids.shape[1]:], 
+                        skip_special_tokens=True
+                    ).strip()
+                except:
+                    generated_text = ""
             
             f.write(generated_text.strip() + "\n")
 
@@ -823,7 +851,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda", help="Device to train on ('cuda' or 'cpu').")
     
     # Training Hyperparameters
-    parser.add_argument("--learning_rate", type=float, default=5e-5, help="Peak learning rate for the AdamW optimizer.")
+    parser.add_argument("--learning_rate", type=float, default=2e-4, help="Peak learning rate for the AdamW optimizer.")
     parser.add_argument("--batch_size", type=int, default=8, help="Training batch size per device.")
     parser.add_argument("--num_epochs", type=int, default=5, help="Total number of training epochs.")
     parser.add_argument("--max_seq_length", type=int, default=256, help="Maximum sequence length for tokenization.")
