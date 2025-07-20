@@ -585,7 +585,6 @@ def main(args):
     # Tokenizer
     tokenizer = GPT2Tokenizer.from_pretrained(args.model_name)
     tokenizer.pad_token = tokenizer.eos_token
-    base_model.resize_token_embeddings(len(tokenizer))
     # Load and Prepare E2E Refined Dataset
     raw_datasets = prepare_data(args.data_dir)
     
@@ -608,7 +607,8 @@ def main(args):
         client_head = PeftModel.from_pretrained(client_head_base, os.path.join(args.checkpoint_path, "client_head_dora"))
         server = PeftModel.from_pretrained(server_base, os.path.join(args.checkpoint_path, "server_dora"))
         client_tail = PeftModel.from_pretrained(client_tail_base, os.path.join(args.checkpoint_path, "client_tail_dora"))
-        
+        base_model.config.pad_token_id = tokenizer.eos_token_id
+        base_model.resize_token_embeddings(len(tokenizer))
         # Move to device
         client_head.to(device)
         server.to(device)
