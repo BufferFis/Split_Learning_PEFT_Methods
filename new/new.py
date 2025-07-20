@@ -453,12 +453,27 @@ def run_sanity_check(models, tokenizer, test_dataset, args):
                 models, tokenizer, input_ids, max_new_tokens=max_gen_len, beam_width=args.beam_width
             )
             generated_text = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=True)
+            print(f"[DEBUG run_sanity_check] raw output_ids shape: {output_ids.shape}")
+            print(f"[DEBUG run_sanity_check] raw output_ids tensor: {output_ids}")
+
+            # Show entire decoded sequence (prompt + gen)
+            raw_full = tokenizer.decode(output_ids.squeeze(0).tolist(), skip_special_tokens=False)
+            print(f"[DEBUG run_sanity_check] full decoded : {raw_full!r}")
+
+            # Now slice off the prompt
+            gen_ids = output_ids[0, input_ids.shape[1]:].tolist()
+            print(f"[DEBUG run_sanity_check] gen token IDs: {gen_ids}")
+            print(f"[DEBUG run_sanity_check] gen tokens   : {tokenizer.convert_ids_to_tokens(gen_ids)}")
+
+            generated_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+            print(f"  Generated: {generated_text}")
 
         print("-" * 50)
         print(f"Sample {i+1}")
         print(f"  MR       : {mr}")
         print(f"  Reference: {reference_text}")
-        print(f"  Generated: {generated_text}")
+        
+
     print("-" * 50)
     print("--- Sanity Check Complete ---\n")
 
@@ -607,6 +622,10 @@ def main(args):
         client_head = PeftModel.from_pretrained(client_head_base, os.path.join(args.checkpoint_path, "client_head_dora"))
         server = PeftModel.from_pretrained(server_base, os.path.join(args.checkpoint_path, "server_dora"))
         client_tail = PeftModel.from_pretrained(client_tail_base, os.path.join(args.checkpoint_path, "client_tail_dora"))
+        
+        client_tail.lm_head.weight = client_head.transformer.wte.weight  # <<-- ADD THIS
+
+
         base_model.config.pad_token_id = tokenizer.eos_token_id
         base_model.resize_token_embeddings(len(tokenizer))
         # Move to device
@@ -646,7 +665,7 @@ def main(args):
     print("Initializing U-shaped split model...")
     base_model = GPT2LMHeadModel.from_pretrained(args.model_name)
     base_model.config.pad_token_id = tokenizer.pad_token_id
-    
+    base_model.resize_token_embeddings(len(tokenizer))
     split_points = [int(p.strip()) for p in args.split_points.split(',')]
     
     client_head_base = ClientHead(base_model, split_points[0])
