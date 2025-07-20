@@ -894,7 +894,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda", help="Device to train on ('cuda' or 'cpu').")
     
     # Training Hyperparameters
-    parser.add_argument("--learning_rate", type=float, default=2e-5, help="Peak learning rate for the AdamW optimizer.")
+    parser.add_argument("--learning_rate", type=float, default=2e-4, help="Peak learning rate for the AdamW optimizer.")
     parser.add_argument("--batch_size", type=int, default=8, help="Training batch size per device.")
     parser.add_argument("--num_epochs", type=int, default=5, help="Total number of training epochs.")
     parser.add_argument("--max_seq_length", type=int, default=256, help="Maximum sequence length for tokenization.")
