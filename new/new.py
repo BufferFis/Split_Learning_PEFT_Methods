@@ -266,7 +266,8 @@ class ClientTail(nn.Module):
 
         hidden_states = self.ln_f(hidden_states)
         logits = self.lm_head(hidden_states)
-        logits = torch.clamp(logits, min=-10.0, max=10.0)
+        logits = logits - logits.mean(dim=-1, keepdim=True)
+        logits = torch.clamp(logits, min=-5.0, max=5.0)
 
         return logits, tuple(presents) if final_use_cache else None
 
@@ -722,32 +723,29 @@ def load_checkpoint(base_models, optimizers, checkpoint_dir):
 # The main orchestrator for the entire pipeline.
 # ==============================================================================
 def debug_loss_and_labels(logits, labels, loss, step):
-    """Debug loss calculation to identify issues"""
-    if step % 100 == 0:  # Debug every 100 steps
-        print(f"\n=== LOSS DEBUG - Step {step} ===")
+    if step % 100 == 0:
+        print(f"\n=== ENHANCED LOSS DEBUG - Step {step} ===")
         print(f"Loss: {loss.item():.6f}")
         
-        # Check label distribution
+        # Original stats
         valid_labels = labels[labels != -100]
         print(f"Valid labels: {len(valid_labels)} out of {labels.numel()}")
-        print(f"Label range: {valid_labels.min().item() if len(valid_labels) > 0 else 'N/A'} to {valid_labels.max().item() if len(valid_labels) > 0 else 'N/A'}")
         
-        # Check logits
-        print(f"Logits shape: {logits.shape}")
-        print(f"Logits range: {logits.min().item():.3f} to {logits.max().item():.3f}")
+        # ENHANCED: Detailed logits analysis
         print(f"Logits mean: {logits.mean().item():.3f}")
+        print(f"Logits std: {logits.std().item():.3f}")
+        print(f"Logits min/max: {logits.min().item():.3f} / {logits.max().item():.3f}")
         
-        # Check if loss is computed on valid tokens
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        valid_mask = shift_labels != -100
-        valid_count = valid_mask.sum().item()
-        print(f"Valid tokens for loss: {valid_count}")
-        
-        if valid_count == 0:
-            print("⚠️ WARNING: No valid tokens for loss computation!")
-        
-        print("=" * 40)
+        # Check for healthy distribution
+        if logits.mean().item() < -5.0:
+            print("🔴 WARNING: Severe negative logits bias detected!")
+        elif logits.mean().item() < -2.0:
+            print("🟡 CAUTION: Moderate negative logits bias")
+        else:
+            print("✅ Logits distribution looks healthy")
+            
+        print("=" * 50)
+
 
 def main(args):
     # Setup
