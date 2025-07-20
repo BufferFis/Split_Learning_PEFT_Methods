@@ -645,12 +645,18 @@ def main(args):
     # Model Initialization
     print("Initializing U-shaped split model...")
     base_model = GPT2LMHeadModel.from_pretrained(args.model_name)
+    base_model.config.pad_token_id = tokenizer.pad_token_id
+    
     split_points = [int(p.strip()) for p in args.split_points.split(',')]
     
     client_head_base = ClientHead(base_model, split_points[0])
     server_base = Server(base_model, split_points[0], split_points[1])
     client_tail_base = ClientTail(base_model, split_points[1])
     
+    # CRITICAL STEP: Enforce Weight Tying BEFORE applying PEFT
+    client_tail_base.lm_head.weight = client_head_base.transformer.wte.weight
+    print("Weight tying between client_head embedding and client_tail lm_head enforced.")
+
     # Apply DoRA Adapters
     print("Applying DoRA adapters to all model parts...")
     dora_config = LoraConfig(
@@ -670,10 +676,6 @@ def main(args):
     server.print_trainable_parameters()
     client_tail.print_trainable_parameters()
     print("--------------------------\n")
-
-    # CRITICAL STEP: Enforce Weight Tying
-    client_tail.base_model.model.lm_head.weight = client_head.base_model.model.transformer.wte.weight
-    print("Weight tying between client_head embedding and client_tail lm_head enforced.")
 
     client_head.to(device)
     server.to(device)
