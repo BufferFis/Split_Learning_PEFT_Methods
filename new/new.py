@@ -227,7 +227,7 @@ class ClientTail(nn.Module):
             
         hidden_states = self.ln_f(hidden_states)
         logits = self.lm_head(hidden_states)
-        
+        logits = torch.clamp(logits, min=-50.0, max=50.0)
         return logits, tuple(presents) if final_use_cache else None
 
     def prepare_inputs_for_generation(self, *args, **kwargs):
@@ -819,7 +819,9 @@ def main(args):
             # Use autocast for mixed precision
             with torch.amp.autocast(device_type=args.device, enabled=(args.device == "cuda")):
                 head_output, _ = client_head(input_ids, attention_mask=attention_mask, use_cache=False)
+                head_output *= 0.1
                 server_output, _ = server(inputs_embeds=head_output, attention_mask=attention_mask, use_cache=False)
+                server_output *= 0.1
                 logits, _ = client_tail(inputs_embeds=server_output, attention_mask=attention_mask, use_cache=False)
 
                 shift_logits = logits[..., :-1, :].contiguous()
@@ -834,8 +836,8 @@ def main(args):
             scaler.unscale_(server_optimizer)
             
             # Gradient Clipping
-            torch.nn.utils.clip_grad_norm_(client_params, 0.5)
-            torch.nn.utils.clip_grad_norm_(server.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_(client_params, 0.2)
+            torch.nn.utils.clip_grad_norm_(server.parameters(), 0.2)
 
             # Optimizer step
             scaler.step(client_optimizer)
@@ -883,7 +885,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda", help="Device to train on ('cuda' or 'cpu').")
     
     # Training Hyperparameters
-    parser.add_argument("--learning_rate", type=float, default=2e-4, help="Peak learning rate for the AdamW optimizer.")
+    parser.add_argument("--learning_rate", type=float, default=2e-5, help="Peak learning rate for the AdamW optimizer.")
     parser.add_argument("--batch_size", type=int, default=8, help="Training batch size per device.")
     parser.add_argument("--num_epochs", type=int, default=5, help="Total number of training epochs.")
     parser.add_argument("--max_seq_length", type=int, default=256, help="Maximum sequence length for tokenization.")
