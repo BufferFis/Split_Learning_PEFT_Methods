@@ -459,6 +459,9 @@ def run_sanity_check(models, tokenizer, test_dataset, args):
         print(f"  MR       : {mr}")
         print(f"  Reference: {reference_text}")
         print(f"  Generated: {generated_text}")
+        print(f"  Generated: {generated_text}")
+        print(f"  Token IDs: {tokenizer.convert_ids_to_tokens(output_ids[0][input_ids.shape[1]:].tolist())}")
+
     print("-" * 50)
     print("--- Sanity Check Complete ---\n")
 
@@ -607,6 +610,10 @@ def main(args):
         client_head = PeftModel.from_pretrained(client_head_base, os.path.join(args.checkpoint_path, "client_head_dora"))
         server = PeftModel.from_pretrained(server_base, os.path.join(args.checkpoint_path, "server_dora"))
         client_tail = PeftModel.from_pretrained(client_tail_base, os.path.join(args.checkpoint_path, "client_tail_dora"))
+        
+        client_tail.lm_head.weight = client_head.transformer.wte.weight  # <<-- ADD THIS
+
+
         base_model.config.pad_token_id = tokenizer.eos_token_id
         base_model.resize_token_embeddings(len(tokenizer))
         # Move to device
@@ -646,7 +653,7 @@ def main(args):
     print("Initializing U-shaped split model...")
     base_model = GPT2LMHeadModel.from_pretrained(args.model_name)
     base_model.config.pad_token_id = tokenizer.pad_token_id
-    
+    base_model.resize_token_embeddings(len(tokenizer))
     split_points = [int(p.strip()) for p in args.split_points.split(',')]
     
     client_head_base = ClientHead(base_model, split_points[0])
