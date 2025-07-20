@@ -227,7 +227,7 @@ class ClientTail(nn.Module):
             
         hidden_states = self.ln_f(hidden_states)
         logits = self.lm_head(hidden_states)
-        logits = torch.clamp(logits, min=-50.0, max=50.0)
+        logits = torch.clamp(logits, min=-10.0, max=10.0)
         return logits, tuple(presents) if final_use_cache else None
 
     def prepare_inputs_for_generation(self, *args, **kwargs):
@@ -818,11 +818,20 @@ def main(args):
 
             # Use autocast for mixed precision
             with torch.amp.autocast(device_type=args.device, enabled=(args.device == "cuda")):
-                head_output, _ = client_head(input_ids, attention_mask=attention_mask, use_cache=False)
-                head_output *= 0.1
-                server_output, _ = server(inputs_embeds=head_output, attention_mask=attention_mask, use_cache=False)
-                server_output *= 0.1
-                logits, _ = client_tail(inputs_embeds=server_output, attention_mask=attention_mask, use_cache=False)
+                # FIXED: Use same parameters as generation
+                head_output, head_past = client_head(input_ids, attention_mask=attention_mask, use_cache=True)
+                server_output, server_past = server(
+                    inputs_embeds=head_output, 
+                    past_key_values=head_past,  # ADDED
+                    attention_mask=attention_mask, 
+                    use_cache=True  # CHANGED
+                )
+                logits, tail_past = client_tail(
+                    inputs_embeds=server_output, 
+                    past_key_values=server_past,  # ADDED
+                    attention_mask=attention_mask, 
+                    use_cache=True  # CHANGED
+                )
 
                 shift_logits = logits[..., :-1, :].contiguous()
                 shift_labels = labels[..., 1:].contiguous()
