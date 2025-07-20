@@ -299,43 +299,46 @@ def prepare_data(data_dir):
     return raw_datasets
 
 def preprocess_function(examples, tokenizer, max_length):
-    """FIXED: Consistent delimiter throughout pipeline"""
+    """FIXED: Proper label masking for each sample"""
     model_inputs = {"input_ids": [], "attention_mask": [], "labels": []}
     
-    # Use SAME delimiter for ALL phases
-    DELIMITER = " >> "  # Clear, unique separator
+    DELIMITER = " >> "
     
     for i in range(len(examples['mr'])):
-        # Construct MR string (exclude empty fields)
         mr_str = linearize_mr(examples['mr'][i])
         target_text = str(examples['txt'][i])
         
-        # FIXED: Use consistent format
         input_str = f"{mr_str}{DELIMITER}"
         full_text = f"{input_str}{target_text}{tokenizer.eos_token}"
         
-        # Tokenize the full sequence
-        tokenized = tokenizer(
-            full_text, 
-            truncation=True, 
-            max_length=max_length,
-            padding="max_length",
-            return_tensors="pt"
-        )
-        
-        # Calculate where input ends and target begins
+        # Tokenize separately for accurate length calculation
         input_tokens = tokenizer.encode(input_str, add_special_tokens=False)
+        full_tokens = tokenizer.encode(full_text, add_special_tokens=False)
+        
         input_length = len(input_tokens)
         
-        # Create labels: mask input part, keep target part
-        labels = tokenized["input_ids"].clone()
-        labels[:input_length] = -100  # Mask input tokens
+        # Pad to max_length
+        if len(full_tokens) > max_length:
+            full_tokens = full_tokens[:max_length]
+            
+        attention_mask = [1] * len(full_tokens) + [0] * (max_length - len(full_tokens))
+        input_ids = full_tokens + [tokenizer.pad_token_id] * (max_length - len(full_tokens))
         
-        model_inputs["input_ids"].append(tokenized["input_ids"].squeeze())
-        model_inputs["attention_mask"].append(tokenized["attention_mask"].squeeze())
-        model_inputs["labels"].append(labels.squeeze())
+        # FIXED: Create labels correctly - mask input portion only
+        labels = input_ids.copy()
+        for j in range(min(input_length, len(labels))):
+            labels[j] = -100
+        
+        # Mask padding tokens in labels too
+        for j in range(len(full_tokens), len(labels)):
+            labels[j] = -100
+        
+        model_inputs["input_ids"].append(input_ids)
+        model_inputs["attention_mask"].append(attention_mask)
+        model_inputs["labels"].append(labels)
     
     return model_inputs
+
 
 
 def apply_weight_tying_after_peft(client_head, client_tail):
@@ -629,6 +632,33 @@ def load_checkpoint(base_models, optimizers, checkpoint_dir):
 # SECTION 5: MAIN TRAINING FUNCTION
 # The main orchestrator for the entire pipeline.
 # ==============================================================================
+def debug_loss_and_labels(logits, labels, loss, step):
+    """Debug loss calculation to identify issues"""
+    if step % 100 == 0:  # Debug every 100 steps
+        print(f"\n=== LOSS DEBUG - Step {step} ===")
+        print(f"Loss: {loss.item():.6f}")
+        
+        # Check label distribution
+        valid_labels = labels[labels != -100]
+        print(f"Valid labels: {len(valid_labels)} out of {labels.numel()}")
+        print(f"Label range: {valid_labels.min().item() if len(valid_labels) > 0 else 'N/A'} to {valid_labels.max().item() if len(valid_labels) > 0 else 'N/A'}")
+        
+        # Check logits
+        print(f"Logits shape: {logits.shape}")
+        print(f"Logits range: {logits.min().item():.3f} to {logits.max().item():.3f}")
+        print(f"Logits mean: {logits.mean().item():.3f}")
+        
+        # Check if loss is computed on valid tokens
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        valid_mask = shift_labels != -100
+        valid_count = valid_mask.sum().item()
+        print(f"Valid tokens for loss: {valid_count}")
+        
+        if valid_count == 0:
+            print("⚠️ WARNING: No valid tokens for loss computation!")
+        
+        print("=" * 40)
 
 def main(args):
     # Setup
@@ -709,7 +739,7 @@ def main(args):
     client_tail_base = ClientTail(base_model, split_points[1])
     
     # CRITICAL STEP: Enforce Weight Tying BEFORE applying PEFT
-    client_tail_base.lm_head.weight = client_head_base.transformer.wte.weight
+    #client_tail_base.lm_head.weight = client_head_base.transformer.wte.weight
     print("Weight tying between client_head embedding and client_tail lm_head enforced.")
 
     # Apply DoRA Adapters
@@ -778,7 +808,7 @@ def main(args):
         total_loss = 0
         progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{end_epoch}", unit="batch")
         
-        for batch in progress_bar:
+        for step, batch in enumerate(progress_bar):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
@@ -795,7 +825,7 @@ def main(args):
                 shift_logits = logits[..., :-1, :].contiguous()
                 shift_labels = labels[..., 1:].contiguous()
                 loss = loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-
+            debug_loss_and_labels(logits, labels, loss, step)
             # Scale the loss and perform backward pass
             scaler.scale(loss).backward()
 
@@ -804,8 +834,8 @@ def main(args):
             scaler.unscale_(server_optimizer)
             
             # Gradient Clipping
-            torch.nn.utils.clip_grad_norm_(client_params, 1.0)
-            torch.nn.utils.clip_grad_norm_(server.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(client_params, 0.5)
+            torch.nn.utils.clip_grad_norm_(server.parameters(), 0.5)
 
             # Optimizer step
             scaler.step(client_optimizer)
