@@ -115,6 +115,7 @@ class ClientHead(nn.Module):
 
 class Server(nn.Module):
     """The middle part of the split GPT-2 model, executed on the server."""
+    
     def __init__(self, gpt2_model, split_point_1, split_point_2):
         super().__init__()
         self.config = gpt2_model.config
@@ -131,27 +132,44 @@ class Server(nn.Module):
             extended_attention_mask = attention_mask[:, None, :, :]
         else:
             raise ValueError(f"Wrong shape for attention_mask (shape {attention_mask.shape})")
-        
         extended_attention_mask = extended_attention_mask.to(dtype=dtype)
         extended_attention_mask = (1.0 - extended_attention_mask) * torch.finfo(dtype).min
         return extended_attention_mask
 
-    def forward(self, inputs_embeds, past_key_values=None, attention_mask=None, use_cache=None, **kwargs):
+    def forward(self, inputs_embeds, past_key_values=None, attention_mask=None, 
+                use_cache=None, position_offset=0, **kwargs):
+        """FIXED: Position-aware forward pass with offset handling"""
         final_use_cache = use_cache if use_cache is not None else self.config.use_cache
         hidden_states = inputs_embeds
-        
+
+        # FIXED: Use position_offset if provided instead of defaulting to 0
         if past_key_values is None or past_key_values[0] is None:
-            past_length = 0
+            past_length = position_offset  # Use provided offset instead of 0
             past_key_values = tuple([None] * len(self.h))
         else:
             past_length = past_key_values[0][0].size(-2)
-        
+
         device = hidden_states.device
-        
+
+        # FIXED: Better attention mask handling with proper sequence length
         if attention_mask is not None:
-            attention_mask = self._prepare_attention_mask(attention_mask, (hidden_states.shape[0], hidden_states.shape[1] + past_length), device, hidden_states.dtype)
-            
+            # Ensure attention mask accounts for full sequence including past
+            full_seq_len = hidden_states.shape[1] + past_length
+            if attention_mask.shape[-1] != full_seq_len:
+                # Extend attention mask if needed
+                batch_size = attention_mask.shape[0]
+                extended_mask = torch.ones(batch_size, full_seq_len, device=device, dtype=attention_mask.dtype)
+                extended_mask[:, :attention_mask.shape[1]] = attention_mask
+                attention_mask = extended_mask
+                
+            attention_mask = self._prepare_attention_mask(
+                attention_mask, 
+                (hidden_states.shape[0], full_seq_len), 
+                device, hidden_states.dtype
+            )
+
         presents = [] if final_use_cache else None
+
         for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
             outputs = block(
                 hidden_states,
@@ -159,20 +177,23 @@ class Server(nn.Module):
                 attention_mask=attention_mask,
                 use_cache=final_use_cache
             )
+
             hidden_states = outputs[0]
             if final_use_cache:
                 # Safely handle the output tuple which may or may not contain past_key_values
                 present = outputs[1] if len(outputs) > 1 else None
                 presents.append(present)
-            
+
         return hidden_states, tuple(presents) if final_use_cache else None
 
     def prepare_inputs_for_generation(self, *args, **kwargs):
         """A dummy method for PEFT compatibility. It's not called in our custom loop."""
         return kwargs
 
+
 class ClientTail(nn.Module):
     """The final part of the split GPT-2 model, executed on the client."""
+    
     def __init__(self, gpt2_model, split_point_2):
         super().__init__()
         self.config = gpt2_model.config
@@ -191,27 +212,44 @@ class ClientTail(nn.Module):
             extended_attention_mask = attention_mask[:, None, :, :]
         else:
             raise ValueError(f"Wrong shape for attention_mask (shape {attention_mask.shape})")
-        
         extended_attention_mask = extended_attention_mask.to(dtype=dtype)
         extended_attention_mask = (1.0 - extended_attention_mask) * torch.finfo(dtype).min
         return extended_attention_mask
 
-    def forward(self, inputs_embeds, past_key_values=None, attention_mask=None, use_cache=None, **kwargs):
+    def forward(self, inputs_embeds, past_key_values=None, attention_mask=None, 
+                use_cache=None, position_offset=0, **kwargs):
+        """FIXED: Position-aware forward pass with offset handling"""
         final_use_cache = use_cache if use_cache is not None else self.config.use_cache
         hidden_states = inputs_embeds
-        
+
+        # FIXED: Use position_offset if provided instead of defaulting to 0
         if past_key_values is None or past_key_values[0] is None:
-            past_length = 0
+            past_length = position_offset  # Use provided offset instead of 0
             past_key_values = tuple([None] * len(self.h))
         else:
             past_length = past_key_values[0][0].size(-2)
-        
+
         device = hidden_states.device
-        
+
+        # FIXED: Better attention mask handling with proper sequence length
         if attention_mask is not None:
-            attention_mask = self._prepare_attention_mask(attention_mask, (hidden_states.shape[0], hidden_states.shape[1] + past_length), device, hidden_states.dtype)
+            # Ensure attention mask accounts for full sequence including past
+            full_seq_len = hidden_states.shape[1] + past_length
+            if attention_mask.shape[-1] != full_seq_len:
+                # Extend attention mask if needed
+                batch_size = attention_mask.shape[0]
+                extended_mask = torch.ones(batch_size, full_seq_len, device=device, dtype=attention_mask.dtype)
+                extended_mask[:, :attention_mask.shape[1]] = attention_mask
+                attention_mask = extended_mask
+                
+            attention_mask = self._prepare_attention_mask(
+                attention_mask, 
+                (hidden_states.shape[0], full_seq_len), 
+                device, hidden_states.dtype
+            )
 
         presents = [] if final_use_cache else None
+
         for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
             outputs = block(
                 hidden_states,
@@ -219,20 +257,24 @@ class ClientTail(nn.Module):
                 attention_mask=attention_mask,
                 use_cache=final_use_cache
             )
+
             hidden_states = outputs[0]
             if final_use_cache:
                 # Safely handle the output tuple which may or may not contain past_key_values
                 present = outputs[1] if len(outputs) > 1 else None
                 presents.append(present)
-            
+
         hidden_states = self.ln_f(hidden_states)
         logits = self.lm_head(hidden_states)
-        logits = torch.clamp(logits, min=-10.0, max=10.0)
+        logits = logits - logits.mean(dim=-1, keepdim=True)
+        logits = torch.clamp(logits, min=-5.0, max=5.0)
+
         return logits, tuple(presents) if final_use_cache else None
 
     def prepare_inputs_for_generation(self, *args, **kwargs):
         """A dummy method for PEFT compatibility. It's not called in our custom loop."""
         return kwargs
+
 
 # ==============================================================================
 # SECTION 2: DATA PREPARATION FOR E2E REFINED DATASET
@@ -369,7 +411,7 @@ def apply_weight_tying_after_peft(client_head, client_tail):
 # ==============================================================================
 
 def beam_search_generate(models, tokenizer, input_ids, max_new_tokens, beam_width=5):
-    """Custom beam search generation for the 3-part split model."""
+    """Custom beam search generation for the 3-part split model with proper attention mask handling."""
     client_head, server, client_tail = models
     client_head.eval()
     server.eval()
@@ -378,10 +420,31 @@ def beam_search_generate(models, tokenizer, input_ids, max_new_tokens, beam_widt
     eos_token_id = tokenizer.eos_token_id
 
     with torch.no_grad():
-        prompt_attention_mask = torch.ones_like(input_ids)
-        head_out, head_past = client_head(input_ids, attention_mask=prompt_attention_mask, use_cache=True)
-        server_out, server_past = server(inputs_embeds=head_out, past_key_values=head_past, attention_mask=prompt_attention_mask, use_cache=True)
-        logits, tail_past = client_tail(inputs_embeds=server_out, past_key_values=server_past, attention_mask=prompt_attention_mask, use_cache=True)
+        # Track current sequence length for all components
+        current_length = input_ids.shape[1]
+        batch_size = input_ids.shape[0]
+        
+        # Initial forward pass with proper attention masks
+        attention_mask = torch.ones_like(input_ids)
+        head_out, head_past = client_head(input_ids, attention_mask=attention_mask, use_cache=True)
+        
+        # Pass consistent length information to server
+        server_attention_mask = torch.ones(batch_size, current_length, device=device)
+        server_out, server_past = server(
+            inputs_embeds=head_out, 
+            past_key_values=head_past,
+            attention_mask=server_attention_mask, 
+            use_cache=True
+        )
+        
+        # Same for client_tail
+        tail_attention_mask = torch.ones(batch_size, current_length, device=device)
+        logits, tail_past = client_tail(
+            inputs_embeds=server_out, 
+            past_key_values=server_past,
+            attention_mask=tail_attention_mask, 
+            use_cache=True
+        )
 
         next_token_logits = logits[:, -1, :]
         log_probs = torch.nn.functional.log_softmax(next_token_logits, dim=-1)
@@ -401,6 +464,7 @@ def beam_search_generate(models, tokenizer, input_ids, max_new_tokens, beam_widt
         for _ in range(max_new_tokens - 1):
             new_beams = []
             any_beam_active = False
+            
             for beam in beams:
                 if beam["finished"]:
                     new_beams.append(beam)
@@ -408,11 +472,36 @@ def beam_search_generate(models, tokenizer, input_ids, max_new_tokens, beam_widt
                 
                 any_beam_active = True
                 last_token = beam["sequence"][:, -1].unsqueeze(-1)
-                full_sequence_attention_mask = torch.ones_like(beam["sequence"])
+                
+                # FIXED: Update current_length for this beam
+                current_length = beam["sequence"].shape[1]
+                
+                # FIXED: Create proper attention masks for each component
+                head_attention_mask = torch.ones(batch_size, current_length, device=device)
+                server_attention_mask = torch.ones(batch_size, current_length, device=device)  
+                tail_attention_mask = torch.ones(batch_size, current_length, device=device)
 
-                head_out, new_head_past = client_head(last_token, past_key_values=beam["head_past"], attention_mask=full_sequence_attention_mask, use_cache=True)
-                server_out, new_server_past = server(inputs_embeds=head_out, past_key_values=beam["server_past"], attention_mask=full_sequence_attention_mask, use_cache=True)
-                logits, new_tail_past = client_tail(inputs_embeds=server_out, past_key_values=beam["tail_past"], attention_mask=full_sequence_attention_mask, use_cache=True)
+                # FIXED: Pass component-specific masks with proper shapes
+                head_out, new_head_past = client_head(
+                    last_token, 
+                    past_key_values=beam["head_past"], 
+                    attention_mask=head_attention_mask, 
+                    use_cache=True
+                )
+                
+                server_out, new_server_past = server(
+                    inputs_embeds=head_out, 
+                    past_key_values=beam["server_past"], 
+                    attention_mask=server_attention_mask, 
+                    use_cache=True
+                )
+                
+                logits, new_tail_past = client_tail(
+                    inputs_embeds=server_out, 
+                    past_key_values=beam["tail_past"], 
+                    attention_mask=tail_attention_mask, 
+                    use_cache=True
+                )
 
                 next_token_logits = logits[:, -1, :]
                 log_probs = torch.nn.functional.log_softmax(next_token_logits, dim=-1)
@@ -435,6 +524,7 @@ def beam_search_generate(models, tokenizer, input_ids, max_new_tokens, beam_widt
 
         best_beam = sorted(beams, key=lambda x: x["log_prob"].item(), reverse=True)[0]
         return best_beam["sequence"]
+
 
 def run_sanity_check(models, tokenizer, test_dataset, args):
     """FIXED: Use SAME delimiter as training"""
@@ -633,32 +723,29 @@ def load_checkpoint(base_models, optimizers, checkpoint_dir):
 # The main orchestrator for the entire pipeline.
 # ==============================================================================
 def debug_loss_and_labels(logits, labels, loss, step):
-    """Debug loss calculation to identify issues"""
-    if step % 100 == 0:  # Debug every 100 steps
-        print(f"\n=== LOSS DEBUG - Step {step} ===")
+    if step % 100 == 0:
+        print(f"\n=== ENHANCED LOSS DEBUG - Step {step} ===")
         print(f"Loss: {loss.item():.6f}")
         
-        # Check label distribution
+        # Original stats
         valid_labels = labels[labels != -100]
         print(f"Valid labels: {len(valid_labels)} out of {labels.numel()}")
-        print(f"Label range: {valid_labels.min().item() if len(valid_labels) > 0 else 'N/A'} to {valid_labels.max().item() if len(valid_labels) > 0 else 'N/A'}")
         
-        # Check logits
-        print(f"Logits shape: {logits.shape}")
-        print(f"Logits range: {logits.min().item():.3f} to {logits.max().item():.3f}")
+        # ENHANCED: Detailed logits analysis
         print(f"Logits mean: {logits.mean().item():.3f}")
+        print(f"Logits std: {logits.std().item():.3f}")
+        print(f"Logits min/max: {logits.min().item():.3f} / {logits.max().item():.3f}")
         
-        # Check if loss is computed on valid tokens
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        valid_mask = shift_labels != -100
-        valid_count = valid_mask.sum().item()
-        print(f"Valid tokens for loss: {valid_count}")
-        
-        if valid_count == 0:
-            print("⚠️ WARNING: No valid tokens for loss computation!")
-        
-        print("=" * 40)
+        # Check for healthy distribution
+        if logits.mean().item() < -5.0:
+            print("🔴 WARNING: Severe negative logits bias detected!")
+        elif logits.mean().item() < -2.0:
+            print("🟡 CAUTION: Moderate negative logits bias")
+        else:
+            print("✅ Logits distribution looks healthy")
+            
+        print("=" * 50)
+
 
 def main(args):
     # Setup
@@ -818,19 +905,22 @@ def main(args):
 
             # Use autocast for mixed precision
             with torch.amp.autocast(device_type=args.device, enabled=(args.device == "cuda")):
-                # FIXED: Use same parameters as generation
                 head_output, head_past = client_head(input_ids, attention_mask=attention_mask, use_cache=True)
+    
                 server_output, server_past = server(
-                    inputs_embeds=head_output, 
-                    past_key_values=head_past,  # ADDED
-                    attention_mask=attention_mask, 
-                    use_cache=True  # CHANGED
+                    inputs_embeds=head_output,
+                    past_key_values=head_past,
+                    attention_mask=attention_mask,
+                    position_offset=0,  # ADDED: Position offset for training
+                    use_cache=True
                 )
+                
                 logits, tail_past = client_tail(
-                    inputs_embeds=server_output, 
-                    past_key_values=server_past,  # ADDED
-                    attention_mask=attention_mask, 
-                    use_cache=True  # CHANGED
+                    inputs_embeds=server_output,
+                    past_key_values=server_past,
+                    attention_mask=attention_mask,
+                    position_offset=0,  # ADDED: Position offset for training
+                    use_cache=True
                 )
 
                 shift_logits = logits[..., :-1, :].contiguous()
@@ -894,7 +984,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda", help="Device to train on ('cuda' or 'cpu').")
     
     # Training Hyperparameters
-    parser.add_argument("--learning_rate", type=float, default=2e-5, help="Peak learning rate for the AdamW optimizer.")
+    parser.add_argument("--learning_rate", type=float, default=2e-4, help="Peak learning rate for the AdamW optimizer.")
     parser.add_argument("--batch_size", type=int, default=8, help="Training batch size per device.")
     parser.add_argument("--num_epochs", type=int, default=5, help="Total number of training epochs.")
     parser.add_argument("--max_seq_length", type=int, default=256, help="Maximum sequence length for tokenization.")
