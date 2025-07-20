@@ -585,7 +585,7 @@ def main(args):
     # Tokenizer
     tokenizer = GPT2Tokenizer.from_pretrained(args.model_name)
     tokenizer.pad_token = tokenizer.eos_token
-
+    base_model.resize_token_embeddings(len(tokenizer))
     # Load and Prepare E2E Refined Dataset
     raw_datasets = prepare_data(args.data_dir)
     
@@ -670,7 +670,7 @@ def main(args):
     client_head = get_peft_model(client_head_base, dora_config)
     server = get_peft_model(server_base, dora_config)
     client_tail = get_peft_model(client_tail_base, dora_config)
-
+    client_tail.lm_head.weight = client_head.transformer.wte.weight
     print("\n--- Trainable Parameters ---")
     client_head.print_trainable_parameters()
     server.print_trainable_parameters()
@@ -757,7 +757,14 @@ def main(args):
 
             # Update the scale for next iteration
             scaler.update()
-
+            print("\n Input:")
+            print(tokenizer.decode(input_ids.tolist(), skip_special_tokens=False))
+            print("\n Labels:")
+            label_ids_viewable = [token_id if token_id != -100 else tokenizer.pad_token_id for token_id in labels.tolist()]
+            print(tokenizer.decode(label_ids_viewable, skip_special_tokens=False))
+            print("\n Raw IDs (for debugging):")
+            print("input_ids:", input_ids.tolist())
+            print("labels:", labels.tolist())
             if not torch.isnan(loss):
                 total_loss += loss.item()
             progress_bar.set_postfix({"loss": total_loss / (progress_bar.n + 1)})
