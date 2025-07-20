@@ -1,3 +1,4 @@
+
 import os
 import torch
 import torch.nn as nn
@@ -298,37 +299,44 @@ def prepare_data(data_dir):
     return raw_datasets
 
 def preprocess_function(examples, tokenizer, max_length):
-    """FIXED: Corrected separator - no HTML encoding"""
+    """FIXED: Consistent delimiter throughout pipeline"""
     model_inputs = {"input_ids": [], "attention_mask": [], "labels": []}
-    inputs = [linearize_mr(mr) for mr in examples['mr']]
-    targets = [str(txt) for txt in examples['txt']]
     
-    for i in range(len(inputs)):
-        # FIXED: Use proper separator (not HTML encoded)
-        separator = " -> "  # NOT " -&gt; "
-        input_text = inputs[i] + separator
-        target_text = targets[i] + tokenizer.eos_token
+    # Use SAME delimiter for ALL phases
+    DELIMITER = " >> "  # Clear, unique separator
+    
+    for i in range(len(examples['mr'])):
+        # Construct MR string (exclude empty fields)
+        mr_str = linearize_mr(examples['mr'][i])
+        target_text = str(examples['txt'][i])
         
-        # Rest of function remains the same...
-        input_tokens = tokenizer.encode(input_text, add_special_tokens=False)
-        target_tokens = tokenizer.encode(target_text, add_special_tokens=False)
-        combined_tokens = input_tokens + target_tokens
-        labels = ([-100] * len(input_tokens)) + target_tokens
+        # FIXED: Use consistent format
+        input_str = f"{mr_str}{DELIMITER}"
+        full_text = f"{input_str}{target_text}{tokenizer.eos_token}"
         
-        if len(combined_tokens) > max_length:
-            combined_tokens = combined_tokens[:max_length]
-            labels = labels[:max_length]
+        # Tokenize the full sequence
+        tokenized = tokenizer(
+            full_text, 
+            truncation=True, 
+            max_length=max_length,
+            padding="max_length",
+            return_tensors="pt"
+        )
         
-        padding_length = max_length - len(combined_tokens)
-        attention_mask = [1] * len(combined_tokens) + [0] * padding_length
-        final_input_ids = combined_tokens + [tokenizer.pad_token_id] * padding_length
-        final_labels = labels + [-100] * padding_length
+        # Calculate where input ends and target begins
+        input_tokens = tokenizer.encode(input_str, add_special_tokens=False)
+        input_length = len(input_tokens)
         
-        model_inputs["input_ids"].append(final_input_ids)
-        model_inputs["attention_mask"].append(attention_mask)
-        model_inputs["labels"].append(final_labels)
+        # Create labels: mask input part, keep target part
+        labels = tokenized["input_ids"].clone()
+        labels[:input_length] = -100  # Mask input tokens
+        
+        model_inputs["input_ids"].append(tokenized["input_ids"].squeeze())
+        model_inputs["attention_mask"].append(tokenized["attention_mask"].squeeze())
+        model_inputs["labels"].append(labels.squeeze())
     
     return model_inputs
+
 
 def apply_weight_tying_after_peft(client_head, client_tail):
     """
@@ -426,31 +434,34 @@ def beam_search_generate(models, tokenizer, input_ids, max_new_tokens, beam_widt
         return best_beam["sequence"]
 
 def run_sanity_check(models, tokenizer, test_dataset, args):
-    """FIXED: Use the SAME separator as training"""
+    """FIXED: Use SAME delimiter as training"""
     print("\n--- Running Sanity Check ---")
     client_head, server, client_tail = models
     client_head.eval()
     server.eval() 
     client_tail.eval()
     
+    # CRITICAL: Use SAME delimiter as preprocessing
+    DELIMITER = " >> "
+    
     for i in range(min(args.sanity_check_samples, len(test_dataset))):
         item = test_dataset[i]
-        mr = linearize_mr(item['mr'])
+        mr_str = linearize_mr(item['mr'])
         reference_text = item['txt']
         
-        # CRITICAL: Use the SAME separator as in training
-        # If your model was trained with HTML encoded separator, use that temporarily
-        separator = " ->"  # Try to decode what the model actually learned
-        input_text = mr + separator
+        # FIXED: Use consistent format
+        input_str = f"{mr_str}{DELIMITER}"
         
         print("-" * 50)
         print(f"Sample {i+1}")
-        print(f" MR: {mr}")
-        print(f" Training format would be: '{mr + separator}'")
-        print(f" Input for generation: '{input_text}'")
+        print(f" MR: {mr_str}")
+        print(f" Input: '{input_str}'")
         print(f" Reference: {reference_text}")
         
-        input_ids = tokenizer.encode(input_text, return_tensors="pt").to(args.device)
+        # Proper tokenization
+        inputs = tokenizer(input_str, return_tensors="pt").to(args.device)
+        input_ids = inputs["input_ids"]
+        
         max_gen_len = min(args.max_seq_length - input_ids.shape[1], 50)
         
         if max_gen_len <= 0:
@@ -474,8 +485,7 @@ def run_sanity_check(models, tokenizer, test_dataset, args):
         
         print(f" Generated: {generated_text}")
         print("-" * 50)
-    
-    print("--- Sanity Check Complete ---\n")
+
 
 def test_separators(models, tokenizer, test_dataset, args):
     """Test different separators to see which one the model expects"""
@@ -501,7 +511,7 @@ def test_separators(models, tokenizer, test_dataset, args):
 def run_evaluation(models, tokenizer, test_dataset, args):
     """Generates predictions and runs the official E2E evaluation script."""
     print("\nRunning evaluation on the test set...")
-    
+    DELIMITER = " >> "
     ref_map = {}
     for item in test_dataset:
         mr = linearize_mr(item['mr'])
@@ -520,8 +530,7 @@ def run_evaluation(models, tokenizer, test_dataset, args):
     pred_file_path = os.path.join(args.output_dir, "eval_predictions.txt")
     with open(pred_file_path, "w", encoding="utf-8") as f:
         for mr in tqdm(ref_map.keys(), desc="Generating Predictions"):
-            seperator = " | "
-            input_text = mr + seperator
+            input_text = f"{mr}{DELIMITER}"
             input_ids = tokenizer.encode(input_text, return_tensors="pt").to(args.device)
             
             max_gen_len = args.max_seq_length - input_ids.shape[1]
@@ -630,7 +639,8 @@ def main(args):
     # Tokenizer
     tokenizer = GPT2Tokenizer.from_pretrained(args.model_name)
     tokenizer.pad_token = tokenizer.eos_token
-
+    print(f"   EOS token: '{tokenizer.eos_token}' (ID: {tokenizer.eos_token_id})")
+    print(f"   PAD token: '{tokenizer.pad_token}' (ID: {tokenizer.pad_token_id})")
     # Load and Prepare E2E Refined Dataset
     raw_datasets = prepare_data(args.data_dir)
     
