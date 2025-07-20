@@ -757,14 +757,12 @@ def main(args):
 
             # Update the scale for next iteration
             scaler.update()
-            print("\n Input:")
-            print(tokenizer.decode(input_ids.tolist(), skip_special_tokens=False))
             print("\n Labels:")
             label_ids_viewable = [token_id if token_id != -100 else tokenizer.pad_token_id for token_id in labels.tolist()]
-            print(tokenizer.decode(label_ids_viewable, skip_special_tokens=False))
-            print("\n Raw IDs (for debugging):")
-            print("input_ids:", input_ids.tolist())
-            print("labels:", labels.tolist())
+            #print(tokenizer.decode(label_ids_viewable, skip_special_tokens=False))
+            #print("\n Raw IDs (for debugging):")
+            #print("input_ids:", input_ids.tolist())
+            #print("labels:", labels.tolist())
             if not torch.isnan(loss):
                 total_loss += loss.item()
             progress_bar.set_postfix({"loss": total_loss / (progress_bar.n + 1)})
