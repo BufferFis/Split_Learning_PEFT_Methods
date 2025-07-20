@@ -320,41 +320,66 @@ def prepare_data(data_dir):
 
 def preprocess_function(examples, tokenizer, max_length):
     """
-    Tokenizes and formats the E2E dataset for training the causal LM.
-    This version uses a robust method for creating labels to prevent errors.
+    FIXED: Better preprocessing with clearer separation tokens
     """
     model_inputs = {"input_ids": [], "attention_mask": [], "labels": []}
-
+    
     inputs = [linearize_mr(mr) for mr in examples['mr']]
     targets = [str(txt) for txt in examples['txt']]
-
+    
     for i in range(len(inputs)):
-        # Tokenize the input and target separately
-        input_tokens = tokenizer(inputs[i] + tokenizer.eos_token, add_special_tokens=False).input_ids
-        target_tokens = tokenizer(targets[i] + tokenizer.eos_token, add_special_tokens=False).input_ids
-
-        # Concatenate for the model's input
+        # FIXED: Add a clear separator between MR and target text
+        separator = " -> "  # Clear separator to help model understand transition
+        input_text = inputs[i] + separator
+        target_text = targets[i] + tokenizer.eos_token
+        
+        # Tokenize separately
+        input_tokens = tokenizer.encode(input_text, add_special_tokens=False)
+        target_tokens = tokenizer.encode(target_text, add_special_tokens=False)
+        
+        # Concatenate
         combined_tokens = input_tokens + target_tokens
         
-        # Create labels: mask the input part, keep the target part
+        # Create labels: mask input part, keep target part
         labels = ([-100] * len(input_tokens)) + target_tokens
-
-        # Truncate if the combined length is too long
+        
+        # Truncate if too long
         if len(combined_tokens) > max_length:
             combined_tokens = combined_tokens[:max_length]
             labels = labels[:max_length]
-
-        # Pad to max_length
+        
+        # Pad
         padding_length = max_length - len(combined_tokens)
         attention_mask = [1] * len(combined_tokens) + [0] * padding_length
         final_input_ids = combined_tokens + [tokenizer.pad_token_id] * padding_length
         final_labels = labels + [-100] * padding_length
-
+        
         model_inputs["input_ids"].append(final_input_ids)
         model_inputs["attention_mask"].append(attention_mask)
         model_inputs["labels"].append(final_labels)
-        
+    
     return model_inputs
+def apply_weight_tying_after_peft(client_head, client_tail):
+    """
+    Apply weight tying after PEFT adapters are added.
+    This is crucial for proper text generation.
+    """
+    # Get the base model embeddings
+    if hasattr(client_head, 'base_model'):
+        wte_weight = client_head.base_model.transformer.wte.weight
+    else:
+        wte_weight = client_head.transformer.wte.weight
+    
+    # Tie to lm_head
+    if hasattr(client_tail, 'base_model'):
+        client_tail.base_model.lm_head.weight = wte_weight
+    else:
+        client_tail.lm_head.weight = wte_weight
+    
+    print("Weight tying applied after PEFT adapters")
+
+
+
 
 # ==============================================================================
 # SECTION 3: GENERATION AND EVALUATION
@@ -670,6 +695,7 @@ def main(args):
     client_head = get_peft_model(client_head_base, dora_config)
     server = get_peft_model(server_base, dora_config)
     client_tail = get_peft_model(client_tail_base, dora_config)
+    apply_weight_tying_after_peft(client_head, client_tail)
 
     print("\n--- Trainable Parameters ---")
     client_head.print_trainable_parameters()
