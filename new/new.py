@@ -453,14 +453,26 @@ def run_sanity_check(models, tokenizer, test_dataset, args):
                 models, tokenizer, input_ids, max_new_tokens=max_gen_len, beam_width=args.beam_width
             )
             generated_text = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=True)
+            print(f"[DEBUG run_sanity_check] raw output_ids shape: {output_ids.shape}")
+            print(f"[DEBUG run_sanity_check] raw output_ids tensor: {output_ids}")
+
+            # Show entire decoded sequence (prompt + gen)
+            raw_full = tokenizer.decode(output_ids.squeeze(0).tolist(), skip_special_tokens=False)
+            print(f"[DEBUG run_sanity_check] full decoded : {raw_full!r}")
+
+            # Now slice off the prompt
+            gen_ids = output_ids[0, input_ids.shape[1]:].tolist()
+            print(f"[DEBUG run_sanity_check] gen token IDs: {gen_ids}")
+            print(f"[DEBUG run_sanity_check] gen tokens   : {tokenizer.convert_ids_to_tokens(gen_ids)}")
+
+            generated_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+            print(f"  Generated: {generated_text}")
 
         print("-" * 50)
         print(f"Sample {i+1}")
         print(f"  MR       : {mr}")
         print(f"  Reference: {reference_text}")
-        print(f"  Generated: {generated_text}")
-        print(f"  Generated: {generated_text}")
-        print(f"  Token IDs: {tokenizer.convert_ids_to_tokens(output_ids[0][input_ids.shape[1]:].tolist())}")
+        
 
     print("-" * 50)
     print("--- Sanity Check Complete ---\n")
