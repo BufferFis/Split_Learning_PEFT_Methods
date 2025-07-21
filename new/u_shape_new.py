@@ -85,15 +85,17 @@ class HeadModel(nn.Module):
     """First stage: Embeddings + first 4 transformer blocks"""
     def __init__(self, base_model):
         super().__init__()
+        self.config = base_model.config  # Store config for dimension checking
         self.wte = base_model.transformer.wte
         self.wpe = base_model.transformer.wpe
         self.drop = base_model.transformer.drop
+        # First 4 transformer blocks (0-3)
         self.h = nn.ModuleList([base_model.transformer.h[i] for i in range(4)])
         
     def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, **kwargs):
-        # Handle embeddings
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
+            # Ensure correct position embeddings
             seq_length = inputs_embeds.size(1)
             position_ids = torch.arange(0, seq_length, dtype=torch.long, device=inputs_embeds.device)
             position_embeds = self.wpe(position_ids)
@@ -106,25 +108,34 @@ class HeadModel(nn.Module):
         else:
             raise ValueError("You must specify either input_ids or inputs_embeds")
         
-        # Fix attention mask dtype - CRITICAL FIX
+        # Debug: Print tensor shapes
+        print(f"HeadModel input shape: {hidden_states.shape}")
+        print(f"Expected hidden_size: {self.config.hidden_size}")
+        
+        # Verify dimension consistency
+        if hidden_states.size(-1) != self.config.hidden_size:
+            raise ValueError(f"Hidden states dimension {hidden_states.size(-1)} doesn't match "
+                           f"expected hidden_size {self.config.hidden_size}")
+        
+        # Fix attention mask handling
         if attention_mask is not None:
-            # Convert attention mask to proper dtype
-            if attention_mask.dtype == torch.long:
-                attention_mask = attention_mask.to(dtype=torch.float32)
-            
-            # Create 4D attention mask for transformer blocks
-            batch_size, seq_length = attention_mask.shape
-            # Convert to 4D: [batch_size, 1, 1, seq_length] 
-            attention_mask = attention_mask.view(batch_size, 1, 1, seq_length)
-            # Convert to float and apply mask values
-            attention_mask = attention_mask.to(dtype=hidden_states.dtype)
-            attention_mask = (1.0 - attention_mask) * torch.finfo(hidden_states.dtype).min
+            # Convert to proper format for transformer blocks
+            if attention_mask.dim() == 2:
+                batch_size, seq_length = attention_mask.shape
+                # Create causal mask
+                attention_mask = attention_mask.view(batch_size, 1, 1, seq_length)
+                attention_mask = attention_mask.to(dtype=hidden_states.dtype)
+                # Apply inverted mask (0 for attend, large negative for mask)
+                attention_mask = (1.0 - attention_mask) * torch.finfo(hidden_states.dtype).min
         
         # Pass through first 4 transformer blocks
-        for block in self.h:
+        for i, block in enumerate(self.h):
+            print(f"HeadModel block {i} input shape: {hidden_states.shape}")
             hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
+            print(f"HeadModel block {i} output shape: {hidden_states.shape}")
             
         return hidden_states, attention_mask
+
 
 
 
@@ -132,6 +143,7 @@ class ServerModel(nn.Module):
     """Middle stage: transformer blocks 4-7"""
     def __init__(self, base_model):
         super().__init__()
+        self.config = base_model.config
         self.h = nn.ModuleList([base_model.transformer.h[i] for i in range(4, 8)])
         
     def forward(self, hidden_states=None, attention_mask=None, inputs_embeds=None, **kwargs):
@@ -140,12 +152,17 @@ class ServerModel(nn.Module):
         elif hidden_states is None:
             raise ValueError("You must specify either hidden_states or inputs_embeds")
         
-        # Fix attention mask dtype if needed
-        if attention_mask is not None and attention_mask.dtype == torch.long:
-            attention_mask = attention_mask.to(dtype=hidden_states.dtype)
-            
-        for block in self.h:
+        print(f"ServerModel input shape: {hidden_states.shape}")
+        
+        # Verify dimensions
+        if hidden_states.size(-1) != self.config.hidden_size:
+            raise ValueError(f"ServerModel: Hidden states dimension {hidden_states.size(-1)} "
+                           f"doesn't match expected {self.config.hidden_size}")
+        
+        for i, block in enumerate(self.h):
+            print(f"ServerModel block {i} input shape: {hidden_states.shape}")
             hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
+            print(f"ServerModel block {i} output shape: {hidden_states.shape}")
             
         return hidden_states, attention_mask
 
@@ -153,13 +170,10 @@ class TailModel(nn.Module):
     """Final stage: last 4 transformer blocks + LM head"""
     def __init__(self, base_model):
         super().__init__()
+        self.config = base_model.config
         self.h = nn.ModuleList([base_model.transformer.h[i] for i in range(8, 12)])
         self.ln_f = base_model.transformer.ln_f
         self.lm_head = base_model.lm_head
-        
-        # Required attributes for PEFT
-        self.config = base_model.config
-        self.generation_config = getattr(base_model, 'generation_config', None)
         self._base_model = base_model
         
     def prepare_inputs_for_generation(self, input_ids, **kwargs):
@@ -180,13 +194,23 @@ class TailModel(nn.Module):
         elif hidden_states is None:
             raise ValueError("You must specify either hidden_states or inputs_embeds")
             
-        # Fix attention mask dtype if needed
-        if attention_mask is not None and attention_mask.dtype == torch.long:
-            attention_mask = attention_mask.to(dtype=hidden_states.dtype)
+        print(f"TailModel input shape: {hidden_states.shape}")
         
-        for block in self.h:
-            hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
-            
+        # Verify dimensions before entering transformer blocks
+        if hidden_states.size(-1) != self.config.hidden_size:
+            raise ValueError(f"TailModel: Hidden states dimension {hidden_states.size(-1)} "
+                           f"doesn't match expected {self.config.hidden_size}")
+        
+        for i, block in enumerate(self.h):
+            print(f"TailModel block {i} input shape: {hidden_states.shape}")
+            try:
+                hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
+                print(f"TailModel block {i} output shape: {hidden_states.shape}")
+            except RuntimeError as e:
+                print(f"Error in TailModel block {i}: {e}")
+                print(f"Block config: {block}")
+                raise e
+        
         hidden_states = self.ln_f(hidden_states)
         lm_logits = self.lm_head(hidden_states)
         
@@ -198,8 +222,6 @@ class TailModel(nn.Module):
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
             
         return {"loss": loss, "logits": lm_logits}
-
-
 
 
 class UShaped_GPT2_Model(nn.Module):
@@ -284,8 +306,12 @@ class UShaped_GPT2_Model(nn.Module):
 def setup_model_and_tokenizer(model_name):
     tokenizer = GPT2Tokenizer.from_pretrained(model_name)
     base_model = GPT2LMHeadModel.from_pretrained(model_name)
+    
+    # Print model config for debugging
+    print(f"Model config: {base_model.config}")
+    print(f"Hidden size: {base_model.config.hidden_size}")
+    print(f"Number of layers: {base_model.config.num_hidden_layers}")
 
-    # Add special tokens for structuring the input
     special_tokens_dict = {
         'bos_token': '<|endoftext|>',
         'eos_token': '<|endoftext|>',
@@ -293,15 +319,15 @@ def setup_model_and_tokenizer(model_name):
         'additional_special_tokens': ['<MR>', '<REF>']
     }
     tokenizer.add_special_tokens(special_tokens_dict)
-
-    # Resize model embeddings to accommodate the new tokens
+    
     base_model.resize_token_embeddings(len(tokenizer))
     base_model.config.pad_token_id = tokenizer.pad_token_id
-
-    # Create U-shaped model
+    
+    # Create U-shaped model with consistent config
     u_shaped_model = UShaped_GPT2_Model(base_model)
-
+    
     return u_shaped_model, tokenizer
+
 
 # --- 4. Apply DoRA PEFT to U-shaped model ---
 def apply_dora_peft(model):
@@ -394,7 +420,18 @@ def generate_sanity_check(model, tokenizer, device, mr_string="name[NAME], eatTy
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-
+    print(f"Using model: {args.model_name}")
+    
+    # Verify the model name corresponds to expected dimensions
+    model_configs = {
+        'gpt2': 768,           # GPT-2 small
+        'gpt2-medium': 1024,   # GPT-2 medium  
+        'gpt2-large': 1280,    # GPT-2 large
+        'gpt2-xl': 1600        # GPT-2 XL
+    }
+    expected_dim = model_configs.get(args.model_name)
+    if expected_dim:
+        print(f"Expected hidden dimension: {expected_dim}")
     # Setup U-shaped model and tokenizer
     model, tokenizer = setup_model_and_tokenizer(args.model_name)
 
