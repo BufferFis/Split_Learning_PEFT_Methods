@@ -92,7 +92,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             """Default implementation for prepare_inputs_for_generation"""
             return {"input_ids": input_ids}
             
-        def forward(self, input_ids=None, attention_mask=None, output_hidden_states=False, **kwargs):
+        def forward(self, input_ids=None, attention_mask=None, output_hidden_states=False,**kwargs):
             inputs_embeds = self.wte(input_ids)
             seq_length = input_ids.size(-1)
             position_ids = torch.arange(0, seq_length, dtype=torch.long, device=input_ids.device)
@@ -267,17 +267,22 @@ class ServerModel:
             lr=learning_rate
         )
         
-    def forward(self, activations, attention_mask=None, past_key_values=None, position_ids=None):
-        """Forward pass through body layers (inference mode) with context"""
-        self.body_model.eval()
-        with torch.no_grad():
-            output = self.body_model(
-                hidden_states=activations,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                position_ids=position_ids
-            )
-            return output.last_hidden_state
+    def forward_train(self, activations, attention_mask=None, past_key_values=None, position_ids=None, **kwargs):
+        """Forward pass during training with context passing"""
+        self.body_model.train()
+        # Don't detach - maintain gradient connection
+        activations.requires_grad_(True)
+        
+        output = self.body_model(
+            hidden_states=activations,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=True,  # Enable cache for consistency
+            **kwargs
+        )
+        
+        # Return the output object and activations for backward pass
+        return output, activations
     
     def forward_train(self, activations, attention_mask=None, past_key_values=None, position_ids=None):
         """Forward pass during training with context passing"""
@@ -349,28 +354,18 @@ class HeadClient:
             lr=learning_rate
         )
         
-    def forward(self, input_ids, attention_mask=None, use_cache=False):
-        """Forward pass through head layers"""
+    def forward(self, input_ids, attention_mask=None, use_cache=False, **kwargs):
+        """Forward pass through head layers with cache support"""
         output = self.head_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            output_hidden_states=True
+            use_cache=use_cache,
+            **kwargs
         )
         
-        # Return proper output object with required attributes
-        if hasattr(output, 'hidden_states') and output.hidden_states is not None:
-            last_hidden_state = output.hidden_states[-1]
-        else:
-            last_hidden_state = output.last_hidden_state
-        
-        # Create output object with required attributes for context passing
-        return type('HeadOutput', (), {
-            'last_hidden_state': last_hidden_state,
-            'past_key_values': None,  # Add this for context passing
-            'position_ids': None,     # Add this for context passing
-            'hidden_states': output.hidden_states if hasattr(output, 'hidden_states') else None,
-            'attentions': None
-        })()
+        # Return the output object directly (it already has last_hidden_state, past_key_values, etc.)
+        return output
+
 
     
     def backward(self, head_activations, head_grad):
@@ -400,15 +395,18 @@ class TailClient:
         self.loss_fn = nn.CrossEntropyLoss(label_smoothing=0.05)
         self.tokenizer = tokenizer
         
-    def forward(self, body_activations, attention_mask=None, past_key_values=None, position_ids=None):
+    def forward(self, body_activations, attention_mask=None, past_key_values=None, position_ids=None, **kwargs):
         """Forward pass through tail layers with context"""
         output = self.tail_model(
             inputs_embeds=body_activations,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
-            position_ids=position_ids
+            use_cache=True,  # Enable cache for consistency
+            **kwargs
         )
+        
         return output.logits
+
     
     def compute_loss_and_backward(self, body_activations, labels, attention_mask=None, mr_texts=None, past_key_values=None, position_ids=None):
         """Enhanced loss computation with coverage awareness"""
@@ -971,31 +969,33 @@ class SplitLoRATrainer:
                             mr_texts.append(mr_text)
                         else:
                             mr_texts.append("")
-                    
+
                     # Forward pass with coverage
                     head_output = self.head_client.forward(input_ids, attention_mask=attention_mask, use_cache=True)
                     head_activations = head_output.last_hidden_state
-                    body_output = self.server.forward_train(
-                        head_activations, 
+                    
+                    body_output, head_activations_stored = self.server.forward_train(
+                        head_activations,
                         attention_mask=attention_mask,
-                        past_key_values=head_output.past_key_values,  # FIXED: Pass KV cache
-                        position_ids=head_output.position_ids         # FIXED: Pass position context
+                        past_key_values=head_output.past_key_values,
+                        position_ids=getattr(head_output, 'position_ids', None)
                     )
+                    
                     body_activations = body_output.last_hidden_state
                     
                     loss, body_grad = self.tail_client.compute_loss_and_backward(
-                        body_activations, 
-                        labels, 
-                        attention_mask, 
+                        body_activations,
+                        labels,
+                        attention_mask,
                         mr_texts,
-                        past_key_values=body_output.past_key_values,  # FIXED: Pass KV cache
-                        position_ids=body_output.position_ids         # FIXED: Pass position context
+                        past_key_values=body_output.past_key_values,
+                        position_ids=getattr(body_output, 'position_ids', None)
                     )
-                    
+
                     # Backward pass
-                    head_grad = self.server.backward(body_activations, body_grad, head_activations)
+                    head_grad = self.server.backward(body_activations, body_grad, head_activations_stored)
                     self.head_client.backward(head_activations, head_grad)
-                    
+
                     # Update schedulers
                     for sched in self.schedulers:
                         sched.step()
