@@ -3,7 +3,9 @@ import pandas as pd
 import json
 import argparse
 from torch.utils.data import Dataset, DataLoader
-from transformers import GPT2Tokenizer, GPT2LMHeadModel, AdamW, get_linear_schedule_with_warmup
+# --- FIX: AdamW is now imported from torch.optim ---
+from torch.optim import AdamW 
+from transformers import GPT2Tokenizer, GPT2LMHeadModel, get_linear_schedule_with_warmup
 from tqdm import tqdm
 import os
 
