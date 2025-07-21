@@ -9,6 +9,7 @@ import torch.optim as optim
 from typing import Optional
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from torch.cuda.amp import autocast, GradScaler
 from datasets import load_dataset
 from evaluate import load as load_metric
 from peft import LoraConfig, get_peft_model, PeftModel
@@ -932,8 +933,8 @@ class SplitLoRATrainer:
             print(f"⚠️ Sanity check failed: {e}")
             return True  # Continue training anyway
 
-    from torch.cuda.amp import autocast, GradScaler
-from torch.cuda.amp import autocast, GradScaler
+    
+
 
     def train_with_coverage(self, train_dataloader, epochs=1):
         """Enhanced training with coverage monitoring + AMP + memory optimization."""
