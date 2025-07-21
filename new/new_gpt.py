@@ -37,11 +37,6 @@ class SplitGPT2_UShape(nn.Module):
         self.tokenizer.pad_token = self.tokenizer.eos_token
         full_model.resize_token_embeddings(len(self.tokenizer))
 
-        for block in full_model.transformer.h:
-            if hasattr(block.attn, 'k_proj') and hasattr(block.attn, 'v_proj'):
-                block.attn.k_proj.dropout = nn.Dropout(0.2)
-                block.attn.v_proj.dropout = nn.Dropout(0.2)
-
         self.client_head = nn.Sequential(*full_model.transformer.h[:4])
         self.server = nn.Sequential(*full_model.transformer.h[4:8])
         self.client_tail = nn.Sequential(*full_model.transformer.h[8:])
@@ -65,24 +60,24 @@ class SplitGPT2_UShape(nn.Module):
         for layer in self.client_tail: hidden = layer(hidden)[0]
         hidden = self.ln_f(hidden)
         logits = self.lm_head(hidden)
-
         return {'logits': logits}
 
     def generate(self, input_ids, attention_mask=None, **gen_kwargs):
-        full = GPT2LMHeadModel.from_pretrained("gpt2").cuda()
+        full = GPT2LMHeadModel.from_pretrained("gpt2").to(self.lm_head.weight.device)
         full.transformer.wte = self.wte
         full.transformer.wpe = self.wpe
         full.transformer.ln_f = self.ln_f
         full.transformer.h = nn.ModuleList(list(self.client_head) + list(self.server) + list(self.client_tail))
         full.lm_head = self.lm_head
         full.eval()
-        return full.generate(input_ids=input_ids, attention_mask=attention_mask, **gen_kwargs)
+        return full.generate(input_ids=input_ids, attention_mask=attention_mask, repetition_penalty=1.2, **gen_kwargs)
 
 # ============ Dataset ============
 def linearize_mr_dict(mr_dict):
     kv = mr_dict.copy()
     for key in ["name", "area", "near"]:
-        if key in kv: kv[key] = key.upper()
+        if key in kv:
+            kv[key] = key.upper()
     keys = list(kv.keys())
     random.shuffle(keys)
     return " ".join([f"{k}=[{kv[k]}]" for k in keys if kv[k]])
@@ -170,7 +165,7 @@ def evaluate(args):
     ref_path = os.path.join(out_dir, "valid.refs.txt")
 
     with open(pred_path, "w") as pf, open(ref_path, "w") as rf:
-        for idx, (mr, refs) in enumerate(zip(val_data["inputs"], val_data["targets"])):
+        for idx, (mr, refs) in enumerate(zip(val_data['inputs'], val_data['targets'])):
             mr_lin = linearize_mr_dict(mr)
             input = tokenizer(mr_lin + tokenizer.eos_token, return_tensors="pt", padding=True)
             input_ids = input["input_ids"].cuda()
