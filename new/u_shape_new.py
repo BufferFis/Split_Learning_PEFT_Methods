@@ -127,9 +127,10 @@ class TailModel(nn.Module):
         self.ln_f = base_model.transformer.ln_f
         self.lm_head = base_model.lm_head
         
-        # Add required attributes for PEFT
+        # Store references needed by PEFT
         self.config = base_model.config
         self.generation_config = getattr(base_model, 'generation_config', None)
+        self._base_model = base_model  # Keep reference to base model
         
     def prepare_inputs_for_generation(self, input_ids, **kwargs):
         """Required for PEFT CAUSAL_LM compatibility"""
@@ -140,7 +141,8 @@ class TailModel(nn.Module):
         }
         
     def get_input_embeddings(self):
-        return None  # Embeddings handled by HeadModel
+        """Return the base model's input embeddings for PEFT compatibility"""
+        return self._base_model.transformer.wte  # Return actual embedding layer
         
     def get_output_embeddings(self):
         return self.lm_head
@@ -149,7 +151,7 @@ class TailModel(nn.Module):
         self.lm_head = new_embeddings
         
     def forward(self, hidden_states, attention_mask=None, labels=None, **kwargs):
-        # Your existing forward method unchanged
+        # Your existing forward method
         for block in self.h:
             hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
             
@@ -164,6 +166,7 @@ class TailModel(nn.Module):
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
             
         return {"loss": loss, "logits": lm_logits}
+
 
 
 class UShaped_GPT2_Model(nn.Module):
