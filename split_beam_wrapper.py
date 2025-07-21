@@ -78,7 +78,7 @@ class SplitGPT2ForGeneration(PreTrainedModel, GenerationMixin):
         Returns
         -------
         logits : (B, T, V)
-        new_past_key_values : same three-tuple structure or None
+        new_past_key_values : same three-tuple structureor None
         """
         head_past, body_past, tail_past = (
             (None, None, None) if past_key_values is None else past_key_values
@@ -181,11 +181,11 @@ class SplitGPT2ForGeneration(PreTrainedModel, GenerationMixin):
 
             # feed **only** the last token + cache
             logits, past = self._forward_step(
-                input_ids=input_ids[:, -1:],      # (B, 1)
-                attention_mask=attention_mask,
-                past_key_values=past,
-                use_cache=True,
-            )
+            input_ids=input_ids[:, -1:],          # (B, 1)
+            attention_mask=attention_mask[:, -1:],# (B, 1) ← NEW
+            past_key_values=past,
+            use_cache=True,
+        )
 
         return input_ids
 
