@@ -333,16 +333,27 @@ def prepare_data(data_dir):
         print("="*80)
         exit(1)
 
-    raw_datasets = load_dataset('json', data_files={'train': train_file, 'validation': valid_file, 'test': test_file})
+    raw_datasets = load_dataset('json', data_files={'train': train_file,
+                                                   'validation': valid_file,
+                                                   'test': test_file})
 
-    # If you're using the lexicalized-only JSON (txt_lex / mr_lex), rename them
+        # Handle lexicalized JSON columns: only rename if no collision, else drop
     for split in raw_datasets:
-        cols = raw_datasets[split].column_names
+        ds = raw_datasets[split]
         if 'txt_lex' in cols:
-            raw_datasets[split] = raw_datasets[split].rename_column('txt_lex', 'txt')
+            if 'txt' not in cols:
+                cols = ds.column_names
+                ds = ds.rename_column('txt_lex', 'txt')
+            else:
+                ds = ds.remove_columns('txt_lex')
         if 'mr_lex' in cols:
-            raw_datasets[split] = raw_datasets[split].rename_column('mr_lex', 'mr')
+            if 'mr' not in cols:
+                ds = ds.rename_column('mr_lex', 'mr')
+            else:
+                ds = ds.remove_columns('mr_lex')
+        raw_datasets[split] = ds
 
+    return raw_datasets    
 def preprocess_function(examples, tokenizer, max_length):
     """COMPLETELY FIXED: Removes HTML encoding and improves label handling"""
     model_inputs = {"input_ids": [], "attention_mask": [], "labels": []}
