@@ -267,7 +267,7 @@ class ClientTail(nn.Module):
         hidden_states = self.ln_f(hidden_states)
         logits = self.lm_head(hidden_states)
         logits = logits - logits.mean(dim=-1, keepdim=True)
-        logits = torch.clamp(logits, min=-5.0, max=5.0)
+        logits = torch.clamp(logits, min=-30.0, max=30.0)
 
         return logits, tuple(presents) if final_use_cache else None
 
@@ -341,45 +341,48 @@ def prepare_data(data_dir):
     return raw_datasets
 
 def preprocess_function(examples, tokenizer, max_length):
-    """FIXED: Proper label masking for each sample"""
+    """COMPLETELY FIXED: Removes HTML encoding and improves label handling"""
     model_inputs = {"input_ids": [], "attention_mask": [], "labels": []}
     
-    DELIMITER = " >> "
+    # CRITICAL FIX: Use simple, unencoded delimiter
+    DELIMITER = " = "  
     
     for i in range(len(examples['mr'])):
         mr_str = linearize_mr(examples['mr'][i])
         target_text = str(examples['txt'][i])
         
+        # Create input and full sequences
         input_str = f"{mr_str}{DELIMITER}"
         full_text = f"{input_str}{target_text}{tokenizer.eos_token}"
         
-        # Tokenize separately for accurate length calculation
-        input_tokens = tokenizer.encode(input_str, add_special_tokens=False)
-        full_tokens = tokenizer.encode(full_text, add_special_tokens=False)
+        # Tokenize with proper handling
+        input_ids = tokenizer.encode(input_str, add_special_tokens=False)
+        target_ids = tokenizer.encode(target_text + tokenizer.eos_token, add_special_tokens=False)
         
-        input_length = len(input_tokens)
+        # Combine sequences
+        combined_ids = input_ids + target_ids
+        input_length = len(input_ids)
         
-        # Pad to max_length
-        if len(full_tokens) > max_length:
-            full_tokens = full_tokens[:max_length]
-            
-        attention_mask = [1] * len(full_tokens) + [0] * (max_length - len(full_tokens))
-        input_ids = full_tokens + [tokenizer.pad_token_id] * (max_length - len(full_tokens))
+        # Truncate if necessary
+        if len(combined_ids) > max_length:
+            combined_ids = combined_ids[:max_length]
+            input_length = min(input_length, max_length)
         
-        # FIXED: Create labels correctly - mask input portion only
-        labels = input_ids.copy()
-        for j in range(min(input_length, len(labels))):
-            labels[j] = -100
+        # Create attention mask
+        attention_mask = [1] * len(combined_ids) + [0] * (max_length - len(combined_ids))
         
-        # Mask padding tokens in labels too
-        for j in range(len(full_tokens), len(labels)):
-            labels[j] = -100
+        # Pad input_ids
+        padded_input_ids = combined_ids + [tokenizer.pad_token_id] * (max_length - len(combined_ids))
         
-        model_inputs["input_ids"].append(input_ids)
+        # Create labels with proper masking
+        labels = [-100] * input_length + combined_ids[input_length:] + [-100] * (max_length - len(combined_ids))
+        
+        model_inputs["input_ids"].append(padded_input_ids)
         model_inputs["attention_mask"].append(attention_mask)
         model_inputs["labels"].append(labels)
     
     return model_inputs
+
 
 
 
@@ -545,7 +548,7 @@ def run_sanity_check(models, tokenizer, test_dataset, args):
     server.eval()
     client_tail.eval()
 
-    DELIMITER = " >> "
+    DELIMITER = " = "
     successful_generations = 0
 
     for i in range(min(args.sanity_check_samples, len(test_dataset))):
@@ -601,7 +604,7 @@ def run_sanity_check(models, tokenizer, test_dataset, args):
 def run_evaluation(models, tokenizer, test_dataset, args):
     """Generates predictions and runs the official E2E evaluation script."""
     print("\nRunning evaluation on the test set...")
-    DELIMITER = " >> "
+    DELIMITER = " = "
     ref_map = {}
     for item in test_dataset:
         mr = linearize_mr(item['mr'])
@@ -931,8 +934,8 @@ def main(args):
             scaler.unscale_(server_optimizer)
             
             # Gradient Clipping
-            torch.nn.utils.clip_grad_norm_(client_params, 0.2)
-            torch.nn.utils.clip_grad_norm_(server.parameters(), 0.2)
+            torch.nn.utils.clip_grad_norm_(client_params, 1.0)
+            torch.nn.utils.clip_grad_norm_(server.parameters(), 1.0)
 
             # Optimizer step
             scaler.step(client_optimizer)
