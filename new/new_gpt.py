@@ -3,14 +3,28 @@
 import random
 import torch
 import torch.nn as nn
-from transformers import GPT2LMHeadModel, GPT2TokenizerFast
+from transformers import GPT2LMHeadModel, GPT2TokenizerFast, get_linear_schedule_with_warmup
 from peft import LoraConfig, get_peft_model
 from torch.utils.data import DataLoader
+from torch.nn.utils import clip_grad_norm_
 import os
 import json
 import argparse
 import sys
 import subprocess
+
+# ============ SmoothCrossEntropyLoss ============
+class SmoothCELoss(nn.Module):
+    def __init__(self, eps=0.1):
+        super().__init__()
+        self.eps = eps
+    def forward(self, logits, labels):
+        log_preds = torch.log_softmax(logits, dim=-1)
+        loss = -log_preds.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+        smooth_loss = -log_preds.mean(dim=-1)
+        mask = labels != -100
+        loss = loss * mask + smooth_loss * self.eps
+        return loss.sum() / mask.sum()
 
 # ============ SplitGPT2 U-Shape Setup ============
 class SplitGPT2_UShape(nn.Module):
@@ -20,6 +34,11 @@ class SplitGPT2_UShape(nn.Module):
         self.tokenizer = GPT2TokenizerFast.from_pretrained(model_name)
         self.tokenizer.pad_token = self.tokenizer.eos_token
         full_model.resize_token_embeddings(len(self.tokenizer))
+
+        for block in full_model.transformer.h:
+            if hasattr(block.attn, 'k_proj') and hasattr(block.attn, 'v_proj'):
+                block.attn.k_proj.dropout = nn.Dropout(0.2)
+                block.attn.v_proj.dropout = nn.Dropout(0.2)
 
         self.client_head = nn.Sequential(*full_model.transformer.h[:4])
         self.server = nn.Sequential(*full_model.transformer.h[4:8])
@@ -45,11 +64,7 @@ class SplitGPT2_UShape(nn.Module):
         hidden = self.ln_f(hidden)
         logits = self.lm_head(hidden)
 
-        loss = None
-        if labels is not None:
-            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-            loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
-        return {'loss': loss, 'logits': logits}
+        return {'logits': logits}
 
     def generate(self, input_ids, **gen_kwargs):
         from transformers import PreTrainedModel
@@ -110,16 +125,22 @@ def train(args):
     processed = preprocess(raw_data, tokenizer)
     dataset = list(zip(processed['input_ids'], processed['labels']))
     loader = DataLoader(dataset, batch_size=8)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=0.01)
+    total_steps = len(loader) * 4
+    scheduler = get_linear_schedule_with_warmup(optimizer, 500, total_steps)
+
     model.train()
-    for epoch in range(3):
+    for epoch in range(1, 5):
         for step, (input_ids, labels) in enumerate(loader):
             batch = {"input_ids": input_ids.cuda(), "labels": labels.cuda()}
             out = model(**batch)
-            out['loss'].backward()
-            optimizer.step(); optimizer.zero_grad()
+            loss = SmoothCELoss()(out['logits'], batch['labels'])
+            loss.backward()
+            clip_grad_norm_(model.parameters(), 0.5)
+            optimizer.step(); scheduler.step(); optimizer.zero_grad()
             if step % 100 == 0:
-                print(f"Epoch {epoch} Step {step} Loss: {out['loss'].item():.4f}")
+                print(f"Epoch {epoch} Step {step} Loss: {loss.item():.4f}")
     torch.save(model.state_dict(), args.save_path)
 
 # ============ Eval ============
