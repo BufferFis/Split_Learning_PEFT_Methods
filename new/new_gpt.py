@@ -15,7 +15,7 @@ import subprocess
 
 # ============ SmoothCrossEntropyLoss ============
 class SmoothCELoss(nn.Module):
-    def __init__(self, eps=0.1):
+    def __init__(self, eps=0.05):
         super().__init__()
         self.eps = eps
     def forward(self, logits, labels):
@@ -39,8 +39,8 @@ class SplitGPT2_UShape(nn.Module):
 
         for block in full_model.transformer.h:
             if hasattr(block.attn, 'k_proj') and hasattr(block.attn, 'v_proj'):
-                block.attn.k_proj.dropout = nn.Dropout(0.2)
-                block.attn.v_proj.dropout = nn.Dropout(0.2)
+                block.attn.k_proj.dropout = nn.Dropout(0.05)
+                block.attn.v_proj.dropout = nn.Dropout(0.05)
 
         self.client_head = nn.Sequential(*full_model.transformer.h[:4])
         self.server = nn.Sequential(*full_model.transformer.h[4:8])
