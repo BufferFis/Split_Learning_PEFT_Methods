@@ -969,28 +969,35 @@ class SplitLoRATrainer:
                             mr_texts.append(mr_text)
                         else:
                             mr_texts.append("")
+                    from torch.amp import autocast, GradScaler
+                    scaler = GradScaler()
+                    with autocast(dtype=torch.float16):
+                        # Forward pass with coverage
+                        head_output = self.head_client.forward(input_ids, attention_mask=attention_mask, use_cache=False)
+                        head_activations = head_output.last_hidden_state
+                        
+                        body_output, head_activations_stored = self.server.forward_train(
+                            head_activations,
+                            attention_mask=attention_mask,
+                            past_key_values=head_output.past_key_values,
+                            position_ids=getattr(head_output, 'position_ids', None)
+                        )
+                        
+                        body_activations = body_output.last_hidden_state
+                        
+                        loss, body_grad = self.tail_client.compute_loss_and_backward(
+                            body_activations,
+                            labels,
+                            attention_mask,
+                            mr_texts,
+                            past_key_values=body_output.past_key_values,
+                            position_ids=getattr(body_output, 'position_ids', None)
+                        )
 
-                    # Forward pass with coverage
-                    head_output = self.head_client.forward(input_ids, attention_mask=attention_mask, use_cache=True)
-                    head_activations = head_output.last_hidden_state
-                    
-                    body_output, head_activations_stored = self.server.forward_train(
-                        head_activations,
-                        attention_mask=attention_mask,
-                        past_key_values=head_output.past_key_values,
-                        position_ids=getattr(head_output, 'position_ids', None)
-                    )
-                    
-                    body_activations = body_output.last_hidden_state
-                    
-                    loss, body_grad = self.tail_client.compute_loss_and_backward(
-                        body_activations,
-                        labels,
-                        attention_mask,
-                        mr_texts,
-                        past_key_values=body_output.past_key_values,
-                        position_ids=getattr(body_output, 'position_ids', None)
-                    )
+                    scaler.scale(loss).backward(retain_graph=True)
+                    scaler.step(self.tail_client.optimizer)   # do this for each optimizer
+                    scaler.update()
+
 
                     # Backward pass
                     head_grad = self.server.backward(body_activations, body_grad, head_activations_stored)
