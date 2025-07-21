@@ -8,7 +8,7 @@ from torch.optim import AdamW
 from transformers import GPT2Tokenizer, GPT2LMHeadModel, get_linear_schedule_with_warmup
 from tqdm import tqdm
 import os
-
+from peft import get_peft_model, LoraConfig, TaskType
 # --- 1. Data Preparation Class for JSON ---
 # This class loads data from the specified JSON format, linearizes the MR,
 # and prepares it for the causal language model with loss masking.
@@ -142,10 +142,29 @@ def main(args):
     model, tokenizer = setup_model_and_tokenizer(args.model_name)
     model.to(device)
 
+        
+
+    # --- PEFT: DoRA Configuration ---
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        r=16,                  # low-rank dimension
+        lora_alpha=32,         # scaling
+        lora_dropout=0.1,      # dropout
+        target_modules=["c_attn", "c_proj"],  # adjust for GPT-2 block names
+        use_dora=True          # enable DoRA
+    )
+    model = get_peft_model(model, peft_config)
+    model.print_trainable_parameters()  # verify adapter params only
+
     train_dataset = E2EJsonDataset(json_file=args.train_file, tokenizer=tokenizer, max_length=args.max_length)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
 
-    optimizer = AdamW(model.parameters(), lr=args.learning_rate)
+    optimizer = AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=args.learning_rate,
+        weight_decay=0.01
+    )
     total_steps = len(train_loader) * args.num_epochs
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0.1 * total_steps, num_training_steps=total_steps)
 
