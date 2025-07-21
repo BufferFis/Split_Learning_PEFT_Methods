@@ -340,12 +340,15 @@ def prepare_data(data_dir):
         # Handle lexicalized JSON columns: only rename if no collision, else drop
     for split in raw_datasets:
         ds = raw_datasets[split]
+        # fetch the current schema for this split
+        cols = ds.column_names
+        # rename or drop lexicalized text column
         if 'txt_lex' in cols:
             if 'txt' not in cols:
-                cols = ds.column_names
                 ds = ds.rename_column('txt_lex', 'txt')
             else:
                 ds = ds.remove_columns('txt_lex')
+        # rename or drop lexicalized MR column
         if 'mr_lex' in cols:
             if 'mr' not in cols:
                 ds = ds.rename_column('mr_lex', 'mr')
