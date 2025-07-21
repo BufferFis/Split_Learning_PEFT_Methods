@@ -88,22 +88,37 @@ class HeadModel(nn.Module):
         self.wte = base_model.transformer.wte
         self.wpe = base_model.transformer.wpe
         self.drop = base_model.transformer.drop
-        # First 4 transformer blocks (0-3)
         self.h = nn.ModuleList([base_model.transformer.h[i] for i in range(4)])
         
     def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, **kwargs):
-        # Handle both input_ids and inputs_embeds cases
+        # Handle embeddings
         if inputs_embeds is not None:
-            # If inputs_embeds is provided, use it directly
             hidden_states = inputs_embeds
+            seq_length = inputs_embeds.size(1)
+            position_ids = torch.arange(0, seq_length, dtype=torch.long, device=inputs_embeds.device)
+            position_embeds = self.wpe(position_ids)
+            hidden_states = self.drop(hidden_states + position_embeds)
         elif input_ids is not None:
-            # Standard case: convert input_ids to embeddings
             inputs_embeds = self.wte(input_ids)
             position_ids = torch.arange(0, input_ids.size(-1), dtype=torch.long, device=input_ids.device)
             position_embeds = self.wpe(position_ids)
             hidden_states = self.drop(inputs_embeds + position_embeds)
         else:
             raise ValueError("You must specify either input_ids or inputs_embeds")
+        
+        # Fix attention mask dtype - CRITICAL FIX
+        if attention_mask is not None:
+            # Convert attention mask to proper dtype
+            if attention_mask.dtype == torch.long:
+                attention_mask = attention_mask.to(dtype=torch.float32)
+            
+            # Create 4D attention mask for transformer blocks
+            batch_size, seq_length = attention_mask.shape
+            # Convert to 4D: [batch_size, 1, 1, seq_length] 
+            attention_mask = attention_mask.view(batch_size, 1, 1, seq_length)
+            # Convert to float and apply mask values
+            attention_mask = attention_mask.to(dtype=hidden_states.dtype)
+            attention_mask = (1.0 - attention_mask) * torch.finfo(hidden_states.dtype).min
         
         # Pass through first 4 transformer blocks
         for block in self.h:
@@ -112,52 +127,46 @@ class HeadModel(nn.Module):
         return hidden_states, attention_mask
 
 
+
 class ServerModel(nn.Module):
     """Middle stage: transformer blocks 4-7"""
     def __init__(self, base_model):
         super().__init__()
-        # Middle 4 transformer blocks (4-7)
         self.h = nn.ModuleList([base_model.transformer.h[i] for i in range(4, 8)])
         
     def forward(self, hidden_states=None, attention_mask=None, inputs_embeds=None, **kwargs):
-        # Handle both hidden_states (from pipeline) and inputs_embeds (from PEFT)
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         elif hidden_states is None:
             raise ValueError("You must specify either hidden_states or inputs_embeds")
+        
+        # Fix attention mask dtype if needed
+        if attention_mask is not None and attention_mask.dtype == torch.long:
+            attention_mask = attention_mask.to(dtype=hidden_states.dtype)
             
-        # Pass through middle 4 transformer blocks
         for block in self.h:
             hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
             
         return hidden_states, attention_mask
 
-
 class TailModel(nn.Module):
     """Final stage: last 4 transformer blocks + LM head"""
     def __init__(self, base_model):
         super().__init__()
-        # Last 4 transformer blocks (8-11)
         self.h = nn.ModuleList([base_model.transformer.h[i] for i in range(8, 12)])
         self.ln_f = base_model.transformer.ln_f
         self.lm_head = base_model.lm_head
         
-        # Store references needed by PEFT
+        # Required attributes for PEFT
         self.config = base_model.config
         self.generation_config = getattr(base_model, 'generation_config', None)
-        self._base_model = base_model  # Keep reference to base model
+        self._base_model = base_model
         
     def prepare_inputs_for_generation(self, input_ids, **kwargs):
-        """Required for PEFT CAUSAL_LM compatibility"""
-        return {
-            "input_ids": input_ids,
-            "attention_mask": kwargs.get("attention_mask", None),
-            **kwargs
-        }
+        return {"input_ids": input_ids, "attention_mask": kwargs.get("attention_mask", None), **kwargs}
         
     def get_input_embeddings(self):
-        """Return the base model's input embeddings for PEFT compatibility"""
-        return self._base_model.transformer.wte  # Return actual embedding layer
+        return self._base_model.transformer.wte
         
     def get_output_embeddings(self):
         return self.lm_head
@@ -165,8 +174,16 @@ class TailModel(nn.Module):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
         
-    def forward(self, hidden_states, attention_mask=None, labels=None, **kwargs):
-        # Your existing forward method
+    def forward(self, hidden_states=None, attention_mask=None, labels=None, inputs_embeds=None, **kwargs):
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        elif hidden_states is None:
+            raise ValueError("You must specify either hidden_states or inputs_embeds")
+            
+        # Fix attention mask dtype if needed
+        if attention_mask is not None and attention_mask.dtype == torch.long:
+            attention_mask = attention_mask.to(dtype=hidden_states.dtype)
+        
         for block in self.h:
             hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
             
@@ -181,6 +198,7 @@ class TailModel(nn.Module):
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
             
         return {"loss": loss, "logits": lm_logits}
+
 
 
 
@@ -288,9 +306,18 @@ def setup_model_and_tokenizer(model_name):
 # --- 4. Apply DoRA PEFT to U-shaped model ---
 def apply_dora_peft(model):
     """Apply DoRA PEFT to each stage of the U-shaped model"""
+    
+    # Unload any existing PEFT adapters first
+    if hasattr(model.head, 'unload'):
+        model.head.unload()
+    if hasattr(model.server, 'unload'):
+        model.server.unload()
+    if hasattr(model.tail, 'unload'):
+        model.tail.unload()
+    
     # Configure PEFT for head
     head_peft_config = LoraConfig(
-        task_type=TaskType.FEATURE_EXTRACTION,
+        task_type=None,  # Use None to avoid inputs_embeds issues
         inference_mode=False,
         r=16,
         lora_alpha=32,
@@ -299,10 +326,10 @@ def apply_dora_peft(model):
         use_dora=True
     )
     model.head = get_peft_model(model.head, head_peft_config)
-
+    
     # Configure PEFT for server
     server_peft_config = LoraConfig(
-        task_type=TaskType.FEATURE_EXTRACTION,
+        task_type=None,  # Use None to avoid inputs_embeds issues
         inference_mode=False,
         r=16,
         lora_alpha=32,
@@ -311,7 +338,7 @@ def apply_dora_peft(model):
         use_dora=True
     )
     model.server = get_peft_model(model.server, server_peft_config)
-
+    
     # Configure PEFT for tail
     tail_peft_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
@@ -323,8 +350,9 @@ def apply_dora_peft(model):
         use_dora=True
     )
     model.tail = get_peft_model(model.tail, tail_peft_config)
-
+    
     return model
+
 
 # --- 5. Generation Function for Sanity Checks (modified) ---
 def generate_sanity_check(model, tokenizer, device, mr_string="name[NAME], eatType[restaurant], food[Italian]"):
