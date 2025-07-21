@@ -63,7 +63,8 @@ class SplitGPT2_UShape(nn.Module):
         return {'logits': logits}
 
     def generate(self, input_ids, attention_mask=None, **gen_kwargs):
-        full = GPT2LMHeadModel.from_pretrained("gpt2").to(self.lm_head.weight.device)
+        config = GPT2LMHeadModel.from_pretrained("gpt2").config
+        full = GPT2LMHeadModel(config=config).to(self.lm_head.weight.device)
         full.transformer.wte = self.wte
         full.transformer.wpe = self.wpe
         full.transformer.ln_f = self.ln_f
