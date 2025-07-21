@@ -20,7 +20,9 @@ class SmoothCELoss(nn.Module):
         self.eps = eps
     def forward(self, logits, labels):
         log_preds = torch.log_softmax(logits, dim=-1)
-        loss = -log_preds.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+        vocab_size = logits.size(-1)
+        safe_labels = labels.clamp(min=0, max=vocab_size - 1)
+        loss = -log_preds.gather(dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
         smooth_loss = -log_preds.mean(dim=-1)
         mask = labels != -100
         loss = loss * mask + smooth_loss * self.eps
@@ -112,6 +114,10 @@ def preprocess(batch, tokenizer):
         label_ids = [-100]*sep_idx + enc_input[sep_idx:]
         inputs.append(torch.tensor(enc_input))
         labels.append(torch.tensor(label_ids))
+        # Debugging: check for out-of-bound labels
+        for val in label_ids:
+            if val != -100 and (val < 0 or val >= tokenizer.vocab_size):
+                print("⚠️ Invalid label:", val, "vocab_size:", tokenizer.vocab_size)
     inputs = torch.nn.utils.rnn.pad_sequence(inputs, batch_first=True, padding_value=tokenizer.pad_token_id)
     labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100)
     return {"input_ids": inputs, "labels": labels}
