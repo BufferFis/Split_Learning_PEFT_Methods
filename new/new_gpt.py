@@ -92,8 +92,10 @@ def load_json_dataset(path):
         data = json.load(f)
     inputs, targets = [], []
     for ex in data:
-        mr = ex["mr"]["value"]
-        txts = [ex["txt"], ex.get("txt_lex", ex["txt"])]
+        mr = ex["mr"]["value"] if isinstance(ex["mr"], dict) else ex["mr"]
+        txts = [ex["txt"]]
+        if "txt_lex" in ex and ex["txt_lex"] != ex["txt"]:
+            txts.append(ex["txt_lex"])
         inputs.append(mr)
         targets.append(txts)
     return {"inputs": inputs, "targets": targets}
