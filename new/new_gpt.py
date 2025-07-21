@@ -68,7 +68,7 @@ class SplitGPT2_UShape(nn.Module):
 
         return {'logits': logits}
 
-    def generate(self, input_ids, **gen_kwargs):
+    def generate(self, input_ids, attention_mask=None, **gen_kwargs):
         full = GPT2LMHeadModel.from_pretrained("gpt2").cuda()
         full.transformer.wte = self.wte
         full.transformer.wpe = self.wpe
@@ -76,7 +76,7 @@ class SplitGPT2_UShape(nn.Module):
         full.transformer.h = nn.ModuleList(list(self.client_head) + list(self.server) + list(self.client_tail))
         full.lm_head = self.lm_head
         full.eval()
-        return full.generate(input_ids, **gen_kwargs)
+        return full.generate(input_ids=input_ids, attention_mask=attention_mask, **gen_kwargs)
 
 # ============ Dataset ============
 def linearize_mr_dict(mr_dict):
@@ -161,8 +161,10 @@ def evaluate(args):
     with open(pred_path, "w") as pf, open(ref_path, "w") as rf:
         for mr, refs in zip(val_data["inputs"], val_data["targets"]):
             mr_lin = linearize_mr_dict(mr)
-            input_ids = tokenizer(mr_lin + tokenizer.eos_token, return_tensors="pt").input_ids.cuda()
-            out_ids = model.generate(input_ids, max_new_tokens=60, num_beams=5, do_sample=True, top_k=50, top_p=0.95)[0]
+            input = tokenizer(mr_lin + tokenizer.eos_token, return_tensors="pt", padding=True)
+            input_ids = input["input_ids"].cuda()
+            attention_mask = input["attention_mask"].cuda()
+            out_ids = model.generate(input_ids, attention_mask=attention_mask, max_new_tokens=60, num_beams=5, do_sample=True, top_k=50, top_p=0.95, pad_token_id=tokenizer.eos_token_id)[0]
             pred = tokenizer.decode(out_ids, skip_special_tokens=True)
             pf.write(pred.strip() + "\n")
             rf.write("|||" + "|||".join(ref.strip() for ref in refs) + "\n")
