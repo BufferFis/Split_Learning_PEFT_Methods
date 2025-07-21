@@ -1,29 +1,23 @@
 import torch
 import pandas as pd
+import json
+import argparse
 from torch.utils.data import Dataset, DataLoader
 from transformers import GPT2Tokenizer, GPT2LMHeadModel, AdamW, get_linear_schedule_with_warmup
 from tqdm import tqdm
 import os
 
-# --- 1. Configuration ---
-MODEL_NAME = 'gpt2-medium'
-# Ensure these files are in the same directory as the script
-TRAIN_FILE = 'trainset.csv'
-DEV_FILE = 'devset.csv' 
-OUTPUT_DIR = './e2e_gpt2_medium_finetuned'
-NUM_EPOCHS = 3
-BATCH_SIZE = 4 # Adjust based on your GPU memory
-LEARNING_RATE = 3e-5
-MAX_LENGTH = 256 # Max sequence length for tokenizer
-
-# --- 2. Corrected Data Preparation Class ---
-# This class formats the data correctly for a causal LM, including loss masking.
-class E2EDataset(Dataset):
-    def __init__(self, csv_file, tokenizer, max_length):
-        self.data = pd.read_csv(csv_file)
+# --- 1. Data Preparation Class for JSON ---
+# This class loads data from the specified JSON format, linearizes the MR,
+# and prepares it for the causal language model with loss masking.
+class E2EJsonDataset(Dataset):
+    def __init__(self, json_file, tokenizer, max_length):
+        # Load data from the JSON file
+        with open(json_file, 'r', encoding='utf-8') as f:
+            self.data = json.load(f)
         self.tokenizer = tokenizer
         self.max_length = max_length
-        # Using special tokens to clearly separate MR from the reference text
+        # Special tokens to separate MR from the reference text
         self.mr_start_token = '<MR>'
         self.ref_start_token = '<REF>'
 
@@ -31,11 +25,23 @@ class E2EDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        row = self.data.iloc[idx]
-        mr = row['mr']
-        ref = row['ref']
+        item = self.data[idx]
+        
+        # --- The Core Change: Processing JSON MR ---
+        # Linearize the MR from the dictionary format into a string
+        # e.g., {"name": "The Eagle"} -> "name[The Eagle]"
+        mr_dict = item['mr']['value']
+        mr_parts = []
+        for key, value in mr_dict.items():
+            # Only include fields that have a value
+            if value and str(value).strip():
+                mr_parts.append(f"{key}[{value}]")
+        mr = ", ".join(mr_parts)
 
-        # The core fix: Combine MR and REF into a single sequence for the causal LM
+        # The reference text is in the 'txt' field
+        ref = item['txt']
+
+        # Combine MR and REF into a single sequence for the causal LM
         # Format: <MR> MR_TEXT <REF> REF_TEXT <|endoftext|>
         formatted_text = (f"{self.mr_start_token} {mr} "
                           f"{self.ref_start_token} {ref} "
@@ -54,19 +60,16 @@ class E2EDataset(Dataset):
         labels = input_ids.clone()
         
         # Find the start of the reference text to apply the loss mask
-        # We use the tokenized version of the ref_start_token to find its ID
         ref_start_token_id = self.tokenizer.convert_tokens_to_ids(self.ref_start_token)
-        
-        # Find all occurrences of the ref_start_token_id
         ref_start_indices = (labels == ref_start_token_id).nonzero(as_tuple=True)[0]
 
         if len(ref_start_indices) > 0:
-            # The crucial step: Mask out the MR part by setting its labels to -100
+            # Mask out the MR part by setting its labels to -100
             # The loss will only be calculated on the reference text.
             mask_end_index = ref_start_indices[0]
             labels[:mask_end_index] = -100
         else:
-            # If the ref start token is not found (e.g., due to truncation), mask everything
+            # If the ref start token is not found, mask everything
             labels[:] = -100
 
         return {
@@ -75,12 +78,12 @@ class E2EDataset(Dataset):
             "labels": labels
         }
 
-# --- 3. Model and Tokenizer Setup with Special Tokens ---
-def setup_model_and_tokenizer():
-    tokenizer = GPT2Tokenizer.from_pretrained(MODEL_NAME)
-    model = GPT2LMHeadModel.from_pretrained(MODEL_NAME)
+# --- 2. Model and Tokenizer Setup ---
+def setup_model_and_tokenizer(model_name):
+    tokenizer = GPT2Tokenizer.from_pretrained(model_name)
+    model = GPT2LMHeadModel.from_pretrained(model_name)
 
-    # Define and add special tokens. This is critical for the model to understand structure.
+    # Add special tokens for structuring the input
     special_tokens_dict = {
         'bos_token': '<|endoftext|>',
         'eos_token': '<|endoftext|>',
@@ -95,71 +98,58 @@ def setup_model_and_tokenizer():
     
     return model, tokenizer
 
-# --- 4. Robust Generation Function for Sanity Checks ---
-# This function uses advanced decoding to prevent repetitive and nonsensical output.
+# --- 3. Generation Function for Sanity Checks ---
 def generate_sanity_check(model, tokenizer, device, mr_string="name[NAME], eatType[restaurant], food[Italian]"):
-    model.eval() # Set model to evaluation mode for inference
+    model.eval()
     mr_start_token = '<MR>'
     ref_start_token = '<REF>'
     prompt = f"{mr_start_token} {mr_string} {ref_start_token}"
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
-    # The fix for generation: Use sampling and penalties instead of greedy search
     generation_config = {
-        "max_new_tokens": 100,          # Limit the length of the generated text
-        "do_sample": True,              # Enable stochastic sampling
-        "temperature": 0.7,             # Sharpen the distribution to reduce randomness
-        "top_p": 0.92,                  # Use nucleus sampling for dynamic vocabulary
-        "top_k": 50,                    # Can be used alongside top_p
-        "repetition_penalty": 1.2,      # Penalize words that have already been said
-        "no_repeat_ngram_size": 2,      # Prevent 2-grams from repeating
-        "pad_token_id": tokenizer.eos_token_id, # Important for clean generation
+        "max_new_tokens": 100, "do_sample": True, "temperature": 0.7,
+        "top_p": 0.92, "top_k": 50, "repetition_penalty": 1.2,
+        "no_repeat_ngram_size": 2, "pad_token_id": tokenizer.eos_token_id,
         "eos_token_id": tokenizer.eos_token_id
     }
 
     with torch.no_grad():
-        # Generate returns a tensor of shape (batch_size, sequence_length)
         output_sequences = model.generate(
             input_ids=inputs['input_ids'], 
             attention_mask=inputs['attention_mask'], 
             **generation_config
         )
     
-    # Decode the first sequence in the batch
     generated_text = tokenizer.decode(output_sequences[0], skip_special_tokens=True)
     
-    # Clean up the output to only show the generated part after the <REF> token
     try:
-        # Split the text at the reference token and take the last part
         cleaned_text = generated_text.split(ref_start_token)[-1].strip()
     except IndexError:
-        # Fallback if the ref_start_token is not in the generated text
         cleaned_text = generated_text 
 
     print("\n=== Sanity Generation ===")
     print(f"Sanity MR: {mr_string}")
     print(f"Sanity PRED: {cleaned_text}\n")
-    model.train() # Set model back to training mode
+    model.train()
 
-# --- 5. Main Training Function ---
-def main():
+# --- 4. Main Training Function ---
+def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    model, tokenizer = setup_model_and_tokenizer()
+    model, tokenizer = setup_model_and_tokenizer(args.model_name)
     model.to(device)
 
-    train_dataset = E2EDataset(csv_file=TRAIN_FILE, tokenizer=tokenizer, max_length=MAX_LENGTH)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    train_dataset = E2EJsonDataset(json_file=args.train_file, tokenizer=tokenizer, max_length=args.max_length)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
 
-    # The fix for training stability: AdamW optimizer and a learning rate scheduler
-    optimizer = AdamW(model.parameters(), lr=LEARNING_RATE)
-    total_steps = len(train_loader) * NUM_EPOCHS
+    optimizer = AdamW(model.parameters(), lr=args.learning_rate)
+    total_steps = len(train_loader) * args.num_epochs
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0.1 * total_steps, num_training_steps=total_steps)
 
     model.train()
-    for epoch in range(NUM_EPOCHS):
-        print(f"--- Epoch {epoch+1}/{NUM_EPOCHS} ---")
+    for epoch in range(args.num_epochs):
+        print(f"--- Epoch {epoch+1}/{args.num_epochs} ---")
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
         for i, batch in enumerate(progress_bar):
             input_ids = batch['input_ids'].to(device)
@@ -170,27 +160,42 @@ def main():
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
             loss = outputs.loss
             
-            # Standard backpropagation
             loss.backward()
             optimizer.step()
             scheduler.step()
 
             progress_bar.set_postfix({'loss': loss.item()})
             
-            # Perform a sanity check every 500 steps
-            if (i + 1) % 500 == 0:
+            if (i + 1) % args.sanity_check_steps == 0:
                 generate_sanity_check(model, tokenizer, device)
 
-    # Save the final fine-tuned model and tokenizer
-    if not os.path.exists(OUTPUT_DIR):
-        os.makedirs(OUTPUT_DIR)
-    model.save_pretrained(OUTPUT_DIR)
-    tokenizer.save_pretrained(OUTPUT_DIR)
-    print(f"\nTraining complete. Model saved to {OUTPUT_DIR}")
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
+    model.save_pretrained(args.output_dir)
+    tokenizer.save_pretrained(args.output_dir)
+    print(f"\nTraining complete. Model saved to {args.output_dir}")
 
+# --- 5. Entry Point and Argument Parsing ---
 if __name__ == '__main__':
-    # Make sure you have trainset.csv and devset.csv in the same folder as this script
-    if not os.path.exists(TRAIN_FILE) or not os.path.exists(DEV_FILE):
-        print(f"Error: Make sure '{TRAIN_FILE}' and '{DEV_FILE}' are present in the current directory.")
+    parser = argparse.ArgumentParser(description="Fine-tune a GPT-2 model on E2E NLG from JSON data.")
+    
+    # File paths
+    parser.add_argument("--train_file", type=str, required=True, help="Path to the training JSON file.")
+    parser.add_argument("--dev_file", type=str, required=True, help="Path to the validation JSON file.")
+    parser.add_argument("--output_dir", type=str, default="./e2e_gpt2_json_finetuned", help="Directory to save the fine-tuned model.")
+    
+    # Model and training hyperparameters
+    parser.add_argument("--model_name", type=str, default="gpt2-medium", help="Name of the pre-trained model to use.")
+    parser.add_argument("--num_epochs", type=int, default=3, help="Number of training epochs.")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size for training.")
+    parser.add_argument("--learning_rate", type=float, default=3e-5, help="Learning rate for the optimizer.")
+    parser.add_argument("--max_length", type=int, default=256, help="Maximum sequence length for the tokenizer.")
+    parser.add_argument("--sanity_check_steps", type=int, default=500, help="Perform a sanity check every N steps.")
+
+    args = parser.parse_args()
+    
+    # Check if data files exist
+    if not os.path.exists(args.train_file) or not os.path.exists(args.dev_file):
+        print(f"Error: Make sure '{args.train_file}' and '{args.dev_file}' are present.")
     else:
-        main()
+        main(args)
