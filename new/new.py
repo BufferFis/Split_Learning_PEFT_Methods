@@ -333,12 +333,15 @@ def prepare_data(data_dir):
         print("="*80)
         exit(1)
 
-    # Load data directly from JSON files using the datasets library
     raw_datasets = load_dataset('json', data_files={'train': train_file, 'validation': valid_file, 'test': test_file})
-    
-    print("\n--- Raw Datasets Info ---")
-    print(raw_datasets)
-    return raw_datasets
+
+    # If you're using the lexicalized-only JSON (txt_lex / mr_lex), rename them
+    for split in raw_datasets:
+        cols = raw_datasets[split].column_names
+        if 'txt_lex' in cols:
+            raw_datasets[split] = raw_datasets[split].rename_column('txt_lex', 'txt')
+        if 'mr_lex' in cols:
+            raw_datasets[split] = raw_datasets[split].rename_column('mr_lex', 'mr')
 
 def preprocess_function(examples, tokenizer, max_length):
     """COMPLETELY FIXED: Removes HTML encoding and improves label handling"""
@@ -346,10 +349,11 @@ def preprocess_function(examples, tokenizer, max_length):
     
     # CRITICAL FIX: Use simple, unencoded delimiter
     DELIMITER = " = "  
-    
-    for i in range(len(examples['mr'])):
-        mr_str = linearize_mr(examples['mr'][i])
-        target_text = str(examples['txt'][i])
+    mrs = examples.get('mr', [''] * len(examples.get('txt', [])))
+    txts = examples.get('txt', [])
+    for mr_obj, target_text in zip(mrs, txts):
+        mr_str = linearize_mr(mr_obj)
+        target_text = str(target_text)
         
         # Create input and full sequences
         input_str = f"{mr_str}{DELIMITER}"
