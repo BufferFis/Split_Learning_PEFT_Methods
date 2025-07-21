@@ -140,14 +140,16 @@ def train(args):
             if step % 100 == 0:
                 print(f"Epoch {epoch} Step {step} Loss: {loss.item():.4f}")
             if step % 500 == 0:
-                # ============ Sanity Check Generation ============
                 model.eval()
-                sample_input = linearize_mr_dict(raw_data['inputs'][0]) + tokenizer.eos_token
-                input_tensor = tokenizer(sample_input, return_tensors="pt").to(model.lm_head.weight.device)
-                gen_ids = model.generate(input_tensor['input_ids'], attention_mask=input_tensor['attention_mask'],
-                                         max_new_tokens=60, num_beams=5, do_sample=True, top_k=50, top_p=0.95)[0]
-                print("Sanity MR:", sample_input)
-                print("Sanity PRED:", tokenizer.decode(gen_ids[input_tensor['input_ids'].shape[1]:], skip_special_tokens=True))
+                print("\n=== Sanity Generation ===")
+                for _ in range(3):
+                    rand_idx = random.randint(0, len(raw_data['inputs']) - 1)
+                    sample_input = linearize_mr_dict(raw_data['inputs'][rand_idx]) + tokenizer.eos_token
+                    input_tensor = tokenizer(sample_input, return_tensors="pt").to(model.lm_head.weight.device)
+                    gen_ids = model.generate(input_tensor['input_ids'], attention_mask=input_tensor['attention_mask'],
+                                             max_new_tokens=60, num_beams=5, do_sample=True, top_k=50, top_p=0.95)[0]
+                    print("Sanity MR:", sample_input)
+                    print("Sanity PRED:", tokenizer.decode(gen_ids[input_tensor['input_ids'].shape[1]:], skip_special_tokens=True))
                 model.train()
     torch.save(model.state_dict(), args.save_path)
 
@@ -172,7 +174,7 @@ def evaluate(args):
             input_ids = input["input_ids"].cuda()
             attention_mask = input["attention_mask"].cuda()
             out_ids = model.generate(input_ids, attention_mask=attention_mask, max_new_tokens=60, num_beams=5, do_sample=True, top_k=50, top_p=0.95, pad_token_id=tokenizer.eos_token_id)[0]
-            generated = out_ids[input_ids.shape[1]:]  # Remove prompt
+            generated = out_ids[input_ids.shape[1]:]
             pred = tokenizer.decode(generated, skip_special_tokens=True)
             pf.write(pred.strip() + "\n")
             rf.write("|||" + "|||".join(ref.strip() for ref in refs) + "\n")
