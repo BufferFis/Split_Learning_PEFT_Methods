@@ -159,7 +159,7 @@ def evaluate(args):
     ref_path = os.path.join(out_dir, "valid.refs.txt")
 
     with open(pred_path, "w") as pf, open(ref_path, "w") as rf:
-        for mr, refs in zip(val_data["inputs"], val_data["targets"]):
+        for idx, (mr, refs) in enumerate(zip(val_data["inputs"], val_data["targets"])):
             mr_lin = linearize_mr_dict(mr)
             input = tokenizer(mr_lin + tokenizer.eos_token, return_tensors="pt", padding=True)
             input_ids = input["input_ids"].cuda()
@@ -168,6 +168,11 @@ def evaluate(args):
             pred = tokenizer.decode(out_ids, skip_special_tokens=True)
             pf.write(pred.strip() + "\n")
             rf.write("|||" + "|||".join(ref.strip() for ref in refs) + "\n")
+            if idx % 100 == 0:
+                print(f"Decoded {idx} samples...")
+                print("MR:", mr_lin)
+                print("PRED:", pred)
+                print("REF:", refs[0])
 
     print("Running official evaluation script...")
     subprocess.run(["python", args.eval_script, "-p", pred_path, "-r", ref_path, "-o", out_dir])
