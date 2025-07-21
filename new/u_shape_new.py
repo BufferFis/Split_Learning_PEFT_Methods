@@ -90,19 +90,27 @@ class HeadModel(nn.Module):
         self.drop = base_model.transformer.drop
         # First 4 transformer blocks (0-3)
         self.h = nn.ModuleList([base_model.transformer.h[i] for i in range(4)])
-
-    def forward(self, input_ids, attention_mask=None):
-        # Token embeddings + position embeddings
-        inputs_embeds = self.wte(input_ids)
-        position_ids = torch.arange(0, input_ids.size(-1), dtype=torch.long, device=input_ids.device)
-        position_embeds = self.wpe(position_ids)
-        hidden_states = self.drop(inputs_embeds + position_embeds)
-
+        
+    def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, **kwargs):
+        # Handle both input_ids and inputs_embeds cases
+        if inputs_embeds is not None:
+            # If inputs_embeds is provided, use it directly
+            hidden_states = inputs_embeds
+        elif input_ids is not None:
+            # Standard case: convert input_ids to embeddings
+            inputs_embeds = self.wte(input_ids)
+            position_ids = torch.arange(0, input_ids.size(-1), dtype=torch.long, device=input_ids.device)
+            position_embeds = self.wpe(position_ids)
+            hidden_states = self.drop(inputs_embeds + position_embeds)
+        else:
+            raise ValueError("You must specify either input_ids or inputs_embeds")
+        
         # Pass through first 4 transformer blocks
         for block in self.h:
             hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
-
+            
         return hidden_states, attention_mask
+
 
 class ServerModel(nn.Module):
     """Middle stage: transformer blocks 4-7"""
@@ -110,13 +118,20 @@ class ServerModel(nn.Module):
         super().__init__()
         # Middle 4 transformer blocks (4-7)
         self.h = nn.ModuleList([base_model.transformer.h[i] for i in range(4, 8)])
-
-    def forward(self, hidden_states, attention_mask=None):
+        
+    def forward(self, hidden_states=None, attention_mask=None, inputs_embeds=None, **kwargs):
+        # Handle both hidden_states (from pipeline) and inputs_embeds (from PEFT)
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        elif hidden_states is None:
+            raise ValueError("You must specify either hidden_states or inputs_embeds")
+            
         # Pass through middle 4 transformer blocks
         for block in self.h:
             hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
-
+            
         return hidden_states, attention_mask
+
 
 class TailModel(nn.Module):
     """Final stage: last 4 transformer blocks + LM head"""
