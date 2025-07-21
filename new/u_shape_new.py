@@ -177,7 +177,11 @@ class TailModel(nn.Module):
         self._base_model = base_model
         
     def prepare_inputs_for_generation(self, input_ids, **kwargs):
-        return {"input_ids": input_ids, "attention_mask": kwargs.get("attention_mask", None), **kwargs}
+        return {
+            "input_ids": input_ids, 
+            "attention_mask": kwargs.get("attention_mask", None), 
+            **kwargs
+        }
         
     def get_input_embeddings(self):
         return self._base_model.transformer.wte
@@ -189,6 +193,7 @@ class TailModel(nn.Module):
         self.lm_head = new_embeddings
         
     def forward(self, hidden_states=None, attention_mask=None, labels=None, inputs_embeds=None, **kwargs):
+        # Handle both hidden_states and inputs_embeds
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         elif hidden_states is None:
@@ -196,24 +201,20 @@ class TailModel(nn.Module):
             
         print(f"TailModel input shape: {hidden_states.shape}")
         
-        # Verify dimensions before entering transformer blocks
+        # Verify dimensions
         if hidden_states.size(-1) != self.config.hidden_size:
             raise ValueError(f"TailModel: Hidden states dimension {hidden_states.size(-1)} "
                            f"doesn't match expected {self.config.hidden_size}")
         
+        # Process through transformer blocks
         for i, block in enumerate(self.h):
-            print(f"TailModel block {i} input shape: {hidden_states.shape}")
-            try:
-                hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
-                print(f"TailModel block {i} output shape: {hidden_states.shape}")
-            except RuntimeError as e:
-                print(f"Error in TailModel block {i}: {e}")
-                print(f"Block config: {block}")
-                raise e
+            hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
         
+        # Final layer norm and output
         hidden_states = self.ln_f(hidden_states)
         lm_logits = self.lm_head(hidden_states)
         
+        # Calculate loss if labels provided
         loss = None
         if labels is not None:
             shift_logits = lm_logits[..., :-1, :].contiguous()
@@ -228,20 +229,30 @@ class UShaped_GPT2_Model(nn.Module):
     """Complete U-shaped model pipeline"""
     def __init__(self, base_model):
         super().__init__()
+        self.config = base_model.config
         self.head = HeadModel(base_model)
         self.server = ServerModel(base_model)
         self.tail = TailModel(base_model)
-
+        
     def forward(self, input_ids, attention_mask=None, labels=None):
+        print(f"Input shape: {input_ids.shape}")
+        
         # Stage 1: Head processing
         hidden_states, attention_mask = self.head(input_ids, attention_mask)
-
+        print(f"After head: {hidden_states.shape}")
+        
         # Stage 2: Server processing  
         hidden_states, attention_mask = self.server(hidden_states, attention_mask)
-
-        # Stage 3: Tail processing with loss calculation
-        output = self.tail(hidden_states, attention_mask, labels)
-
+        print(f"After server: {hidden_states.shape}")
+        
+        # Stage 3: Tail processing - FIX: Use keyword arguments
+        output = self.tail(
+            hidden_states=hidden_states, 
+            attention_mask=attention_mask, 
+            labels=labels
+        )
+        print(f"After tail: output logits shape: {output['logits'].shape}")
+        
         return output
 
     def generate(self, input_ids, attention_mask=None, **kwargs):
