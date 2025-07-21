@@ -935,113 +935,113 @@ class SplitLoRATrainer:
     from torch.cuda.amp import autocast, GradScaler
 from torch.cuda.amp import autocast, GradScaler
 
-def train_with_coverage(self, train_dataloader, epochs=1):
-    """Enhanced training with coverage monitoring + AMP + memory optimization."""
-    # Initialize GradScaler for AMP
-    scaler = GradScaler()
+    def train_with_coverage(self, train_dataloader, epochs=1):
+        """Enhanced training with coverage monitoring + AMP + memory optimization."""
+        # Initialize GradScaler for AMP
+        scaler = GradScaler()
 
-    print(f"Starting AMP-enabled training for {epochs} epoch(s)...")
-    for epoch in range(epochs):
-        total_loss = 0.0
-        num_batches = 0
+        print(f"Starting AMP-enabled training for {epochs} epoch(s)...")
+        for epoch in range(epochs):
+            total_loss = 0.0
+            num_batches = 0
 
-        for batch_idx, batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{epochs}")):
-            # Periodically clear CUDA cache to reduce fragmentation
-            if batch_idx % 100 == 0:
-                torch.cuda.empty_cache()
+            for batch_idx, batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{epochs}")):
+                # Periodically clear CUDA cache to reduce fragmentation
+                if batch_idx % 100 == 0:
+                    torch.cuda.empty_cache()
 
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device).bool()
-            labels = batch["labels"].to(device)
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device).bool()
+                labels = batch["labels"].to(device)
 
-            # Extract MR texts for coverage penalty
-            mr_texts = []
-            for seq in input_ids:
-                # find delimiter index
-                delim_pos = None
-                for i in range(seq.size(0) - len(self.DELIM_TOKENS) + 1):
-                    if seq[i : i + len(self.DELIM_TOKENS)].tolist() == self.DELIM_TOKENS:
-                        delim_pos = i + len(self.DELIM_TOKENS)
-                        break
-                mr_texts.append(
-                    self.tokenizer.decode(seq[: delim_pos], skip_special_tokens=True)
-                    if delim_pos is not None
-                    else ""
-                )
+                # Extract MR texts for coverage penalty
+                mr_texts = []
+                for seq in input_ids:
+                    # find delimiter index
+                    delim_pos = None
+                    for i in range(seq.size(0) - len(self.DELIM_TOKENS) + 1):
+                        if seq[i : i + len(self.DELIM_TOKENS)].tolist() == self.DELIM_TOKENS:
+                            delim_pos = i + len(self.DELIM_TOKENS)
+                            break
+                    mr_texts.append(
+                        self.tokenizer.decode(seq[: delim_pos], skip_special_tokens=True)
+                        if delim_pos is not None
+                        else ""
+                    )
 
-            # AMP‐enabled forward/backward
-            with autocast(dtype=torch.float16):
-                # 1) Head forward (no cache)
-                head_out = self.head_client.forward(
-                    input_ids, attention_mask=attention_mask, use_cache=False
-                )
-                h_states = head_out.last_hidden_state
+                # AMP‐enabled forward/backward
+                with autocast(dtype=torch.float16):
+                    # 1) Head forward (no cache)
+                    head_out = self.head_client.forward(
+                        input_ids, attention_mask=attention_mask, use_cache=False
+                    )
+                    h_states = head_out.last_hidden_state
 
-                # 2) Body forward (no cache)
-                body_out, _ = self.server.forward_train(
-                    h_states, attention_mask=attention_mask, past_key_values=None
-                )
-                b_states = body_out.last_hidden_state
+                    # 2) Body forward (no cache)
+                    body_out, _ = self.server.forward_train(
+                        h_states, attention_mask=attention_mask, past_key_values=None
+                    )
+                    b_states = body_out.last_hidden_state
 
-                # 3) Tail forward & compute loss
-                logits = self.tail_client.tail_model(
-                    inputs_embeds=b_states,
-                    attention_mask=attention_mask,
-                    past_key_values=None,
-                ).logits
+                    # 3) Tail forward & compute loss
+                    logits = self.tail_client.tail_model(
+                        inputs_embeds=b_states,
+                        attention_mask=attention_mask,
+                        past_key_values=None,
+                    ).logits
 
-                # shift for CE
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
-                shift_labels[shift_labels == -100] = self.tail_client.loss_fn.ignore_index
-                base_loss = self.tail_client.loss_fn(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_labels.view(-1),
-                )
+                    # shift for CE
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., 1:].contiguous()
+                    shift_labels[shift_labels == -100] = self.tail_client.loss_fn.ignore_index
+                    base_loss = self.tail_client.loss_fn(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1),
+                    )
 
-                # coverage penalty
-                penalty = 0.0
-                for i, mr in enumerate(mr_texts):
-                    pred_ids = torch.argmax(shift_logits[i], dim=-1)
-                    pred_txt = self.tokenizer.decode(pred_ids, skip_special_tokens=True)
-                    cov = self.tail_client.validate_coverage(mr, pred_txt)
-                    penalty += (1.0 - cov["coverage_ratio"]) * 0.2
-                loss = base_loss + penalty / max(len(mr_texts), 1)
+                    # coverage penalty
+                    penalty = 0.0
+                    for i, mr in enumerate(mr_texts):
+                        pred_ids = torch.argmax(shift_logits[i], dim=-1)
+                        pred_txt = self.tokenizer.decode(pred_ids, skip_special_tokens=True)
+                        cov = self.tail_client.validate_coverage(mr, pred_txt)
+                        penalty += (1.0 - cov["coverage_ratio"]) * 0.2
+                    loss = base_loss + penalty / max(len(mr_texts), 1)
 
-            # 4) backward with scaler
-            scaler.scale(loss).backward(retain_graph=True)
+                # 4) backward with scaler
+                scaler.scale(loss).backward(retain_graph=True)
 
-            # 5) retrieve body grads and propagate
-            body_grad = b_states.grad.clone() if b_states.grad is not None else torch.zeros_like(b_states)
-            head_grad = self.server.backward(b_states, body_grad, h_states)
-            self.head_client.backward(h_states, head_grad)
+                # 5) retrieve body grads and propagate
+                body_grad = b_states.grad.clone() if b_states.grad is not None else torch.zeros_like(b_states)
+                head_grad = self.server.backward(b_states, body_grad, h_states)
+                self.head_client.backward(h_states, head_grad)
 
-            # 6) unscale & clip
-            for opt in (self.head_client.optimizer, self.server.optimizer, self.tail_client.optimizer):
-                scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(self.head_client.head_model.parameters(), 1.0)
-            torch.nn.utils.clip_grad_norm_(self.server.body_model.parameters(), 1.0)
-            torch.nn.utils.clip_grad_norm_(self.tail_client.tail_model.parameters(), 1.0)
+                # 6) unscale & clip
+                for opt in (self.head_client.optimizer, self.server.optimizer, self.tail_client.optimizer):
+                    scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(self.head_client.head_model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(self.server.body_model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(self.tail_client.tail_model.parameters(), 1.0)
 
-            # 7) optimizer steps & scaler update
-            scaler.step(self.head_client.optimizer)
-            scaler.step(self.server.optimizer)
-            scaler.step(self.tail_client.optimizer)
-            scaler.update()
+                # 7) optimizer steps & scaler update
+                scaler.step(self.head_client.optimizer)
+                scaler.step(self.server.optimizer)
+                scaler.step(self.tail_client.optimizer)
+                scaler.update()
 
-            # 8) scheduler step
-            for sched in self.schedulers:
-                sched.step()
+                # 8) scheduler step
+                for sched in self.schedulers:
+                    sched.step()
 
-            total_loss += loss.item()
-            num_batches += 1
+                total_loss += loss.item()
+                num_batches += 1
 
-            if batch_idx % 50 == 0:
-                print(f"Batch {batch_idx}, Loss: {loss.item():.4f}")
+                if batch_idx % 50 == 0:
+                    print(f"Batch {batch_idx}, Loss: {loss.item():.4f}")
 
-        avg = total_loss / max(num_batches, 1)
-        self.metrics["loss"].append(avg)
-        print(f"Epoch {epoch+1} average loss: {avg:.4f}")
+            avg = total_loss / max(num_batches, 1)
+            self.metrics["loss"].append(avg)
+            print(f"Epoch {epoch+1} average loss: {avg:.4f}")
 
 
 
