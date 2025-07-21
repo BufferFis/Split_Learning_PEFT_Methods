@@ -349,10 +349,11 @@ def preprocess_function(examples, tokenizer, max_length):
     
     # CRITICAL FIX: Use simple, unencoded delimiter
     DELIMITER = " = "  
-    
-    for i in range(len(examples['mr'])):
-        mr_str = linearize_mr(examples['mr'][i])
-        target_text = str(examples['txt'][i])
+    mrs = examples.get('mr', [''] * len(examples.get('txt', [])))
+    txts = examples.get('txt', [])
+    for mr_obj, target_text in zip(mrs, txts):
+        mr_str = linearize_mr(mr_obj)
+        target_text = str(target_text)
         
         # Create input and full sequences
         input_str = f"{mr_str}{DELIMITER}"
