@@ -71,7 +71,18 @@ class SplitGPT2_UShape(nn.Module):
         full.transformer.h = nn.ModuleList(list(self.client_head) + list(self.server) + list(self.client_tail))
         full.lm_head = self.lm_head
         full.eval()
-        return full.generate(input_ids=input_ids, attention_mask=attention_mask, repetition_penalty=1.2, **gen_kwargs)
+        return full.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=60,
+            do_sample=True,
+            top_k=30,
+            top_p=0.85,
+            temperature=0.7,
+            repetition_penalty=1.5,
+            pad_token_id=self.tokenizer.eos_token_id,
+            **gen_kwargs
+        )
 
 # ============ Dataset ============
 def linearize_mr_dict(mr_dict):
@@ -103,7 +114,7 @@ def preprocess(batch, tokenizer):
         mr_lin = linearize_mr_dict(mr)
         prompt = mr_lin + tokenizer.eos_token
         full_text = prompt + target + tokenizer.eos_token
-        enc_input = tokenizer(full_text, add_special_tokens=False, truncation=True, padding=False)['input_ids']
+        enc_input = tokenizer(full_text, add_special_tokens=False, truncation=False, padding=False)['input_ids']
         sep_len = len(tokenizer(prompt, add_special_tokens=False)['input_ids'])
         label_ids = [-100]*sep_len + enc_input[sep_len:]
         inputs.append(torch.tensor(enc_input))
@@ -122,7 +133,7 @@ def train(args):
     dataset = list(zip(processed['input_ids'], processed['labels']))
     loader = DataLoader(dataset, batch_size=8)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
     total_steps = len(loader) * 4
     scheduler = get_linear_schedule_with_warmup(optimizer, 500, total_steps)
 
@@ -144,8 +155,10 @@ def train(args):
                     rand_idx = random.randint(0, len(raw_data['inputs']) - 1)
                     sample_input = linearize_mr_dict(raw_data['inputs'][rand_idx]) + tokenizer.eos_token
                     input_tensor = tokenizer(sample_input, return_tensors="pt").to(model.lm_head.weight.device)
-                    gen_ids = model.generate(input_tensor['input_ids'], attention_mask=input_tensor['attention_mask'],
-                                             max_new_tokens=60, num_beams=5, do_sample=True, top_k=50, top_p=0.95)[0]
+                    gen_ids = model.generate(
+                        input_tensor['input_ids'],
+                        attention_mask=input_tensor['attention_mask']
+                    )[0]
                     print("Sanity MR:", sample_input)
                     print("Sanity PRED:", tokenizer.decode(gen_ids[input_tensor['input_ids'].shape[1]:], skip_special_tokens=True))
                 model.train()
@@ -171,7 +184,10 @@ def evaluate(args):
             input = tokenizer(mr_lin + tokenizer.eos_token, return_tensors="pt", padding=True)
             input_ids = input["input_ids"].cuda()
             attention_mask = input["attention_mask"].cuda()
-            out_ids = model.generate(input_ids, attention_mask=attention_mask, max_new_tokens=60, num_beams=5, do_sample=True, top_k=50, top_p=0.95, pad_token_id=tokenizer.eos_token_id)[0]
+            out_ids = model.generate(
+                input_ids,
+                attention_mask=attention_mask
+            )[0]
             generated = out_ids[input_ids.shape[1]:]
             pred = tokenizer.decode(generated, skip_special_tokens=True)
             pf.write(pred.strip() + "\n")
