@@ -91,15 +91,15 @@ def preprocess(batch, tokenizer):
         target = random.choice(targets).strip()
         mr_lin = linearize_mr_dict(mr)
         prompt = mr_lin + tokenizer.eos_token + target + tokenizer.eos_token
-        enc = tokenizer(prompt, add_special_tokens=False)
-        input_ids = enc['input_ids']
+        enc_input = tokenizer(prompt, add_special_tokens=False, truncation=True, padding=False)['input_ids']
         eos = tokenizer.eos_token_id
-        sep_idx = input_ids.index(eos) + 1 if eos in input_ids else len(input_ids)
-        label_ids = [-100]*sep_idx + input_ids[sep_idx:]
-        inputs.append(input_ids)
-        labels.append(label_ids)
-    enc = tokenizer.pad({"input_ids": inputs, "labels": labels}, padding=True, return_tensors="pt")
-    return enc
+        sep_idx = enc_input.index(eos) + 1 if eos in enc_input else len(enc_input)
+        label_ids = [-100]*sep_idx + enc_input[sep_idx:]
+        inputs.append(torch.tensor(enc_input))
+        labels.append(torch.tensor(label_ids))
+    inputs = torch.nn.utils.rnn.pad_sequence(inputs, batch_first=True, padding_value=tokenizer.pad_token_id)
+    labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100)
+    return {"input_ids": inputs, "labels": labels}
 
 # ============ Train ============
 def train(args):
@@ -108,12 +108,13 @@ def train(args):
     tokenizer = model.tokenizer
     raw_data = load_json_dataset(args.train_path)
     processed = preprocess(raw_data, tokenizer)
-    loader = DataLoader([{k: v[i:i+1] for k,v in processed.items()} for i in range(len(processed['input_ids']))], batch_size=8)
+    dataset = list(zip(processed['input_ids'], processed['labels']))
+    loader = DataLoader(dataset, batch_size=8)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
     model.train()
     for epoch in range(3):
-        for step, batch in enumerate(loader):
-            for k in batch: batch[k] = batch[k].cuda()
+        for step, (input_ids, labels) in enumerate(loader):
+            batch = {"input_ids": input_ids.cuda(), "labels": labels.cuda()}
             out = model(**batch)
             out['loss'].backward()
             optimizer.step(); optimizer.zero_grad()
