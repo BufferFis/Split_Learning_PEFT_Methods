@@ -15,7 +15,7 @@ import subprocess
 
 # ============ SmoothCrossEntropyLoss ============
 class SmoothCELoss(nn.Module):
-    def __init__(self, eps=0.05):
+    def __init__(self, eps=0.1):
         super().__init__()
         self.eps = eps
     def forward(self, logits, labels):
@@ -39,8 +39,8 @@ class SplitGPT2_UShape(nn.Module):
 
         for block in full_model.transformer.h:
             if hasattr(block.attn, 'k_proj') and hasattr(block.attn, 'v_proj'):
-                block.attn.k_proj.dropout = nn.Dropout(0.05)
-                block.attn.v_proj.dropout = nn.Dropout(0.05)
+                block.attn.k_proj.dropout = nn.Dropout(0.2)
+                block.attn.v_proj.dropout = nn.Dropout(0.2)
 
         self.client_head = nn.Sequential(*full_model.transformer.h[:4])
         self.server = nn.Sequential(*full_model.transformer.h[4:8])
@@ -69,18 +69,14 @@ class SplitGPT2_UShape(nn.Module):
         return {'logits': logits}
 
     def generate(self, input_ids, **gen_kwargs):
-        from transformers import PreTrainedModel
-        class Wrapper(PreTrainedModel):
-            def __init__(self, module, config):
-                super().__init__(config)
-                self.module = module
-                self.config = config
-                self.transformer = nn.Module()
-                self.lm_head = lambda x: module.lm_head(module.ln_f(x))
-            def forward(self, input_ids, **kwargs):
-                return self.module(input_ids, **kwargs)
-        wrapped = Wrapper(self, GPT2LMHeadModel.from_pretrained("gpt2").config).cuda()
-        return wrapped.generate(input_ids, **gen_kwargs)
+        full = GPT2LMHeadModel.from_pretrained("gpt2").cuda()
+        full.transformer.wte = self.wte
+        full.transformer.wpe = self.wpe
+        full.transformer.ln_f = self.ln_f
+        full.transformer.h = nn.ModuleList(list(self.client_head) + list(self.server) + list(self.client_tail))
+        full.lm_head = self.lm_head
+        full.eval()
+        return full.generate(input_ids, **gen_kwargs)
 
 # ============ Dataset ============
 def linearize_mr_dict(mr_dict):
@@ -114,7 +110,6 @@ def preprocess(batch, tokenizer):
         label_ids = [-100]*sep_idx + enc_input[sep_idx:]
         inputs.append(torch.tensor(enc_input))
         labels.append(torch.tensor(label_ids))
-        # Debugging: check for out-of-bound labels
         for val in label_ids:
             if val != -100 and (val < 0 or val >= tokenizer.vocab_size):
                 print("⚠️ Invalid label:", val, "vocab_size:", tokenizer.vocab_size)
