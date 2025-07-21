@@ -126,26 +126,45 @@ class TailModel(nn.Module):
         self.h = nn.ModuleList([base_model.transformer.h[i] for i in range(8, 12)])
         self.ln_f = base_model.transformer.ln_f
         self.lm_head = base_model.lm_head
-
-    def forward(self, hidden_states, attention_mask=None, labels=None):
-        # Pass through last 4 transformer blocks
+        
+        # Add required attributes for PEFT
+        self.config = base_model.config
+        self.generation_config = getattr(base_model, 'generation_config', None)
+        
+    def prepare_inputs_for_generation(self, input_ids, **kwargs):
+        """Required for PEFT CAUSAL_LM compatibility"""
+        return {
+            "input_ids": input_ids,
+            "attention_mask": kwargs.get("attention_mask", None),
+            **kwargs
+        }
+        
+    def get_input_embeddings(self):
+        return None  # Embeddings handled by HeadModel
+        
+    def get_output_embeddings(self):
+        return self.lm_head
+        
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+        
+    def forward(self, hidden_states, attention_mask=None, labels=None, **kwargs):
+        # Your existing forward method unchanged
         for block in self.h:
             hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
-
-        # Final layer norm
+            
         hidden_states = self.ln_f(hidden_states)
-
-        # Language modeling head
         lm_logits = self.lm_head(hidden_states)
-
+        
         loss = None
         if labels is not None:
             shift_logits = lm_logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss_fct = nn.CrossEntropyLoss()
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-
+            
         return {"loss": loss, "logits": lm_logits}
+
 
 class UShaped_GPT2_Model(nn.Module):
     """Complete U-shaped model pipeline"""
