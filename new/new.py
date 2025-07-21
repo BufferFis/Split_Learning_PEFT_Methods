@@ -403,7 +403,11 @@ def apply_weight_tying_after_peft(client_head, client_tail):
     print("Weight tying applied after PEFT adapters")
 
 
-
+def compute_attention_mask_for_generation(sequence_length, past_length, device, dtype=torch.long):
+    """Compute proper attention mask for generation step"""
+    total_length = sequence_length + past_length
+    attention_mask = torch.ones((1, total_length), device=device, dtype=dtype)
+    return attention_mask
 
 # ==============================================================================
 # SECTION 3: GENERATION AND EVALUATION
@@ -411,7 +415,7 @@ def apply_weight_tying_after_peft(client_head, client_tail):
 # ==============================================================================
 
 def beam_search_generate(models, tokenizer, input_ids, max_new_tokens, beam_width=5):
-    """Custom beam search generation for the 3-part split model with proper attention mask handling."""
+    """FIXED: Custom beam search with proper attention mask handling."""
     client_head, server, client_tail = models
     client_head.eval()
     server.eval()
@@ -420,32 +424,29 @@ def beam_search_generate(models, tokenizer, input_ids, max_new_tokens, beam_widt
     eos_token_id = tokenizer.eos_token_id
 
     with torch.no_grad():
-        # Track current sequence length for all components
-        current_length = input_ids.shape[1]
-        batch_size = input_ids.shape[0]
+        batch_size, initial_length = input_ids.shape
         
-        # Initial forward pass with proper attention masks
+        # Initial forward pass
         attention_mask = torch.ones_like(input_ids)
         head_out, head_past = client_head(input_ids, attention_mask=attention_mask, use_cache=True)
         
-        # Pass consistent length information to server
-        server_attention_mask = torch.ones(batch_size, current_length, device=device)
         server_out, server_past = server(
             inputs_embeds=head_out, 
             past_key_values=head_past,
-            attention_mask=server_attention_mask, 
+            attention_mask=attention_mask, 
+            position_offset=0,
             use_cache=True
         )
         
-        # Same for client_tail
-        tail_attention_mask = torch.ones(batch_size, current_length, device=device)
         logits, tail_past = client_tail(
             inputs_embeds=server_out, 
             past_key_values=server_past,
-            attention_mask=tail_attention_mask, 
+            attention_mask=attention_mask, 
+            position_offset=0,
             use_cache=True
         )
 
+        # Initialize beams
         next_token_logits = logits[:, -1, :]
         log_probs = torch.nn.functional.log_softmax(next_token_logits, dim=-1)
         top_log_probs, top_indices = torch.topk(log_probs, beam_width, dim=-1)
@@ -457,11 +458,14 @@ def beam_search_generate(models, tokenizer, input_ids, max_new_tokens, beam_widt
             beams.append({
                 "sequence": torch.cat([input_ids, token_id], dim=-1),
                 "log_prob": log_prob,
-                "head_past": head_past, "server_past": server_past, "tail_past": tail_past,
+                "head_past": head_past, 
+                "server_past": server_past, 
+                "tail_past": tail_past,
                 "finished": token_id.item() == eos_token_id
             })
 
-        for _ in range(max_new_tokens - 1):
+        # Generation loop
+        for step in range(max_new_tokens - 1):
             new_beams = []
             any_beam_active = False
             
@@ -472,34 +476,35 @@ def beam_search_generate(models, tokenizer, input_ids, max_new_tokens, beam_widt
                 
                 any_beam_active = True
                 last_token = beam["sequence"][:, -1].unsqueeze(-1)
+                current_seq_len = beam["sequence"].shape[1]
                 
-                # FIXED: Update current_length for this beam
-                current_length = beam["sequence"].shape[1]
+                # FIXED: Create properly sized attention masks
+                # For incremental generation, we only need mask for the last token
+                single_token_mask = torch.ones(batch_size, 1, device=device)
                 
-                # FIXED: Create proper attention masks for each component
-                head_attention_mask = torch.ones(batch_size, current_length, device=device)
-                server_attention_mask = torch.ones(batch_size, current_length, device=device)  
-                tail_attention_mask = torch.ones(batch_size, current_length, device=device)
+                # FIXED: Pass proper position information
+                position_offset = initial_length + step
 
-                # FIXED: Pass component-specific masks with proper shapes
                 head_out, new_head_past = client_head(
-                    last_token, 
-                    past_key_values=beam["head_past"], 
-                    attention_mask=head_attention_mask, 
+                    last_token,
+                    past_key_values=beam["head_past"],
+                    attention_mask=single_token_mask,
                     use_cache=True
                 )
                 
                 server_out, new_server_past = server(
-                    inputs_embeds=head_out, 
-                    past_key_values=beam["server_past"], 
-                    attention_mask=server_attention_mask, 
+                    inputs_embeds=head_out,
+                    past_key_values=beam["server_past"],
+                    attention_mask=single_token_mask,
+                    position_offset=position_offset,  # FIXED: Added position context
                     use_cache=True
                 )
                 
                 logits, new_tail_past = client_tail(
-                    inputs_embeds=server_out, 
-                    past_key_values=beam["tail_past"], 
-                    attention_mask=tail_attention_mask, 
+                    inputs_embeds=server_out,
+                    past_key_values=beam["tail_past"],
+                    attention_mask=single_token_mask,
+                    position_offset=position_offset,  # FIXED: Added position context
                     use_cache=True
                 )
 
@@ -512,8 +517,11 @@ def beam_search_generate(models, tokenizer, input_ids, max_new_tokens, beam_widt
                     new_log_prob = beam["log_prob"] + top_log_probs[:, i]
                     new_sequence = torch.cat([beam["sequence"], token_id], dim=-1)
                     new_beams.append({
-                        "sequence": new_sequence, "log_prob": new_log_prob,
-                        "head_past": new_head_past, "server_past": new_server_past, "tail_past": new_tail_past,
+                        "sequence": new_sequence, 
+                        "log_prob": new_log_prob,
+                        "head_past": new_head_past, 
+                        "server_past": new_server_past, 
+                        "tail_past": new_tail_past,
                         "finished": token_id.item() == eos_token_id
                     })
             
@@ -526,37 +534,36 @@ def beam_search_generate(models, tokenizer, input_ids, max_new_tokens, beam_widt
         return best_beam["sequence"]
 
 
+
+
+
 def run_sanity_check(models, tokenizer, test_dataset, args):
-    """FIXED: Use SAME delimiter as training"""
+    """Enhanced sanity check with proper error handling"""
     print("\n--- Running Sanity Check ---")
     client_head, server, client_tail = models
     client_head.eval()
-    server.eval() 
+    server.eval()
     client_tail.eval()
-    
-    # CRITICAL: Use SAME delimiter as preprocessing
+
     DELIMITER = " >> "
-    
+    successful_generations = 0
+
     for i in range(min(args.sanity_check_samples, len(test_dataset))):
         item = test_dataset[i]
         mr_str = linearize_mr(item['mr'])
         reference_text = item['txt']
-        
-        # FIXED: Use consistent format
         input_str = f"{mr_str}{DELIMITER}"
-        
+
         print("-" * 50)
         print(f"Sample {i+1}")
         print(f" MR: {mr_str}")
         print(f" Input: '{input_str}'")
         print(f" Reference: {reference_text}")
-        
-        # Proper tokenization
+
         inputs = tokenizer(input_str, return_tensors="pt").to(args.device)
         input_ids = inputs["input_ids"]
-        
         max_gen_len = min(args.max_seq_length - input_ids.shape[1], 50)
-        
+
         if max_gen_len <= 0:
             generated_text = "[SKIPPED: Input too long]"
         else:
@@ -571,35 +578,25 @@ def run_sanity_check(models, tokenizer, test_dataset, args):
                     skip_special_tokens=True
                 ).strip()
                 
+                if generated_text and not generated_text.startswith("["):
+                    successful_generations += 1
+                    
                 if not generated_text:
                     generated_text = "[EMPTY GENERATION]"
+                    
             except Exception as e:
                 generated_text = f"[ERROR: {str(e)}]"
-        
+                print(f"   ERROR DETAILS: {e}")
+
         print(f" Generated: {generated_text}")
         print("-" * 50)
+    
+    success_rate = successful_generations / min(args.sanity_check_samples, len(test_dataset))
+    print(f"\n✅ Generation Success Rate: {success_rate:.2%}")
+    if success_rate < 0.5:
+        print("🔴 WARNING: Low generation success rate indicates fundamental issues!")
 
 
-def test_separators(models, tokenizer, test_dataset, args):
-    """Test different separators to see which one the model expects"""
-    separators_to_test = [" ->", " -&gt;", " | ", "->", " : "]
-    
-    item = test_dataset[0]
-    mr = linearize_mr(item['mr'])
-    reference_text = item['txt']
-    
-    print("=== TESTING DIFFERENT SEPARATORS ===")
-    for sep in separators_to_test:
-        input_text = mr + sep
-        input_ids = tokenizer.encode(input_text, return_tensors="pt").to(args.device)
-        
-        try:
-            output_ids = beam_search_generate(models, tokenizer, input_ids, max_new_tokens=20, beam_width=3)
-            generated_text = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=True).strip()
-            print(f"Separator '{sep}': {generated_text}")
-        except:
-            print(f"Separator '{sep}': ERROR")
-    print("=====================================")
 
 def run_evaluation(models, tokenizer, test_dataset, args):
     """Generates predictions and runs the official E2E evaluation script."""
@@ -790,7 +787,6 @@ def main(args):
         
         # Run Sanity Check
         run_sanity_check(final_models, tokenizer, raw_datasets["test"], args)
-        test_separators(final_models, tokenizer, raw_datasets["test"], args)
         # Run Full Evaluation
         scores = run_evaluation(final_models, tokenizer, raw_datasets["test"], args)
         if scores:
