@@ -38,7 +38,7 @@ class E2EJsonDataset(Dataset):
             if isinstance(item, dict) and 'mr' in item and 'txt' in item:
                 # Extract meaning representation from nested structure
                 mr_dict = item['mr']['value_lex'] if 'value_lex' in item['mr'] else item['mr']
-                reference = item['txt']  # Use actual reference text
+                reference = item['txt_lex']
                 
                 # Build MR string from non-empty attributes only
                 mr_parts = []
@@ -76,7 +76,7 @@ class E2EJsonDataset(Dataset):
         ids_delim = self.DELIM_TOKENS
         
         # Build full sequence
-        full_sequence = ids_mr + ids_delim + ids_ref
+        full_sequence = ids_mr + ids_delim + ids_ref + [self.tokenizer.eos_token_id]
         
         # Truncate if necessary
         if len(full_sequence) > SEQ_LEN:
