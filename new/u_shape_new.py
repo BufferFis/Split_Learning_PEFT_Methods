@@ -21,7 +21,7 @@ class E2EJsonDataset(Dataset):
         self.data = []
         
         # Define delimiter tokens
-        self.DELIM_TOKENS = tokenizer.encode(" <REF>", add_special_tokens=False)
+        self.DELIM_TOKENS = [tokenizer.convert_tokens_to_ids("<REF>")]
         print(f"🔍 Delimiter tokens: {self.DELIM_TOKENS}")
         print(f"🔍 Delimiter decoded: '{tokenizer.decode(self.DELIM_TOKENS)}'")
         
@@ -37,7 +37,7 @@ class E2EJsonDataset(Dataset):
         for item in raw_data:
             if isinstance(item, dict) and 'mr' in item and 'txt' in item:
                 # Extract meaning representation from nested structure
-                mr_dict = item['mr']['value'] if 'value' in item['mr'] else item['mr']
+                mr_dict = item['mr']['value_lex'] if 'value_lex' in item['mr'] else item['mr']
                 reference = item['txt']  # Use actual reference text
                 
                 # Build MR string from non-empty attributes only
@@ -207,7 +207,7 @@ class ServerModel(nn.Module):
         elif hidden_states is None:
             raise ValueError("You must specify either hidden_states or inputs_embeds")
         
-        print(f"ServerModel input shape: {hidden_states.shape}")
+        #print(f"ServerModel input shape: {hidden_states.shape}")
         
         # Verify dimensions
         if hidden_states.size(-1) != self.config.hidden_size:
@@ -231,9 +231,9 @@ class ServerModel(nn.Module):
         
         # Pass through middle 4 transformer blocks with corrected attention mask
         for i, block in enumerate(self.h):
-            print(f"ServerModel block {i} input shape: {hidden_states.shape}")
+            #print(f"ServerModel block {i} input shape: {hidden_states.shape}")
             hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
-            print(f"ServerModel block {i} output shape: {hidden_states.shape}")
+            #print(f"ServerModel block {i} output shape: {hidden_states.shape}")
         
         # Return 2D attention mask for consistency with pipeline
         if attention_mask is not None and attention_mask.dim() == 4:
@@ -277,7 +277,7 @@ class TailModel(nn.Module):
         elif hidden_states is None:
             raise ValueError("You must specify either hidden_states or inputs_embeds")
             
-        print(f"TailModel input shape: {hidden_states.shape}")
+        #print(f"TailModel input shape: {hidden_states.shape}")
         
         # Verify dimensions
         if hidden_states.size(-1) != self.config.hidden_size:
@@ -286,8 +286,8 @@ class TailModel(nn.Module):
         
         # CRITICAL FIX: Convert attention mask dtype and shape
         if attention_mask is not None:
-            print(f"TailModel attention mask input shape: {attention_mask.shape}")
-            print(f"TailModel attention mask dtype: {attention_mask.dtype}")
+            #print(f"TailModel attention mask input shape: {attention_mask.shape}")
+            #print(f"TailModel attention mask dtype: {attention_mask.dtype}")
             
             # Convert from long to float if needed
             if attention_mask.dtype == torch.long:
@@ -302,13 +302,13 @@ class TailModel(nn.Module):
                 # Apply mask transformation (0 for attend, large negative for mask)
                 attention_mask = (1.0 - attention_mask) * torch.finfo(hidden_states.dtype).min
                 
-            print(f"TailModel attention mask after conversion: {attention_mask.shape}")
+            #print(f"TailModel attention mask after conversion: {attention_mask.shape}")
         
         # Process through transformer blocks with corrected attention mask
         for i, block in enumerate(self.h):
-            print(f"TailModel block {i} input shape: {hidden_states.shape}")
+            #print(f"TailModel block {i} input shape: {hidden_states.shape}")
             hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
-            print(f"TailModel block {i} output shape: {hidden_states.shape}")
+            #print(f"TailModel block {i} output shape: {hidden_states.shape}")
         
         # Final layer norm and output
         hidden_states = self.ln_f(hidden_states)
@@ -337,15 +337,15 @@ class UShaped_GPT2_Model(nn.Module):
         self.tokenizer = tokenizer
 
     def forward(self, input_ids, attention_mask=None, labels=None):
-        print(f"Input shape: {input_ids.shape}")
+        #print(f"Input shape: {input_ids.shape}")
         
         # Stage 1: Head processing
         hidden_states, attention_mask = self.head(input_ids, attention_mask)
-        print(f"After head: {hidden_states.shape}")
+        #print(f"After head: {hidden_states.shape}")
         
         # Stage 2: Server processing  
         hidden_states, attention_mask = self.server(hidden_states, attention_mask)
-        print(f"After server: {hidden_states.shape}")
+        #print(f"After server: {hidden_states.shape}")
         
         # Stage 3: Tail processing - FIX: Use keyword arguments
         output = self.tail(
@@ -353,7 +353,7 @@ class UShaped_GPT2_Model(nn.Module):
             attention_mask=attention_mask, 
             labels=labels
         )
-        print(f"After tail: output logits shape: {output['logits'].shape}")
+        #print(f"After tail: output logits shape: {output['logits'].shape}")
         
         return output
 
