@@ -101,10 +101,16 @@ class E2EJsonDataset(Dataset):
             labels = [-100] * len(input_ids)
         
         attention_mask = [1] * len(input_ids)
-        print("ids_delim:", ids_delim)
-        print("first 20 input_ids:", input_ids[:20])
-        print("delim_pos:", delim_pos)
-        print("labels[:20]:", labels[:20])
+        
+               # === DEBUG: show exactly which tokens are being trained on ===
+        non_masked = [i for i, l in enumerate(labels) if l != -100]
+        print(f"delimiter at {delim_pos}, mask_length = {mask_length}")
+        print("label positions (first 10):", non_masked[:10])
+        for i in non_masked[:10]:
+            tok = input_ids[i]
+            print(f"  idx={i:2d} token={tok:5d} → '{self.tokenizer.decode([tok])}'")
+
+        attention_mask = [1] * len(input_ids)
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
