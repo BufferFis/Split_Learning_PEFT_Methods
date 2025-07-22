@@ -7,6 +7,7 @@ from torch.utils.data import Dataset, DataLoader
 # --- FIX: AdamW is now imported from torch.optim ---
 from torch.optim import AdamW 
 import torch.nn.functional as F
+import subprocess, sys
 
 from transformers import GPT2Tokenizer, GPT2LMHeadModel, get_linear_schedule_with_warmup
 from tqdm import tqdm
@@ -161,11 +162,7 @@ class HeadModel(nn.Module):
             hidden_states = self.drop(inputs_embeds + position_embeds)
         else:
             raise ValueError("You must specify either input_ids or inputs_embeds")
-        
-        # Debug: Print tensor shapes
-        #print(f"HeadModel input shape: {hidden_states.shape}")
-        #print(f"Expected hidden_size: {self.config.hidden_size}")
-        
+
         # Verify dimension consistency
         if hidden_states.size(-1) != self.config.hidden_size:
             raise ValueError(f"Hidden states dimension {hidden_states.size(-1)} doesn't match "
@@ -231,9 +228,7 @@ class ServerModel(nn.Module):
         
         # Pass through middle 4 transformer blocks with corrected attention mask
         for i, block in enumerate(self.h):
-            #print(f"ServerModel block {i} input shape: {hidden_states.shape}")
             hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
-            #print(f"ServerModel block {i} output shape: {hidden_states.shape}")
         
         # Return 2D attention mask for consistency with pipeline
         if attention_mask is not None and attention_mask.dim() == 4:
@@ -276,19 +271,13 @@ class TailModel(nn.Module):
             hidden_states = inputs_embeds
         elif hidden_states is None:
             raise ValueError("You must specify either hidden_states or inputs_embeds")
-            
-        #print(f"TailModel input shape: {hidden_states.shape}")
-        
+
         # Verify dimensions
         if hidden_states.size(-1) != self.config.hidden_size:
             raise ValueError(f"TailModel: Hidden states dimension {hidden_states.size(-1)} "
                            f"doesn't match expected {self.config.hidden_size}")
         
-        # CRITICAL FIX: Convert attention mask dtype and shape
         if attention_mask is not None:
-            #print(f"TailModel attention mask input shape: {attention_mask.shape}")
-            #print(f"TailModel attention mask dtype: {attention_mask.dtype}")
-            
             # Convert from long to float if needed
             if attention_mask.dtype == torch.long:
                 attention_mask = attention_mask.to(dtype=torch.float32)
@@ -302,13 +291,10 @@ class TailModel(nn.Module):
                 # Apply mask transformation (0 for attend, large negative for mask)
                 attention_mask = (1.0 - attention_mask) * torch.finfo(hidden_states.dtype).min
                 
-            #print(f"TailModel attention mask after conversion: {attention_mask.shape}")
         
         # Process through transformer blocks with corrected attention mask
         for i, block in enumerate(self.h):
-            #print(f"TailModel block {i} input shape: {hidden_states.shape}")
             hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
-            #print(f"TailModel block {i} output shape: {hidden_states.shape}")
         
         # Final layer norm and output
         hidden_states = self.ln_f(hidden_states)
@@ -468,7 +454,7 @@ def apply_dora_peft(model):
         r=16,
         lora_alpha=32,
         lora_dropout=0.1,
-        target_modules=["c_attn", "c_proj"],
+        target_modules=["c_attn", "c_proj", "c_fc"],
         use_dora=True
     )
     model.head = get_peft_model(model.head, head_peft_config)
@@ -480,7 +466,7 @@ def apply_dora_peft(model):
         r=16,
         lora_alpha=32,
         lora_dropout=0.1,
-        target_modules=["c_attn", "c_proj"],
+        target_modules=["c_attn", "c_proj", "c_fc"],
         use_dora=True
     )
     model.server = get_peft_model(model.server, server_peft_config)
@@ -492,7 +478,7 @@ def apply_dora_peft(model):
         r=16,
         lora_alpha=32,
         lora_dropout=0.1,
-        target_modules=["c_attn", "c_proj"],
+        target_modules=["c_attn", "c_proj", "c_fc"],
         use_dora=True
     )
     model.tail = get_peft_model(model.tail, tail_peft_config)
@@ -523,13 +509,13 @@ def generate_sanity_check(model, tokenizer, device):
             output_sequences = model.generate(
                 input_ids=inputs['input_ids'],
                 attention_mask=inputs['attention_mask'],
-                max_new_tokens=20,              # Reduced for E2E length
-                temperature=0.8,                # Slightly higher for creativity
-                top_p=0.95,                    # Higher for more diverse vocabulary
-                repetition_penalty=1.5,        # Reduced from 2.5
-                no_repeat_ngram_size=3,        # Prevent 3-gram repetition
-                early_stopping=True,
-                do_sample=True,
+                max_new_tokens=30,              # Reduced for E2E length
+                # temperature=0.8,                # Slightly higher for creativity
+                # top_p=0.95,                    # Higher for more diverse vocabulary
+                # repetition_penalty=1.5,        # Reduced from 2.5
+                # no_repeat_ngram_size=3,        # Prevent 3-gram repetition
+                # early_stopping=True,
+                do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id
             )
@@ -547,8 +533,6 @@ def generate_sanity_check(model, tokenizer, device):
             print(f"Quality: {len(words)} words, {unique_ratio:.2f} uniqueness")
     
     model.train()
-
-
 
 # --- 6. Main Training Function (modified) ---
 def main(args):
@@ -655,6 +639,7 @@ def main(args):
     model.tail.save_pretrained(os.path.join(args.output_dir, "tail_stage"))
     tokenizer.save_pretrained(args.output_dir)
 
+  
     print(f"\nTraining complete. U-shaped model stages saved to {args.output_dir}")
 
 # --- 7. Entry Point and Argument Parsing (unchanged) ---
