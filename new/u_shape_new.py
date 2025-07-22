@@ -421,10 +421,15 @@ class UShaped_GPT2_Model(nn.Module):
 
 # --- 3. Model and Tokenizer Setup (modified) ---
 def setup_model_and_tokenizer(model_name):
-    """Simplified single-stage model for debugging"""
+    """Create U-shaped GPT-2 model with tokenizer"""
     tokenizer = GPT2Tokenizer.from_pretrained(model_name)
-    model = GPT2LMHeadModel.from_pretrained(model_name)
+    base_model = GPT2LMHeadModel.from_pretrained(model_name)
     
+    # Print model config for debugging
+    print(f"Model config: {base_model.config}")
+    print(f"Hidden size: {base_model.config.hidden_size}")
+    print(f"Number of layers: {base_model.config.num_hidden_layers}")
+
     special_tokens_dict = {
         'bos_token': '<|endoftext|>',
         'eos_token': '<|endoftext|>',
@@ -432,10 +437,15 @@ def setup_model_and_tokenizer(model_name):
         'additional_special_tokens': ['<MR>', '<REF>']
     }
     tokenizer.add_special_tokens(special_tokens_dict)
-    model.resize_token_embeddings(len(tokenizer))
-    model.config.pad_token_id = tokenizer.pad_token_id
     
-    return model, tokenizer
+    base_model.resize_token_embeddings(len(tokenizer))
+    base_model.config.pad_token_id = tokenizer.pad_token_id
+    
+    # ✅ Create U-shaped model instead of returning base model
+    u_shaped_model = UShaped_GPT2_Model(base_model, tokenizer)
+    
+    return u_shaped_model, tokenizer
+
 
 
 
