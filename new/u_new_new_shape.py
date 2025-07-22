@@ -50,7 +50,7 @@ class E2EJsonDataset(Dataset):
         attention_mask = [1] * len(input_ids)
         return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
-# --- 2. U-Shaped Split Architecture Components (FINAL FIX) ---
+# --- 2. U-Shaped Split Architecture Components (FINAL, FINAL FIX) ---
 class HeadModel(nn.Module):
     def __init__(self, base_model):
         super().__init__()
@@ -83,10 +83,11 @@ class HeadModel(nn.Module):
             attention_mask_4d = attention_mask.view(batch_size, 1, 1, -1)
             attention_mask_4d = attention_mask_4d.to(dtype=hidden_states.dtype)
             attention_mask_4d = (1.0 - attention_mask_4d) * torch.finfo(hidden_states.dtype).min
-
+        
         presents = [] if use_cache else None
         for i, block in enumerate(self.h):
             layer_past = past_key_values[i] if past_key_values is not None else None
+            # THIS IS THE FIX: Pass the 'use_cache' variable down to the block
             outputs = block(hidden_states, layer_past=layer_past, attention_mask=attention_mask_4d, use_cache=use_cache)
             hidden_states = outputs[0]
             if use_cache:
@@ -110,6 +111,7 @@ class ServerModel(nn.Module):
         presents = [] if use_cache else None
         for i, block in enumerate(self.h):
             layer_past = past_key_values[i] if past_key_values is not None else None
+            # THIS IS THE FIX: Pass the 'use_cache' variable down to the block
             outputs = block(hidden_states, layer_past=layer_past, attention_mask=attention_mask_4d, use_cache=use_cache)
             hidden_states = outputs[0]
             if use_cache:
@@ -134,6 +136,7 @@ class TailModel(nn.Module):
         presents = [] if use_cache else None
         for i, block in enumerate(self.h):
             layer_past = past_key_values[i] if past_key_values is not None else None
+            # THIS IS THE FIX: Pass the 'use_cache' variable down to the block
             outputs = block(hidden_states, layer_past=layer_past, attention_mask=attention_mask_4d, use_cache=use_cache)
             hidden_states = outputs[0]
             if use_cache:
