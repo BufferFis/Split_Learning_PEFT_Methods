@@ -20,6 +20,9 @@ class E2EJsonDataset(Dataset):
         self.max_length = max_length
         self.data = []
         
+        # Define delimiter tokens
+        self.DELIM_TOKENS = tokenizer.encode(" <REF>", add_special_tokens=False)
+        
         # Load E2E JSON data
         with open(json_file, 'r', encoding='utf-8') as f:
             raw_data = json.load(f)
@@ -42,47 +45,97 @@ class E2EJsonDataset(Dataset):
                 if mr_parts:  # Only process if we have valid MR
                     mr_string = ", ".join(mr_parts)
                     self.data.append({
-                        'mr': mr_string,
-                        'reference': reference
+                        'meaning_representation': mr_string,
+                        'human_reference': reference
                     })
         
         print(f"✅ Loaded {len(self.data)} E2E examples")
         if len(self.data) > 0:
-            print(f"📝 Sample MR: {self.data[0]['mr']}")
-            print(f"📝 Sample Reference: {self.data[0]['reference']}")
-        
+            print(f"📝 Sample MR: {self.data[0]['meaning_representation']}")
+            print(f"📝 Sample Reference: {self.data[0]['human_reference']}")
+    
     def __len__(self):
         return len(self.data)
     
-    def __getitem__(self, idx):
-        item = self.data[idx]
-        mr = item['mr']
-        reference = item['reference']
+    def preprocess(self, example, sequence_length=None):
+        """FIXED: Proper label alignment with truncated sequences"""
+        SEQ_LEN = sequence_length if sequence_length is not None else self.max_length
         
-        # CRITICAL FIX: Proper E2E training format
-        formatted_text = f"<MR> {mr} <REF> {reference}"
+        mr = example["meaning_representation"]
+        ref = example["human_reference"]
         
-        # Tokenize with proper settings
-        tokenized = self.tokenizer(
-            formatted_text,
-            max_length=self.max_length,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt"
-        )
-
-        input_ids = tokenized['input_ids'].squeeze()
-        attention_mask = tokenized['attention_mask'].squeeze().to(dtype=torch.float32)
+        # Tokenize pieces
+        ids_mr = self.tokenizer.encode(f"<MR> {mr}", add_special_tokens=False)
+        ids_ref = self.tokenizer.encode(ref, add_special_tokens=False)
+        ids_delim = self.DELIM_TOKENS
         
-        # Create labels for causal language modeling
-        labels = input_ids.clone()
-        labels[attention_mask == 0] = -100  # Ignore padding in loss calculation
+        # Build full sequence
+        full_sequence = ids_mr + ids_delim + ids_ref
+        
+        # Truncate if necessary
+        if len(full_sequence) > SEQ_LEN:
+            input_ids = full_sequence[:SEQ_LEN]
+        else:
+            input_ids = full_sequence
+        
+        # Create labels based on ACTUAL input_ids length
+        labels = []
+        
+        # Find delimiter position in the ACTUAL input_ids
+        delim_pos = None
+        for i in range(len(input_ids) - len(ids_delim) + 1):
+            if input_ids[i:i+len(ids_delim)] == ids_delim:
+                delim_pos = i
+                break
+        
+        if delim_pos is not None:
+            # Mask everything before and including delimiter
+            mask_length = delim_pos + len(ids_delim)
+            labels = [-100] * mask_length
+            
+            # Add remaining tokens as targets
+            remaining_tokens = input_ids[mask_length:]
+            labels.extend(remaining_tokens)
+        else:
+            # Delimiter not found (heavily truncated) - mask everything
+            labels = [-100] * len(input_ids)
+        
+        # Ensure exact length match
+        assert len(input_ids) == len(labels), f"Length mismatch: {len(input_ids)} vs {len(labels)}"
+        
+        attention_mask = [1] * len(input_ids)
         
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "labels": labels
+            "labels": labels,
+            "human_reference": ref,
+            "meaning_representation": mr,
         }
+    
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        
+        # Use the corrected preprocessing function
+        processed = self.preprocess(item, self.max_length)
+        
+        # Convert to tensors and pad if necessary
+        input_ids = processed["input_ids"]
+        attention_mask = processed["attention_mask"] 
+        labels = processed["labels"]
+        
+        # Pad sequences to max_length
+        while len(input_ids) < self.max_length:
+            input_ids.append(self.tokenizer.pad_token_id)
+            attention_mask.append(0)
+            labels.append(-100)
+        
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.float32),
+            "labels": torch.tensor(labels, dtype=torch.long)
+        }
+
 
 
 # --- 2. U-Shaped Split Architecture Components ---
