@@ -22,7 +22,13 @@ class E2EJsonDataset(Dataset):
         
         # Define delimiter tokens
         self.DELIM_TOKENS = tokenizer.encode(" <REF>", add_special_tokens=False)
+        print(f"🔍 Delimiter tokens: {self.DELIM_TOKENS}")
+        print(f"🔍 Delimiter decoded: '{tokenizer.decode(self.DELIM_TOKENS)}'")
         
+        # Verify special tokens exist
+        print(f"🔍 Special tokens in vocab:")
+        print(f"  <MR>: {tokenizer.encode('<MR>', add_special_tokens=False)}")
+        print(f"  <REF>: {tokenizer.encode('<REF>', add_special_tokens=False)}")
         # Load E2E JSON data
         with open(json_file, 'r', encoding='utf-8') as f:
             raw_data = json.load(f)
@@ -58,7 +64,7 @@ class E2EJsonDataset(Dataset):
         return len(self.data)
     
     def preprocess(self, example, sequence_length=None):
-        """FIXED: Proper label alignment with truncated sequences"""
+        """FIXED: Proper label alignment with DEBUG output"""
         SEQ_LEN = sequence_length if sequence_length is not None else self.max_length
         
         mr = example["meaning_representation"]
@@ -69,12 +75,23 @@ class E2EJsonDataset(Dataset):
         ids_ref = self.tokenizer.encode(ref, add_special_tokens=False)
         ids_delim = self.DELIM_TOKENS
         
+        # DEBUG: Print tokenization details
+        print(f"\n=== PREPROCESSING DEBUG ===")
+        print(f"MR: {mr}")
+        print(f"REF: {ref}")
+        print(f"MR tokens: {ids_mr} -> {self.tokenizer.decode(ids_mr)}")
+        print(f"REF tokens: {ids_ref} -> {self.tokenizer.decode(ids_ref)}")
+        print(f"DELIM tokens: {ids_delim} -> {self.tokenizer.decode(ids_delim)}")
+        
         # Build full sequence
         full_sequence = ids_mr + ids_delim + ids_ref
+        print(f"Full sequence length: {len(full_sequence)}")
+        print(f"Full sequence: {self.tokenizer.decode(full_sequence)}")
         
         # Truncate if necessary
         if len(full_sequence) > SEQ_LEN:
             input_ids = full_sequence[:SEQ_LEN]
+            print(f"⚠️ TRUNCATED to {SEQ_LEN} tokens")
         else:
             input_ids = full_sequence
         
@@ -88,6 +105,9 @@ class E2EJsonDataset(Dataset):
                 delim_pos = i
                 break
         
+        print(f"Delimiter position: {delim_pos}")
+        print(f"Delimiter tokens to find: {ids_delim}")
+        
         if delim_pos is not None:
             # Mask everything before and including delimiter
             mask_length = delim_pos + len(ids_delim)
@@ -96,14 +116,25 @@ class E2EJsonDataset(Dataset):
             # Add remaining tokens as targets
             remaining_tokens = input_ids[mask_length:]
             labels.extend(remaining_tokens)
+            
+            print(f"Masked {mask_length} tokens")
+            print(f"Training on {len(remaining_tokens)} tokens: {self.tokenizer.decode(remaining_tokens)}")
         else:
             # Delimiter not found (heavily truncated) - mask everything
             labels = [-100] * len(input_ids)
+            print(f"⚠️ DELIMITER NOT FOUND - masking everything!")
+        
+        # Show label distribution
+        masked_count = sum(1 for x in labels if x == -100)
+        target_count = len(labels) - masked_count
+        print(f"Label distribution: {masked_count} masked, {target_count} targets")
         
         # Ensure exact length match
         assert len(input_ids) == len(labels), f"Length mismatch: {len(input_ids)} vs {len(labels)}"
         
         attention_mask = [1] * len(input_ids)
+        
+        print(f"=== END DEBUG ===\n")
         
         return {
             "input_ids": input_ids,
@@ -112,6 +143,7 @@ class E2EJsonDataset(Dataset):
             "human_reference": ref,
             "meaning_representation": mr,
         }
+
     
     def __getitem__(self, idx):
         item = self.data[idx]
@@ -503,63 +535,48 @@ def apply_dora_peft(model):
 
 # --- 5. Generation Function for Sanity Checks (modified) ---
 def generate_sanity_check(model, tokenizer, device):
-    """Fixed sanity check for E2E generation"""
+    """Fixed sanity check matching training format exactly"""
     model.eval()
     
-    # FIXED: Use proper E2E test examples
     test_examples = [
         "name[NAME], eatType[restaurant], food[Italian]",
-        "name[The Vaults], eatType[pub], priceRange[more than £30], customerRating[5 out of 5], near[CAFÉ ADRIATIC]",
         "name[Alimentum], area[riverside], familyFriendly[yes], near[Burger King]"
     ]
-    
-    print("\n" + "="*50)
-    print("🎯 SANITY CHECK - E2E GENERATION")
-    print("="*50)
     
     for i, test_mr in enumerate(test_examples):
         print(f"\n--- Test {i+1} ---")
         print(f"📥 Input MR: {test_mr}")
         
-        # Format input properly
-        input_text = f"<MR> {test_mr} <REF>"
+        # CRITICAL: Format must match training exactly
+        input_text = f"<MR> {test_mr} <REF>"  # Same as training format
+        
+        print(f"🔍 Formatted input: '{input_text}'")
         inputs = tokenizer(input_text, return_tensors="pt").to(device)
         
-        # FIXED: Generation parameters optimized for E2E
+        # Debug tokenization
+        print(f"🔍 Input tokens: {inputs['input_ids'][0].tolist()}")
+        print(f"🔍 Decoded: '{tokenizer.decode(inputs['input_ids'][0])}'")
+        
         with torch.no_grad():
             output_sequences = model.generate(
                 input_ids=inputs['input_ids'],
                 attention_mask=inputs['attention_mask'],
-                max_new_tokens=30,  # Reduced for E2E length
-                temperature=0.7,    # Lower temperature for stability
+                max_new_tokens=25,
+                temperature=0.7,
                 top_p=0.9,
-                repetition_penalty=2.0,  # Higher to prevent repetition
-                length_penalty=1.1,
+                repetition_penalty=2.5,
                 early_stopping=True,
                 do_sample=True,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id
             )
         
-        # Decode and clean output
-        generated_text = tokenizer.batch_decode(output_sequences, skip_special_tokens=True)[0]
+        # Extract only new tokens
+        input_length = inputs['input_ids'].shape[1]
+        generated_tokens = output_sequences[0][input_length:]
+        generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
         
-        # Extract only the generated part (after <REF>)
-        if "<REF>" in generated_text:
-            generated_part = generated_text.split("<REF>", 1)[1].strip()
-        else:
-            generated_part = generated_text.replace(input_text, "").strip()
-        
-        print(f"📤 Generated: {generated_part}")
-        
-        # Check for quality indicators
-        if len(generated_part.split()) < 5:
-            print("⚠️  Warning: Output too short")
-        if "THE WRESTLERS" in generated_part or len(set(generated_part.split())) < len(generated_part.split()) * 0.7:
-            print("⚠️  Warning: Repetitive output detected")
-    
-    print("="*50)
-    model.train()
+        print(f"📤 Generated: {generated_text}")
 
 
 # --- 6. Main Training Function (modified) ---
@@ -611,6 +628,27 @@ def main(args):
         print(f"--- Epoch {epoch+1}/{args.num_epochs} ---")
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
         for i, batch in enumerate(progress_bar):
+            # In your training loop, add after getting the batch:
+            if i == 0 and epoch == 0:  # First batch of first epoch
+                sample_input = batch['input_ids'][0]
+                sample_labels = batch['labels'][0]
+                sample_mask = batch['attention_mask'][0]
+                
+                print(f"\n🔍 TRAINING VERIFICATION:")
+                print(f"Input tokens: {sample_input[:30].tolist()}")
+                print(f"Label tokens: {sample_labels[:30].tolist()}")
+                print(f"Input decoded: {tokenizer.decode(sample_input[sample_mask.bool()])}")
+                
+                # Count masked vs unmasked
+                masked = (sample_labels == -100).sum().item()
+                total = len(sample_labels)
+                print(f"Masked: {masked}/{total} ({masked/total*100:.1f}%)")
+                
+                # Show what model is trained to predict
+                target_tokens = sample_labels[sample_labels != -100]
+                if len(target_tokens) > 0:
+                    print(f"Training targets: {tokenizer.decode(target_tokens)}")
+
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
