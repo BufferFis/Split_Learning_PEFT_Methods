@@ -450,9 +450,9 @@ def apply_dora_peft(model):
     head_peft_config = LoraConfig(
         task_type=None,  # Use None to avoid inputs_embeds issues
         inference_mode=False,
-        r=8,
+        r=4,
         lora_alpha=32,
-        lora_dropout=0.5,
+        lora_dropout=0.8,
         target_modules=["c_attn", "c_proj", "c_fc"],
         use_dora=True
     )
@@ -550,7 +550,9 @@ def generate_sanity_check(model, tokenizer, device):
                 input_ids=inputs['input_ids'],
                 attention_mask=inputs['attention_mask'],
                 max_new_tokens=30,       
-                do_sample=False,
+                do_sample=True,
+                top_p=0.9,
+                repetition_penalty=1.1,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id
             )
