@@ -220,7 +220,6 @@ class TailModel(nn.Module):
         self.lm_head = new_embeddings
         
     def forward(self, hidden_states=None, attention_mask=None, labels=None, inputs_embeds=None, **kwargs):
-        # Handle both hidden_states and inputs_embeds
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         elif hidden_states is None:
@@ -233,9 +232,31 @@ class TailModel(nn.Module):
             raise ValueError(f"TailModel: Hidden states dimension {hidden_states.size(-1)} "
                            f"doesn't match expected {self.config.hidden_size}")
         
-        # Process through transformer blocks
+        # CRITICAL FIX: Convert attention mask dtype and shape
+        if attention_mask is not None:
+            print(f"TailModel attention mask input shape: {attention_mask.shape}")
+            print(f"TailModel attention mask dtype: {attention_mask.dtype}")
+            
+            # Convert from long to float if needed
+            if attention_mask.dtype == torch.long:
+                attention_mask = attention_mask.to(dtype=torch.float32)
+            
+            # If attention mask is 2D, convert to 4D for transformer blocks
+            if attention_mask.dim() == 2:
+                batch_size, seq_length = attention_mask.shape
+                # Convert to 4D: [batch_size, 1, 1, seq_length]
+                attention_mask = attention_mask.view(batch_size, 1, 1, seq_length)
+                attention_mask = attention_mask.to(dtype=hidden_states.dtype)
+                # Apply mask transformation (0 for attend, large negative for mask)
+                attention_mask = (1.0 - attention_mask) * torch.finfo(hidden_states.dtype).min
+                
+            print(f"TailModel attention mask after conversion: {attention_mask.shape}")
+        
+        # Process through transformer blocks with corrected attention mask
         for i, block in enumerate(self.h):
+            print(f"TailModel block {i} input shape: {hidden_states.shape}")
             hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
+            print(f"TailModel block {i} output shape: {hidden_states.shape}")
         
         # Final layer norm and output
         hidden_states = self.ln_f(hidden_states)
@@ -250,6 +271,7 @@ class TailModel(nn.Module):
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
             
         return {"loss": loss, "logits": lm_logits}
+
 
 
 class UShaped_GPT2_Model(nn.Module):
