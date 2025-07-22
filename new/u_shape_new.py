@@ -146,6 +146,7 @@ class ServerModel(nn.Module):
     def __init__(self, base_model):
         super().__init__()
         self.config = base_model.config
+        # Middle 4 transformer blocks (4-7)
         self.h = nn.ModuleList([base_model.transformer.h[i] for i in range(4, 8)])
         
     def forward(self, hidden_states=None, attention_mask=None, inputs_embeds=None, **kwargs):
@@ -161,12 +162,36 @@ class ServerModel(nn.Module):
             raise ValueError(f"ServerModel: Hidden states dimension {hidden_states.size(-1)} "
                            f"doesn't match expected {self.config.hidden_size}")
         
+        # CRITICAL FIX: Convert attention mask dtype
+        if attention_mask is not None:
+            # Convert from long to float if needed
+            if attention_mask.dtype == torch.long:
+                attention_mask = attention_mask.to(dtype=torch.float32)
+            
+            # If attention mask is 2D, convert to 4D for transformer blocks
+            if attention_mask.dim() == 2:
+                batch_size, seq_length = attention_mask.shape
+                # Convert to 4D: [batch_size, 1, 1, seq_length]
+                attention_mask = attention_mask.view(batch_size, 1, 1, seq_length)
+                attention_mask = attention_mask.to(dtype=hidden_states.dtype)
+                # Apply mask transformation (0 for attend, large negative for mask)
+                attention_mask = (1.0 - attention_mask) * torch.finfo(hidden_states.dtype).min
+        
+        # Pass through middle 4 transformer blocks with corrected attention mask
         for i, block in enumerate(self.h):
             print(f"ServerModel block {i} input shape: {hidden_states.shape}")
             hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
             print(f"ServerModel block {i} output shape: {hidden_states.shape}")
+        
+        # Return 2D attention mask for consistency with pipeline
+        if attention_mask is not None and attention_mask.dim() == 4:
+            # Convert back to 2D for pipeline consistency
+            original_attention_mask = attention_mask[:, 0, 0, :]  # Extract 2D from 4D
+        else:
+            original_attention_mask = attention_mask
             
-        return hidden_states, attention_mask
+        return hidden_states, original_attention_mask
+
 
 class TailModel(nn.Module):
     """Final stage: last 4 transformer blocks + LM head"""
