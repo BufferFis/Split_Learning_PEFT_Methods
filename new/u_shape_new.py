@@ -112,20 +112,14 @@ class E2EJsonDataset(Dataset):
     
     def __getitem__(self, idx):
         item = self.data[idx]
-        
         # Use the corrected preprocessing function
-        processed = self.preprocess(item, self.max_length)
-        
-        # Convert to tensors and pad if necessary
-        input_ids = processed["input_ids"]
-        attention_mask = processed["attention_mask"] 
-        labels = processed["labels"]
-        
+        proc = self.preprocess(item, self.max_length)
+
         return {
-            "input_ids": torch.tensor(input_ids, dtype=torch.long),
-            "attention_mask": torch.tensor(attention_mask, dtype=torch.float32),
-            "labels": torch.tensor(labels, dtype=torch.long)
-        }
+       "input_ids":       proc["input_ids"],        # list[int]
+       "attention_mask":  proc["attention_mask"],   # list[int]
+       "labels":          proc["labels"]            # list[int]
+   }
 
 
 
@@ -479,6 +473,47 @@ def apply_dora_peft(model):
     
     return model
 
+# ↓ put near the other class definitions
+class E2EDataCollator:
+    """
+    Pads input_ids / attention_mask / labels to the
+    longest sequence in the batch (or to a multiple-of-8)
+    and converts them to tensors.  ‘labels’ are padded with –100.
+    """
+    def __init__(self, tokenizer, pad_to_multiple_of=8):
+        self.tok = tokenizer
+        self.mult = pad_to_multiple_of
+
+    def _pad(self, seq, pad_id, max_len):
+        pad_len = max_len - len(seq)
+        return seq + [pad_id] * pad_len
+
+    def __call__(self, features):
+        # 1) work on python lists
+        max_len = max(len(f["input_ids"]) for f in features)
+        if self.mult:
+            max_len = ( (max_len + self.mult - 1) // self.mult ) * self.mult
+
+        input_ids, attn, labels = [], [], []
+        for f in features:
+            input_ids.append(
+                self._pad(f["input_ids"], self.tok.pad_token_id, max_len)
+            )
+            attn.append(
+                self._pad(f["attention_mask"], 0, max_len)
+            )
+            labels.append(
+                self._pad(f["labels"], -100, max_len)
+            )
+
+        # 2) stack into tensors
+        batch = {
+            "input_ids":      torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attn,      dtype=torch.float),
+            "labels":         torch.tensor(labels,    dtype=torch.long),
+        }
+        return batch
+
 
 # --- 5. Generation Function for Sanity Checks (modified) ---
 def generate_sanity_check(model, tokenizer, device):
@@ -556,7 +591,7 @@ def main(args):
     model.tail.print_trainable_parameters()
 
     train_dataset = E2EJsonDataset(json_file=args.train_file, tokenizer=tokenizer, max_length=args.max_length)
-    data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=8)
+    data_collator = E2EDataCollator(tokenizer, pad_to_multiple_of=8)
     train_loader  = DataLoader(train_dataset,
                             batch_size=args.batch_size,
                             shuffle=True,
