@@ -66,7 +66,7 @@ class E2EJsonDataset(Dataset):
             "labels": labels
         }
 
-# --- 2. U-Shaped Split Architecture Components (Unchanged) ---
+# --- 2. U-Shaped Split Architecture Components (FIX in HeadModel) ---
 class HeadModel(nn.Module):
     def __init__(self, base_model):
         super().__init__()
@@ -87,7 +87,8 @@ class HeadModel(nn.Module):
         device = input_ids.device
 
         past_length = 0
-        if past_key_values is not None:
+        # --- FIX: Check that the content of past_key_values is not None before subscripting ---
+        if past_key_values is not None and past_key_values[0] is not None:
             past_length = past_key_values[0][0].size(-2)
 
         position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
@@ -171,11 +172,9 @@ class UShaped_GPT2_Model(GPT2PreTrainedModel, GenerationMixin):
         # Ensure the main_input_name is defined for GenerationMixin
         self.main_input_name = "input_ids"
 
-    # --- FIX: Implement get_input_embeddings to solve the NotImplementedError ---
     def get_input_embeddings(self):
         return self.head.wte
 
-    # --- FIX: Implement set_input_embeddings for API completeness ---
     def set_input_embeddings(self, new_embeddings):
         self.head.wte = new_embeddings
 
@@ -395,7 +394,7 @@ if __name__ == '__main__':
     parser.add_argument("--dev_file", type=str, required=True, help="Path to the validation JSON file.")
     parser.add_argument("--output_dir", type=str, default="./e2e_u_shaped_gpt2_dora_fixed", help="Directory to save the fine-tuned model.")
     parser.add_argument("--model_name", type=str, default="gpt2", help="Name of the pre-trained model to use.")
-    parser.add_argument("--num_epochs", type=int, default=3, help="Number of training epochs.")
+    parser.add_argument("--num_epochs", type=int, default=5, help="Number of training epochs.")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size for training.")
     parser.add_argument("--learning_rate", type=float, default=5e-5, help="Learning rate for the optimizer.")
     parser.add_argument("--max_length", type=int, default=128, help="Maximum sequence length for the tokenizer.")
