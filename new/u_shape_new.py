@@ -6,6 +6,8 @@ import argparse
 from torch.utils.data import Dataset, DataLoader
 # --- FIX: AdamW is now imported from torch.optim ---
 from torch.optim import AdamW 
+import torch.nn.functional as F
+
 from transformers import GPT2Tokenizer, GPT2LMHeadModel, get_linear_schedule_with_warmup
 from tqdm import tqdm
 import os
@@ -255,63 +257,66 @@ class UShaped_GPT2_Model(nn.Module):
         
         return output
 
-    def generate(self, input_ids, attention_mask=None, **kwargs):
-        """Generation method for inference"""
+    def generate(self, input_ids, attention_mask=None, max_new_tokens=25, temperature=0.8, 
+             top_p=0.9, repetition_penalty=1.3, length_penalty=1.2, early_stopping=True, **kwargs):
         self.eval()
+        
         with torch.no_grad():
-            max_new_tokens = kwargs.get("max_new_tokens", 25)
-            temperature = kwargs.get("temperature", 0.8)
-            top_p = kwargs.get("top_p", 0.9)
-            repetition_penalty = kwargs.get("repetition_penalty", 1.3)
-            pad_token_id = kwargs.get("pad_token_id", input_ids.shape[-1])
-            eos_token_id = kwargs.get("eos_token_id", input_ids.shape[-1])
-
-            generated = input_ids.clone()
-
+            batch_size, seq_length = input_ids.shape
+            device = input_ids.device
+            
+            # Initialize sequences and attention masks
+            generated_ids = input_ids.clone()
+            current_attention_mask = attention_mask.clone() if attention_mask is not None else torch.ones_like(input_ids)
+            
             for step in range(max_new_tokens):
-                # Forward pass through the U-shaped pipeline
-                hidden_states, current_attention_mask = self.head(generated, attention_mask)
-                hidden_states, current_attention_mask = self.server(hidden_states, current_attention_mask) 
-                output = self.tail(hidden_states, current_attention_mask)
-
-                # Get next token logits
-                next_token_logits = output["logits"][:, -1, :] / temperature
-
+                # Process through head and server
+                hidden_states, current_attention_mask = self.head(generated_ids, current_attention_mask)
+                hidden_states, current_attention_mask = self.server(hidden_states, current_attention_mask)
+                
+                # FIXED: Use keyword arguments for tail
+                output = self.tail(hidden_states=hidden_states, attention_mask=current_attention_mask)
+                
+                logits = output['logits']
+                next_token_logits = logits[:, -1, :] / temperature
+                
                 # Apply repetition penalty
                 if repetition_penalty != 1.0:
-                    for i in range(generated.shape[0]):
-                        for token_id in set(generated[i].tolist()):
-                            next_token_logits[i, token_id] /= repetition_penalty
-
-                # Apply top-p sampling
+                    for i in range(batch_size):
+                        for previous_token in set(generated_ids[i].tolist()):
+                            next_token_logits[i, previous_token] /= repetition_penalty
+                
+                # Apply top-p filtering
                 if top_p < 1.0:
                     sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-                    cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
                     sorted_indices_to_remove = cumulative_probs > top_p
                     sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                     sorted_indices_to_remove[..., 0] = 0
-
-                    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                    next_token_logits[indices_to_remove] = float('-inf')
-
+                    
+                    for i in range(batch_size):
+                        indices_to_remove = sorted_indices[i, sorted_indices_to_remove[i]]
+                        next_token_logits[i, indices_to_remove] = float('-inf')
+                
                 # Sample next token
-                probs = torch.softmax(next_token_logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
-
-                # Check for EOS token
-                if next_token.item() == eos_token_id:
-                    break
-
-                # Append to generated sequence
-                generated = torch.cat([generated, next_token], dim=-1)
-
+                probs = F.softmax(next_token_logits, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1)
+                
+                # Append to sequences
+                generated_ids = torch.cat([generated_ids, next_tokens], dim=-1)
+                
                 # Update attention mask
-                if attention_mask is not None:
-                    attention_mask = torch.cat([attention_mask, torch.ones((attention_mask.shape[0], 1), 
-                                                                          device=attention_mask.device)], dim=-1)
+                current_attention_mask = torch.cat([
+                    current_attention_mask, 
+                    torch.ones(batch_size, 1, device=device)
+                ], dim=-1)
+                
+                # Check for early stopping
+                if early_stopping and (next_tokens == self.tokenizer.eos_token_id).any():
+                    break
+                    
+        return generated_ids
 
-        self.train()
-        return generated
 
 # --- 3. Model and Tokenizer Setup (modified) ---
 def setup_model_and_tokenizer(model_name):
