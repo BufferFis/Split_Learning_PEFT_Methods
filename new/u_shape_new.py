@@ -276,13 +276,14 @@ class TailModel(nn.Module):
 
 class UShaped_GPT2_Model(nn.Module):
     """Complete U-shaped model pipeline"""
-    def __init__(self, base_model):
+    def __init__(self, base_model, tokenizer=None):
         super().__init__()
         self.config = base_model.config
         self.head = HeadModel(base_model)
         self.server = ServerModel(base_model)
         self.tail = TailModel(base_model)
-        
+        self.tokenizer = tokenizer
+
     def forward(self, input_ids, attention_mask=None, labels=None):
         print(f"Input shape: {input_ids.shape}")
         
@@ -305,7 +306,7 @@ class UShaped_GPT2_Model(nn.Module):
         return output
 
     def generate(self, input_ids, attention_mask=None, max_new_tokens=25, temperature=0.8, 
-             top_p=0.9, repetition_penalty=1.3, length_penalty=1.2, early_stopping=True, **kwargs):
+             top_p=0.9, repetition_penalty=1.3, length_penalty=1.2, early_stopping=True,eos_token_id=None, **kwargs):
         self.eval()
         
         with torch.no_grad():
@@ -359,7 +360,7 @@ class UShaped_GPT2_Model(nn.Module):
                 ], dim=-1)
                 
                 # Check for early stopping
-                if early_stopping and (next_tokens == self.tokenizer.eos_token_id).any():
+                if early_stopping and eos_token_id is not None and (next_tokens == eos_token_id).any():
                     break
                     
             return generated_ids
@@ -388,8 +389,8 @@ def setup_model_and_tokenizer(model_name):
     base_model.config.pad_token_id = tokenizer.pad_token_id
     
     # Create U-shaped model with consistent config
-    u_shaped_model = UShaped_GPT2_Model(base_model)
     
+    u_shaped_model = UShaped_GPT2_Model(base_model, tokenizer)
     return u_shaped_model, tokenizer
 
 
