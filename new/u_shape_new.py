@@ -77,7 +77,7 @@ class E2EJsonDataset(Dataset):
         ids_delim = self.DELIM_TOKENS
         
         # Build full sequence
-        full_sequence = ids_mr + ids_delim + ids_ref + [self.tokenizer.eos_token_id]
+        full_sequence = ids_mr + ids_delim + ids_ref
         
         # Truncate if necessary
         if len(full_sequence) > SEQ_LEN:
