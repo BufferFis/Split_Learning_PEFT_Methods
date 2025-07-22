@@ -22,7 +22,9 @@ class E2EJsonDataset(Dataset):
         self.data = []
         
         # Define delimiter tokens
-        self.DELIM_TOKENS = tokenizer.encode(" <REF>", add_special_tokens=False)
+        delim_id = tokenizer.convert_tokens_to_ids("<REF>")
+        self.DELIM_TOKENS = [delim_id]
+
         print(f"🔍 Delimiter tokens: {self.DELIM_TOKENS}")
         print(f"🔍 Delimiter decoded: '{tokenizer.decode(self.DELIM_TOKENS)}'")
         
@@ -99,7 +101,10 @@ class E2EJsonDataset(Dataset):
             labels = [-100] * len(input_ids)
         
         attention_mask = [1] * len(input_ids)
-        
+        print("ids_delim:", ids_delim)
+        print("first 20 input_ids:", input_ids[:20])
+        print("delim_pos:", delim_pos)
+        print("labels[:20]:", labels[:20])
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -604,7 +609,7 @@ def main(args):
         weight_decay=0.01
     )
     total_steps = len(train_loader) * args.num_epochs
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0.1 * total_steps, num_training_steps=total_steps)
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(0.1 * total_steps), num_training_steps=total_steps)
 
     model.train()
     best_loss = float('inf')
