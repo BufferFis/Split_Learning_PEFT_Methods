@@ -15,72 +15,75 @@ from peft import get_peft_model, LoraConfig, TaskType
 
 # --- 1. Data Preparation Class for JSON (unchanged) ---
 class E2EJsonDataset(Dataset):
-    def __init__(self, json_file, tokenizer, max_length):
-        # Load data from the JSON file
-        with open(json_file, 'r', encoding='utf-8') as f:
-            self.data = json.load(f)
+    def __init__(self, json_file, tokenizer, max_length=128):
         self.tokenizer = tokenizer
         self.max_length = max_length
-        # Special tokens to separate MR from the reference text
-        self.mr_start_token = '<MR>'
-        self.ref_start_token = '<REF>'
-
+        self.data = []
+        
+        # Load E2E JSON data
+        with open(json_file, 'r', encoding='utf-8') as f:
+            raw_data = json.load(f)
+        
+        # Process E2E dataset format correctly
+        for item in raw_data:
+            if isinstance(item, dict) and 'mr' in item and 'txt' in item:
+                # Extract meaning representation from nested structure
+                mr_dict = item['mr']['value'] if 'value' in item['mr'] else item['mr']
+                reference = item['txt']  # Use actual reference text
+                
+                # Build MR string from non-empty attributes only
+                mr_parts = []
+                for key, value in mr_dict.items():
+                    if value and str(value).strip():  # Only include non-empty values
+                        # Clean up the key names for better formatting
+                        clean_key = key.replace('customer rating', 'customerRating').replace(' ', '')
+                        mr_parts.append(f"{clean_key}[{value}]")
+                
+                if mr_parts:  # Only process if we have valid MR
+                    mr_string = ", ".join(mr_parts)
+                    self.data.append({
+                        'mr': mr_string,
+                        'reference': reference
+                    })
+        
+        print(f"✅ Loaded {len(self.data)} E2E examples")
+        if len(self.data) > 0:
+            print(f"📝 Sample MR: {self.data[0]['mr']}")
+            print(f"📝 Sample Reference: {self.data[0]['reference']}")
+        
     def __len__(self):
         return len(self.data)
-
+    
     def __getitem__(self, idx):
         item = self.data[idx]
-
-        # --- The Core Change: Processing JSON MR ---
-        # Linearize the MR from the dictionary format into a string
-        # e.g., {"name": "The Eagle"} -> "name[The Eagle]"
-        mr_dict = item['mr']['value']
-        mr_parts = []
-        for key, value in mr_dict.items():
-            # Only include fields that have a value
-            if value and str(value).strip():
-                mr_parts.append(f"{key}[{value}]")
-        mr = ", ".join(mr_parts)
-
-        # The reference text is in the 'txt' field
-        ref = item['txt']
-
-        # Combine MR and REF into a single sequence for the causal LM
-        # Format: <MR> MR_TEXT <REF> REF_TEXT <|endoftext|>
-        formatted_text = (f"{self.mr_start_token} {mr} "
-                          f"{self.ref_start_token} {ref} "
-                          f"{self.tokenizer.eos_token}")
-
-        tokenized = self.tokenizer(formatted_text,
-                                   max_length=self.max_length,
-                                   padding="max_length",
-                                   truncation=True,
-                                   return_tensors="pt")
+        mr = item['mr']
+        reference = item['reference']
+        
+        # CRITICAL FIX: Proper E2E training format
+        formatted_text = f"<MR> {mr} <REF> {reference}"
+        
+        # Tokenize with proper settings
+        tokenized = self.tokenizer(
+            formatted_text,
+            max_length=self.max_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt"
+        )
 
         input_ids = tokenized['input_ids'].squeeze()
-        attention_mask = tokenized['attention_mask'].squeeze()
-
-        # Create labels for loss calculation
+        attention_mask = tokenized['attention_mask'].squeeze().to(dtype=torch.float32)
+        
+        # Create labels for causal language modeling
         labels = input_ids.clone()
-
-        # Find the start of the reference text to apply the loss mask
-        ref_start_token_id = self.tokenizer.convert_tokens_to_ids(self.ref_start_token)
-        ref_start_indices = (labels == ref_start_token_id).nonzero(as_tuple=True)[0]
-
-        if len(ref_start_indices) > 0:
-            # Mask out the MR part by setting its labels to -100
-            # The loss will only be calculated on the reference text.
-            mask_end_index = ref_start_indices[0]
-            labels[:mask_end_index] = -100
-        else:
-            # If the ref start token is not found, mask everything
-            labels[:] = -100
-
+        labels[attention_mask == 0] = -100  # Ignore padding in loss calculation
+        
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels
         }
+
 
 # --- 2. U-Shaped Split Architecture Components ---
 class HeadModel(nn.Module):
@@ -446,40 +449,65 @@ def apply_dora_peft(model):
 
 
 # --- 5. Generation Function for Sanity Checks (modified) ---
-def generate_sanity_check(model, tokenizer, device, mr_string="name[NAME], eatType[restaurant], food[Italian]"):
+def generate_sanity_check(model, tokenizer, device):
+    """Fixed sanity check for E2E generation"""
     model.eval()
-    mr_start_token = '<MR>'
-    ref_start_token = '<REF>'
-    prompt = f"{mr_start_token} {mr_string} {ref_start_token}"
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
-
-    generation_config = {
-        "max_new_tokens": 25,  # Fixed for E2E dataset
-        "temperature": 0.8,
-        "top_p": 0.9,
-        "repetition_penalty": 1.3,
-        "pad_token_id": tokenizer.pad_token_id,
-        "eos_token_id": tokenizer.eos_token_id
-    }
-
-    with torch.no_grad():
-        output_sequences = model.generate(
-            input_ids=inputs['input_ids'], 
-            attention_mask=inputs['attention_mask'], 
-            **generation_config
-        )
-
-    generated_text = tokenizer.decode(output_sequences[0], skip_special_tokens=True)
-
-    try:
-        cleaned_text = generated_text.split(ref_start_token)[-1].strip()
-    except IndexError:
-        cleaned_text = generated_text 
-
-    print("\n=== Sanity Generation ===")
-    print(f"Sanity MR: {mr_string}")
-    print(f"Sanity PRED: {cleaned_text}\n")
+    
+    # FIXED: Use proper E2E test examples
+    test_examples = [
+        "name[NAME], eatType[restaurant], food[Italian]",
+        "name[The Vaults], eatType[pub], priceRange[more than £30], customerRating[5 out of 5], near[CAFÉ ADRIATIC]",
+        "name[Alimentum], area[riverside], familyFriendly[yes], near[Burger King]"
+    ]
+    
+    print("\n" + "="*50)
+    print("🎯 SANITY CHECK - E2E GENERATION")
+    print("="*50)
+    
+    for i, test_mr in enumerate(test_examples):
+        print(f"\n--- Test {i+1} ---")
+        print(f"📥 Input MR: {test_mr}")
+        
+        # Format input properly
+        input_text = f"<MR> {test_mr} <REF>"
+        inputs = tokenizer(input_text, return_tensors="pt").to(device)
+        
+        # FIXED: Generation parameters optimized for E2E
+        with torch.no_grad():
+            output_sequences = model.generate(
+                input_ids=inputs['input_ids'],
+                attention_mask=inputs['attention_mask'],
+                max_new_tokens=30,  # Reduced for E2E length
+                temperature=0.7,    # Lower temperature for stability
+                top_p=0.9,
+                repetition_penalty=2.0,  # Higher to prevent repetition
+                length_penalty=1.1,
+                early_stopping=True,
+                do_sample=True,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id
+            )
+        
+        # Decode and clean output
+        generated_text = tokenizer.batch_decode(output_sequences, skip_special_tokens=True)[0]
+        
+        # Extract only the generated part (after <REF>)
+        if "<REF>" in generated_text:
+            generated_part = generated_text.split("<REF>", 1)[1].strip()
+        else:
+            generated_part = generated_text.replace(input_text, "").strip()
+        
+        print(f"📤 Generated: {generated_part}")
+        
+        # Check for quality indicators
+        if len(generated_part.split()) < 5:
+            print("⚠️  Warning: Output too short")
+        if "THE WRESTLERS" in generated_part or len(set(generated_part.split())) < len(generated_part.split()) * 0.7:
+            print("⚠️  Warning: Repetitive output detected")
+    
+    print("="*50)
     model.train()
+
 
 # --- 6. Main Training Function (modified) ---
 def main(args):
@@ -533,7 +561,6 @@ def main(args):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
-
             model.zero_grad()
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
             loss = outputs["loss"]
