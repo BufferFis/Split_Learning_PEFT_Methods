@@ -8,7 +8,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW 
 import torch.nn.functional as F
 import subprocess, sys
-
+from transformers import DataCollatorWithPadding
 from transformers import GPT2Tokenizer, GPT2LMHeadModel, get_linear_schedule_with_warmup
 from tqdm import tqdm
 import os
@@ -120,12 +120,6 @@ class E2EJsonDataset(Dataset):
         input_ids = processed["input_ids"]
         attention_mask = processed["attention_mask"] 
         labels = processed["labels"]
-        
-        # Pad sequences to max_length
-        while len(input_ids) < self.max_length:
-            input_ids.append(self.tokenizer.pad_token_id)
-            attention_mask.append(0)
-            labels.append(-100)
         
         return {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
@@ -451,9 +445,9 @@ def apply_dora_peft(model):
     head_peft_config = LoraConfig(
         task_type=None,  # Use None to avoid inputs_embeds issues
         inference_mode=False,
-        r=16,
+        r=8,
         lora_alpha=32,
-        lora_dropout=0.1,
+        lora_dropout=0.5,
         target_modules=["c_attn", "c_proj", "c_fc"],
         use_dora=True
     )
@@ -463,9 +457,9 @@ def apply_dora_peft(model):
     server_peft_config = LoraConfig(
         task_type=None,  # Use None to avoid inputs_embeds issues
         inference_mode=False,
-        r=16,
+        r=8,
         lora_alpha=32,
-        lora_dropout=0.1,
+        lora_dropout=0.5,
         target_modules=["c_attn", "c_proj", "c_fc"],
         use_dora=True
     )
@@ -475,9 +469,9 @@ def apply_dora_peft(model):
     tail_peft_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         inference_mode=False,
-        r=16,
+        r=8,
         lora_alpha=32,
-        lora_dropout=0.1,
+        lora_dropout=0.5,
         target_modules=["c_attn", "c_proj", "c_fc"],
         use_dora=True
     )
@@ -509,12 +503,7 @@ def generate_sanity_check(model, tokenizer, device):
             output_sequences = model.generate(
                 input_ids=inputs['input_ids'],
                 attention_mask=inputs['attention_mask'],
-                max_new_tokens=30,              # Reduced for E2E length
-                # temperature=0.8,                # Slightly higher for creativity
-                # top_p=0.95,                    # Higher for more diverse vocabulary
-                # repetition_penalty=1.5,        # Reduced from 2.5
-                # no_repeat_ngram_size=3,        # Prevent 3-gram repetition
-                # early_stopping=True,
+                max_new_tokens=30,       
                 do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id
@@ -567,7 +556,11 @@ def main(args):
     model.tail.print_trainable_parameters()
 
     train_dataset = E2EJsonDataset(json_file=args.train_file, tokenizer=tokenizer, max_length=args.max_length)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=8)
+    train_loader  = DataLoader(train_dataset,
+                            batch_size=args.batch_size,
+                            shuffle=True,
+                            collate_fn=data_collator)
 
     # Optimizer for all trainable parameters across all stages
     optimizer = AdamW(
@@ -656,7 +649,7 @@ if __name__ == '__main__':
     parser.add_argument("--num_epochs", type=int, default=3, help="Number of training epochs.")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size for training.")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate for the optimizer.")
-    parser.add_argument("--max_length", type=int, default=256, help="Maximum sequence length for the tokenizer.")
+    parser.add_argument("--max_length", type=int, default=128, help="Maximum sequence length for the tokenizer.")
     parser.add_argument("--sanity_check_steps", type=int, default=500, help="Perform a sanity check every N steps.")
 
     args = parser.parse_args()
