@@ -37,7 +37,7 @@ class E2EJsonDataset(Dataset):
         for item in raw_data:
             if isinstance(item, dict) and 'mr' in item and 'txt' in item:
                 # Extract meaning representation from nested structure
-                mr_dict = item['mr']['value'] if 'value' in item['mr'] else item['mr']
+                mr_dict = item['mr']['value_lex'] if 'value_lex' in item['mr'] else item['mr']
                 reference = item['txt']  # Use actual reference text
                 
                 # Build MR string from non-empty attributes only
@@ -64,7 +64,7 @@ class E2EJsonDataset(Dataset):
         return len(self.data)
     
     def preprocess(self, example, sequence_length=None):
-        """FIXED: Proper label alignment with DEBUG output"""
+        """Optimized preprocessing without excessive debug output"""
         SEQ_LEN = sequence_length if sequence_length is not None else self.max_length
         
         mr = example["meaning_representation"]
@@ -75,66 +75,29 @@ class E2EJsonDataset(Dataset):
         ids_ref = self.tokenizer.encode(ref, add_special_tokens=False)
         ids_delim = self.DELIM_TOKENS
         
-        # DEBUG: Print tokenization details
-        print(f"\n=== PREPROCESSING DEBUG ===")
-        print(f"MR: {mr}")
-        print(f"REF: {ref}")
-        print(f"MR tokens: {ids_mr} -> {self.tokenizer.decode(ids_mr)}")
-        print(f"REF tokens: {ids_ref} -> {self.tokenizer.decode(ids_ref)}")
-        print(f"DELIM tokens: {ids_delim} -> {self.tokenizer.decode(ids_delim)}")
-        
         # Build full sequence
         full_sequence = ids_mr + ids_delim + ids_ref
-        print(f"Full sequence length: {len(full_sequence)}")
-        print(f"Full sequence: {self.tokenizer.decode(full_sequence)}")
         
         # Truncate if necessary
         if len(full_sequence) > SEQ_LEN:
             input_ids = full_sequence[:SEQ_LEN]
-            print(f"⚠️ TRUNCATED to {SEQ_LEN} tokens")
         else:
             input_ids = full_sequence
         
-        # Create labels based on ACTUAL input_ids length
-        labels = []
-        
-        # Find delimiter position in the ACTUAL input_ids
+        # Find delimiter and create labels
         delim_pos = None
         for i in range(len(input_ids) - len(ids_delim) + 1):
             if input_ids[i:i+len(ids_delim)] == ids_delim:
                 delim_pos = i
                 break
         
-        print(f"Delimiter position: {delim_pos}")
-        print(f"Delimiter tokens to find: {ids_delim}")
-        
         if delim_pos is not None:
-            # Mask everything before and including delimiter
             mask_length = delim_pos + len(ids_delim)
-            labels = [-100] * mask_length
-            
-            # Add remaining tokens as targets
-            remaining_tokens = input_ids[mask_length:]
-            labels.extend(remaining_tokens)
-            
-            print(f"Masked {mask_length} tokens")
-            print(f"Training on {len(remaining_tokens)} tokens: {self.tokenizer.decode(remaining_tokens)}")
+            labels = [-100] * mask_length + input_ids[mask_length:]
         else:
-            # Delimiter not found (heavily truncated) - mask everything
             labels = [-100] * len(input_ids)
-            print(f"⚠️ DELIMITER NOT FOUND - masking everything!")
-        
-        # Show label distribution
-        masked_count = sum(1 for x in labels if x == -100)
-        target_count = len(labels) - masked_count
-        print(f"Label distribution: {masked_count} masked, {target_count} targets")
-        
-        # Ensure exact length match
-        assert len(input_ids) == len(labels), f"Length mismatch: {len(input_ids)} vs {len(labels)}"
         
         attention_mask = [1] * len(input_ids)
-        
-        print(f"=== END DEBUG ===\n")
         
         return {
             "input_ids": input_ids,
@@ -143,6 +106,7 @@ class E2EJsonDataset(Dataset):
             "human_reference": ref,
             "meaning_representation": mr,
         }
+
 
     
     def __getitem__(self, idx):
@@ -199,8 +163,8 @@ class HeadModel(nn.Module):
             raise ValueError("You must specify either input_ids or inputs_embeds")
         
         # Debug: Print tensor shapes
-        print(f"HeadModel input shape: {hidden_states.shape}")
-        print(f"Expected hidden_size: {self.config.hidden_size}")
+        #print(f"HeadModel input shape: {hidden_states.shape}")
+        #print(f"Expected hidden_size: {self.config.hidden_size}")
         
         # Verify dimension consistency
         if hidden_states.size(-1) != self.config.hidden_size:
@@ -243,7 +207,7 @@ class ServerModel(nn.Module):
         elif hidden_states is None:
             raise ValueError("You must specify either hidden_states or inputs_embeds")
         
-        print(f"ServerModel input shape: {hidden_states.shape}")
+        #print(f"ServerModel input shape: {hidden_states.shape}")
         
         # Verify dimensions
         if hidden_states.size(-1) != self.config.hidden_size:
@@ -267,9 +231,9 @@ class ServerModel(nn.Module):
         
         # Pass through middle 4 transformer blocks with corrected attention mask
         for i, block in enumerate(self.h):
-            print(f"ServerModel block {i} input shape: {hidden_states.shape}")
+            #print(f"ServerModel block {i} input shape: {hidden_states.shape}")
             hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
-            print(f"ServerModel block {i} output shape: {hidden_states.shape}")
+            #print(f"ServerModel block {i} output shape: {hidden_states.shape}")
         
         # Return 2D attention mask for consistency with pipeline
         if attention_mask is not None and attention_mask.dim() == 4:
@@ -313,7 +277,7 @@ class TailModel(nn.Module):
         elif hidden_states is None:
             raise ValueError("You must specify either hidden_states or inputs_embeds")
             
-        print(f"TailModel input shape: {hidden_states.shape}")
+        #print(f"TailModel input shape: {hidden_states.shape}")
         
         # Verify dimensions
         if hidden_states.size(-1) != self.config.hidden_size:
@@ -322,8 +286,8 @@ class TailModel(nn.Module):
         
         # CRITICAL FIX: Convert attention mask dtype and shape
         if attention_mask is not None:
-            print(f"TailModel attention mask input shape: {attention_mask.shape}")
-            print(f"TailModel attention mask dtype: {attention_mask.dtype}")
+            #print(f"TailModel attention mask input shape: {attention_mask.shape}")
+            #print(f"TailModel attention mask dtype: {attention_mask.dtype}")
             
             # Convert from long to float if needed
             if attention_mask.dtype == torch.long:
@@ -338,13 +302,13 @@ class TailModel(nn.Module):
                 # Apply mask transformation (0 for attend, large negative for mask)
                 attention_mask = (1.0 - attention_mask) * torch.finfo(hidden_states.dtype).min
                 
-            print(f"TailModel attention mask after conversion: {attention_mask.shape}")
+            #print(f"TailModel attention mask after conversion: {attention_mask.shape}")
         
         # Process through transformer blocks with corrected attention mask
         for i, block in enumerate(self.h):
-            print(f"TailModel block {i} input shape: {hidden_states.shape}")
+            #print(f"TailModel block {i} input shape: {hidden_states.shape}")
             hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
-            print(f"TailModel block {i} output shape: {hidden_states.shape}")
+            #print(f"TailModel block {i} output shape: {hidden_states.shape}")
         
         # Final layer norm and output
         hidden_states = self.ln_f(hidden_states)
@@ -373,15 +337,15 @@ class UShaped_GPT2_Model(nn.Module):
         self.tokenizer = tokenizer
 
     def forward(self, input_ids, attention_mask=None, labels=None):
-        print(f"Input shape: {input_ids.shape}")
+        #print(f"Input shape: {input_ids.shape}")
         
         # Stage 1: Head processing
         hidden_states, attention_mask = self.head(input_ids, attention_mask)
-        print(f"After head: {hidden_states.shape}")
+        #print(f"After head: {hidden_states.shape}")
         
         # Stage 2: Server processing  
         hidden_states, attention_mask = self.server(hidden_states, attention_mask)
-        print(f"After server: {hidden_states.shape}")
+        #print(f"After server: {hidden_states.shape}")
         
         # Stage 3: Tail processing - FIX: Use keyword arguments
         output = self.tail(
@@ -389,7 +353,7 @@ class UShaped_GPT2_Model(nn.Module):
             attention_mask=attention_mask, 
             labels=labels
         )
-        print(f"After tail: output logits shape: {output['logits'].shape}")
+        #print(f"After tail: output logits shape: {output['logits'].shape}")
         
         return output
 
@@ -457,6 +421,7 @@ class UShaped_GPT2_Model(nn.Module):
 
 # --- 3. Model and Tokenizer Setup (modified) ---
 def setup_model_and_tokenizer(model_name):
+    """Create U-shaped GPT-2 model with tokenizer"""
     tokenizer = GPT2Tokenizer.from_pretrained(model_name)
     base_model = GPT2LMHeadModel.from_pretrained(model_name)
     
@@ -476,10 +441,12 @@ def setup_model_and_tokenizer(model_name):
     base_model.resize_token_embeddings(len(tokenizer))
     base_model.config.pad_token_id = tokenizer.pad_token_id
     
-    # Create U-shaped model with consistent config
-    
+    # ✅ Create U-shaped model instead of returning base model
     u_shaped_model = UShaped_GPT2_Model(base_model, tokenizer)
+    
     return u_shaped_model, tokenizer
+
+
 
 
 # --- 4. Apply DoRA PEFT to U-shaped model ---
@@ -535,7 +502,7 @@ def apply_dora_peft(model):
 
 # --- 5. Generation Function for Sanity Checks (modified) ---
 def generate_sanity_check(model, tokenizer, device):
-    """Fixed sanity check matching training format exactly"""
+    """Optimized generation with better parameters"""
     model.eval()
     
     test_examples = [
@@ -543,40 +510,44 @@ def generate_sanity_check(model, tokenizer, device):
         "name[Alimentum], area[riverside], familyFriendly[yes], near[Burger King]"
     ]
     
+    print("\n🎯 E2E Generation Check")
+    
     for i, test_mr in enumerate(test_examples):
         print(f"\n--- Test {i+1} ---")
-        print(f"📥 Input MR: {test_mr}")
+        print(f"Input MR: {test_mr}")
         
-        # CRITICAL: Format must match training exactly
-        input_text = f"<MR> {test_mr} <REF>"  # Same as training format
-        
-        print(f"🔍 Formatted input: '{input_text}'")
+        input_text = f"<MR> {test_mr} <REF>"
         inputs = tokenizer(input_text, return_tensors="pt").to(device)
-        
-        # Debug tokenization
-        print(f"🔍 Input tokens: {inputs['input_ids'][0].tolist()}")
-        print(f"🔍 Decoded: '{tokenizer.decode(inputs['input_ids'][0])}'")
         
         with torch.no_grad():
             output_sequences = model.generate(
                 input_ids=inputs['input_ids'],
                 attention_mask=inputs['attention_mask'],
-                max_new_tokens=25,
-                temperature=0.7,
-                top_p=0.9,
-                repetition_penalty=2.5,
+                max_new_tokens=20,              # Reduced for E2E length
+                temperature=0.8,                # Slightly higher for creativity
+                top_p=0.95,                    # Higher for more diverse vocabulary
+                repetition_penalty=1.5,        # Reduced from 2.5
+                no_repeat_ngram_size=3,        # Prevent 3-gram repetition
                 early_stopping=True,
                 do_sample=True,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id
             )
         
-        # Extract only new tokens
         input_length = inputs['input_ids'].shape[1]
         generated_tokens = output_sequences[0][input_length:]
         generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
         
-        print(f"📤 Generated: {generated_text}")
+        print(f"Generated: {generated_text}")
+        
+        # Quality metrics
+        words = generated_text.split()
+        if words:
+            unique_ratio = len(set(words)) / len(words)
+            print(f"Quality: {len(words)} words, {unique_ratio:.2f} uniqueness")
+    
+    model.train()
+
 
 
 # --- 6. Main Training Function (modified) ---
@@ -624,6 +595,8 @@ def main(args):
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0.1 * total_steps, num_training_steps=total_steps)
 
     model.train()
+    best_loss = float('inf')
+    patience_counter = 0
     for epoch in range(args.num_epochs):
         print(f"--- Epoch {epoch+1}/{args.num_epochs} ---")
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
