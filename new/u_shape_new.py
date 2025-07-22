@@ -119,24 +119,24 @@ class HeadModel(nn.Module):
             raise ValueError(f"Hidden states dimension {hidden_states.size(-1)} doesn't match "
                            f"expected hidden_size {self.config.hidden_size}")
         
+        original_attention_mask = attention_mask
         # Fix attention mask handling
+        # Transform to 4D for transformer blocks
         if attention_mask is not None:
-            # Convert to proper format for transformer blocks
-            if attention_mask.dim() == 2:
-                batch_size, seq_length = attention_mask.shape
-                # Create causal mask
-                attention_mask = attention_mask.view(batch_size, 1, 1, seq_length)
-                attention_mask = attention_mask.to(dtype=hidden_states.dtype)
-                # Apply inverted mask (0 for attend, large negative for mask)
-                attention_mask = (1.0 - attention_mask) * torch.finfo(hidden_states.dtype).min
-        
-        # Pass through first 4 transformer blocks
-        for i, block in enumerate(self.h):
-            print(f"HeadModel block {i} input shape: {hidden_states.shape}")
-            hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
-            print(f"HeadModel block {i} output shape: {hidden_states.shape}")
+            if attention_mask.dtype == torch.long:
+                attention_mask = attention_mask.to(dtype=torch.float32)
             
-        return hidden_states, attention_mask
+            batch_size, seq_length = attention_mask.shape
+            attention_mask_4d = attention_mask.view(batch_size, 1, 1, seq_length)
+            attention_mask_4d = attention_mask_4d.to(dtype=hidden_states.dtype)
+            attention_mask_4d = (1.0 - attention_mask_4d) * torch.finfo(hidden_states.dtype).min
+        
+        # Pass through transformer blocks with 4D mask
+        for block in self.h:
+            hidden_states = block(hidden_states, attention_mask=attention_mask_4d)[0]
+        
+        # Return original 2D attention mask for pipeline consistency
+        return hidden_states, original_attention_mask
 
 
 
@@ -265,16 +265,16 @@ class UShaped_GPT2_Model(nn.Module):
             batch_size, seq_length = input_ids.shape
             device = input_ids.device
             
-            # Initialize sequences and attention masks
+            # Initialize sequences and attention masks (keep in 2D)
             generated_ids = input_ids.clone()
             current_attention_mask = attention_mask.clone() if attention_mask is not None else torch.ones_like(input_ids)
             
             for step in range(max_new_tokens):
-                # Process through head and server
-                hidden_states, current_attention_mask = self.head(generated_ids, current_attention_mask)
-                hidden_states, current_attention_mask = self.server(hidden_states, current_attention_mask)
+                # Process through head and server (they will handle 4D conversion internally)
+                hidden_states, _ = self.head(generated_ids, current_attention_mask)
+                hidden_states, _ = self.server(hidden_states, current_attention_mask)
                 
-                # FIXED: Use keyword arguments for tail
+                # Process through tail
                 output = self.tail(hidden_states=hidden_states, attention_mask=current_attention_mask)
                 
                 logits = output['logits']
@@ -305,17 +305,18 @@ class UShaped_GPT2_Model(nn.Module):
                 # Append to sequences
                 generated_ids = torch.cat([generated_ids, next_tokens], dim=-1)
                 
-                # Update attention mask
+                # FIXED: Update attention mask in 2D format
                 current_attention_mask = torch.cat([
-                    current_attention_mask, 
-                    torch.ones(batch_size, 1, device=device)
+                    current_attention_mask,  # 2D: [batch, seq_len]
+                    torch.ones(batch_size, 1, device=device)  # 2D: [batch, 1]
                 ], dim=-1)
                 
                 # Check for early stopping
                 if early_stopping and (next_tokens == self.tokenizer.eos_token_id).any():
                     break
                     
-        return generated_ids
+            return generated_ids
+
 
 
 # --- 3. Model and Tokenizer Setup (modified) ---
