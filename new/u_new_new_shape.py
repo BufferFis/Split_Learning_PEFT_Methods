@@ -7,7 +7,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 import torch.nn.functional as F
 import subprocess, sys
-# --- FIX: Import GenerationMixin to address the warning ---
+# --- Import GenerationMixin to address the warning ---
 from transformers import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.gpt2.modeling_gpt2 import GPT2PreTrainedModel
@@ -98,8 +98,6 @@ class HeadModel(nn.Module):
         hidden_states = self.drop(inputs_embeds + position_embeds)
 
         if attention_mask is not None:
-            # This logic is for causal masking, which is handled by the model itself.
-            # We only need to handle padding mask.
             attention_mask_4d = attention_mask.view(batch_size, 1, 1, -1)
             attention_mask_4d = attention_mask_4d.to(dtype=hidden_states.dtype)
             attention_mask_4d = (1.0 - attention_mask_4d) * torch.finfo(hidden_states.dtype).min
@@ -162,7 +160,7 @@ class TailModel(nn.Module):
         return lm_logits, tuple(presents)
 
 
-# --- FIX: Inherit from GenerationMixin to silence the warning and ensure future compatibility ---
+# --- Inherit from GenerationMixin to silence the warning and ensure future compatibility ---
 class UShaped_GPT2_Model(GPT2PreTrainedModel, GenerationMixin):
     def __init__(self, config):
         super().__init__(config)
@@ -173,6 +171,13 @@ class UShaped_GPT2_Model(GPT2PreTrainedModel, GenerationMixin):
         # Ensure the main_input_name is defined for GenerationMixin
         self.main_input_name = "input_ids"
 
+    # --- FIX: Implement get_input_embeddings to solve the NotImplementedError ---
+    def get_input_embeddings(self):
+        return self.head.wte
+
+    # --- FIX: Implement set_input_embeddings for API completeness ---
+    def set_input_embeddings(self, new_embeddings):
+        self.head.wte = new_embeddings
 
     def get_output_embeddings(self):
         return self.tail.lm_head
@@ -181,10 +186,8 @@ class UShaped_GPT2_Model(GPT2PreTrainedModel, GenerationMixin):
         self.tail.lm_head = new_embeddings
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
-        # This implementation is mostly correct for autoregressive decoding
         token_type_ids = kwargs.get("token_type_ids", None)
-        
-        # only last token for inputs_ids if past is defined in kwargs
+
         if past_key_values:
             input_ids = input_ids[:, -1].unsqueeze(-1)
             if token_type_ids is not None:
@@ -194,7 +197,6 @@ class UShaped_GPT2_Model(GPT2PreTrainedModel, GenerationMixin):
         position_ids = kwargs.get("position_ids", None)
 
         if attention_mask is not None and position_ids is None:
-            # create position_ids on the fly for batch generation
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
             if past_key_values:
@@ -213,11 +215,10 @@ class UShaped_GPT2_Model(GPT2PreTrainedModel, GenerationMixin):
 
     def forward(self, input_ids, attention_mask=None, labels=None, past_key_values=None, use_cache=None, **kwargs):
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-        
+
         if past_key_values is None:
             past_key_values = [None] * self.config.num_hidden_layers
 
-        # Split past_key_values for each part of the model
         head_past = tuple(past_key_values[i] for i in range(4))
         server_past = tuple(past_key_values[i] for i in range(4, 8))
         tail_past = tuple(past_key_values[i] for i in range(8, 12))
@@ -225,7 +226,7 @@ class UShaped_GPT2_Model(GPT2PreTrainedModel, GenerationMixin):
         hidden_states, head_present = self.head(input_ids=input_ids, past_key_values=head_past, attention_mask=attention_mask, **kwargs)
         hidden_states, server_present = self.server(hidden_states=hidden_states, past_key_values=server_past, attention_mask=attention_mask, **kwargs)
         logits, tail_present = self.tail(hidden_states=hidden_states, past_key_values=tail_past, attention_mask=attention_mask, **kwargs)
-        
+
         past_key_values_present = head_present + server_present + tail_present if use_cache else None
 
         loss = None
@@ -244,7 +245,7 @@ class UShaped_GPT2_Model(GPT2PreTrainedModel, GenerationMixin):
 # --- 3. Model and Tokenizer Setup (Modified) ---
 def setup_model_and_tokenizer(model_name):
     tokenizer = GPT2Tokenizer.from_pretrained(model_name)
-    
+
     special_tokens_dict = {
         'bos_token': '<|endoftext|>',
         'eos_token': '<|endoftext|>',
@@ -252,20 +253,16 @@ def setup_model_and_tokenizer(model_name):
         'additional_special_tokens': ['<MR>', '<REF>']
     }
     tokenizer.add_special_tokens(special_tokens_dict)
-    
-    # Load config from pretrained model
+
     config = GPT2LMHeadModel.from_pretrained(model_name).config
     config.pad_token_id = tokenizer.pad_token_id
-    
-    # --- FIX: Set vocab_size, NOT n_embd. This is the correct parameter. ---
+
     config.vocab_size = len(tokenizer)
 
-    # Create our custom U-shaped model with the corrected config
     u_shaped_model = UShaped_GPT2_Model(config)
-    
-    # Resize the token embeddings layer to match the new vocabulary size
+
     u_shaped_model.resize_token_embeddings(len(tokenizer))
-    
+
     return u_shaped_model, tokenizer
 
 # --- 4. Apply DoRA PEFT to U-shaped model (Simplified) ---
@@ -321,7 +318,7 @@ def generate_sanity_check(model, tokenizer, device):
     for i, test_mr in enumerate(test_examples):
         print(f"\n--- Test {i+1} ---")
         print(f"Input MR: {test_mr}")
-        
+
         input_text = f"<MR> {test_mr} <REF>"
         inputs = tokenizer(input_text, return_tensors="pt").to(device)
 
@@ -339,7 +336,7 @@ def generate_sanity_check(model, tokenizer, device):
         input_length = inputs['input_ids'].shape[1]
         generated_tokens = output_sequences[0][input_length:]
         generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-        
+
         print(f"Generated: {generated_text.strip()}")
     print("="*63 + "\n")
     model.train()
@@ -385,13 +382,13 @@ def main(args):
 
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
-        
+
     model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
-    
+
     print(f"\nTraining complete. Model saved to {args.output_dir}")
 
-# --- 7. Entry Point and Argument Parsing ---
+# --- 7. Entry Point and Argument Parsing (Unchanged) ---
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Fine-tune a U-shaped GPT-2 model on E2E NLG from JSON data.")
     parser.add_argument("--train_file", type=str, required=True, help="Path to the training JSON file.")
@@ -401,7 +398,6 @@ if __name__ == '__main__':
     parser.add_argument("--num_epochs", type=int, default=3, help="Number of training epochs.")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size for training.")
     parser.add_argument("--learning_rate", type=float, default=5e-5, help="Learning rate for the optimizer.")
-    # --- FIX: Changed add_parent to the correct method name: add_argument ---
     parser.add_argument("--max_length", type=int, default=128, help="Maximum sequence length for the tokenizer.")
     parser.add_argument("--sanity_check_steps", type=int, default=500, help="Perform a sanity check every N steps.")
 
