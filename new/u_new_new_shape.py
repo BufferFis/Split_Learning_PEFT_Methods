@@ -16,57 +16,41 @@ from tqdm import tqdm
 import os
 from peft import get_peft_model, LoraConfig, TaskType
 
-# --- 1. Data Preparation Class for JSON (Largely Unchanged) ---
+# --- 1. Data Preparation Class for JSON (Unchanged) ---
 class E2EJsonDataset(Dataset):
     def __init__(self, json_file, tokenizer, max_length=128):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.data = []
-
         self.DELIM_TOKENS = self.tokenizer.encode(" <REF>", add_special_tokens=False)
-
         with open(json_file, 'r', encoding='utf-8') as f:
             raw_data = json.load(f)
-
         for item in raw_data:
             if isinstance(item, dict) and 'mr' in item and 'txt' in item:
                 mr_dict = item['mr']['value'] if 'value' in item['mr'] else item['mr']
                 reference = item['txt']
-
                 mr_parts = [f"{key.replace(' ', '')}[{value}]" for key, value in mr_dict.items() if value and str(value).strip()]
-
                 if mr_parts:
                     self.data.append({
                         'meaning_representation': ", ".join(mr_parts),
                         'human_reference': reference
                     })
-
     def __len__(self):
         return len(self.data)
-
     def __getitem__(self, idx):
         item = self.data[idx]
         mr = item["meaning_representation"]
         ref = item["human_reference"]
-
         ids_mr = self.tokenizer.encode(f"<MR> {mr}", add_special_tokens=False)
         ids_ref = self.tokenizer.encode(ref, add_special_tokens=False)
-
         input_ids = ids_mr + self.DELIM_TOKENS + ids_ref
         input_ids = input_ids[:self.max_length]
-
         labels = [-100] * (len(ids_mr) + len(self.DELIM_TOKENS)) + ids_ref
         labels = labels[:self.max_length]
-
         attention_mask = [1] * len(input_ids)
+        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels
-        }
-
-# --- 2. U-Shaped Split Architecture Components (FIXED) ---
+# --- 2. U-Shaped Split Architecture Components (FINAL FIX) ---
 class HeadModel(nn.Module):
     def __init__(self, base_model):
         super().__init__()
@@ -85,14 +69,12 @@ class HeadModel(nn.Module):
             raise ValueError("You have to specify either input_ids")
 
         device = input_ids.device
-
         past_length = 0
         if past_key_values is not None and past_key_values[0] is not None:
             past_length = past_key_values[0][0].size(-2)
 
         position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
         position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
-
         inputs_embeds = self.wte(input_ids)
         position_embeds = self.wpe(position_ids)
         hidden_states = self.drop(inputs_embeds + position_embeds)
@@ -102,13 +84,11 @@ class HeadModel(nn.Module):
             attention_mask_4d = attention_mask_4d.to(dtype=hidden_states.dtype)
             attention_mask_4d = (1.0 - attention_mask_4d) * torch.finfo(hidden_states.dtype).min
 
-        presents = []
+        presents = [] if use_cache else None
         for i, block in enumerate(self.h):
             layer_past = past_key_values[i] if past_key_values is not None else None
-            # --- FIX: Pass use_cache flag down to the block ---
             outputs = block(hidden_states, layer_past=layer_past, attention_mask=attention_mask_4d, use_cache=use_cache)
             hidden_states = outputs[0]
-            # --- FIX: Conditionally append cache only if it's returned ---
             if use_cache:
                 presents.append(outputs[1])
 
@@ -127,13 +107,11 @@ class ServerModel(nn.Module):
             attention_mask_4d = attention_mask_4d.to(dtype=hidden_states.dtype)
             attention_mask_4d = (1.0 - attention_mask_4d) * torch.finfo(hidden_states.dtype).min
 
-        presents = []
+        presents = [] if use_cache else None
         for i, block in enumerate(self.h):
             layer_past = past_key_values[i] if past_key_values is not None else None
-            # --- FIX: Pass use_cache flag down to the block ---
             outputs = block(hidden_states, layer_past=layer_past, attention_mask=attention_mask_4d, use_cache=use_cache)
             hidden_states = outputs[0]
-            # --- FIX: Conditionally append cache only if it's returned ---
             if use_cache:
                 presents.append(outputs[1])
 
@@ -153,21 +131,18 @@ class TailModel(nn.Module):
             attention_mask_4d = attention_mask_4d.to(dtype=hidden_states.dtype)
             attention_mask_4d = (1.0 - attention_mask_4d) * torch.finfo(hidden_states.dtype).min
 
-        presents = []
+        presents = [] if use_cache else None
         for i, block in enumerate(self.h):
             layer_past = past_key_values[i] if past_key_values is not None else None
-            # --- FIX: Pass use_cache flag down to the block ---
             outputs = block(hidden_states, layer_past=layer_past, attention_mask=attention_mask_4d, use_cache=use_cache)
             hidden_states = outputs[0]
-            # --- FIX: Conditionally append cache only if it's returned ---
             if use_cache:
                 presents.append(outputs[1])
-
+        
         hidden_states = self.ln_f(hidden_states)
         lm_logits = self.lm_head(hidden_states)
 
         return lm_logits, tuple(presents) if use_cache else None
-
 
 class UShaped_GPT2_Model(GPT2PreTrainedModel, GenerationMixin):
     def __init__(self, config):
