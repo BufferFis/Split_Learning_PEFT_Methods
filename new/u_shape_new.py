@@ -38,8 +38,8 @@ class E2EJsonDataset(Dataset):
         for item in raw_data:
             if isinstance(item, dict) and 'mr' in item and 'txt' in item:
                 # Extract meaning representation from nested structure
-                mr_dict = item['mr']['value_lex'] if 'value_lex' in item['mr'] else item['mr']
-                reference = item['txt_lex']
+                mr_dict = item['mr']['value'] if 'value' in item['mr'] else item['mr']
+                reference = item['txt']
                 
                 # Build MR string from non-empty attributes only
                 mr_parts = []
