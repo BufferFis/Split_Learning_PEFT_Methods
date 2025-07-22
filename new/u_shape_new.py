@@ -21,7 +21,7 @@ class E2EJsonDataset(Dataset):
         self.data = []
         
         # Define delimiter tokens
-        self.DELIM_TOKENS = [tokenizer.convert_tokens_to_ids("<REF>")]
+        self.DELIM_TOKENS = tokenizer.encode(" <REF>", add_special_tokens=False)
         print(f"🔍 Delimiter tokens: {self.DELIM_TOKENS}")
         print(f"🔍 Delimiter decoded: '{tokenizer.decode(self.DELIM_TOKENS)}'")
         
@@ -163,8 +163,8 @@ class HeadModel(nn.Module):
             raise ValueError("You must specify either input_ids or inputs_embeds")
         
         # Debug: Print tensor shapes
-        print(f"HeadModel input shape: {hidden_states.shape}")
-        print(f"Expected hidden_size: {self.config.hidden_size}")
+        #print(f"HeadModel input shape: {hidden_states.shape}")
+        #print(f"Expected hidden_size: {self.config.hidden_size}")
         
         # Verify dimension consistency
         if hidden_states.size(-1) != self.config.hidden_size:
