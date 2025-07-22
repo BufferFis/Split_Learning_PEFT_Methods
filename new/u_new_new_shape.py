@@ -391,7 +391,7 @@ def main(args):
     
     print(f"\nTraining complete. Model saved to {args.output_dir}")
 
-# --- 7. Entry Point and Argument Parsing (Unchanged) ---
+# --- 7. Entry Point and Argument Parsing ---
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Fine-tune a U-shaped GPT-2 model on E2E NLG from JSON data.")
     parser.add_argument("--train_file", type=str, required=True, help="Path to the training JSON file.")
@@ -401,7 +401,8 @@ if __name__ == '__main__':
     parser.add_argument("--num_epochs", type=int, default=3, help="Number of training epochs.")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size for training.")
     parser.add_argument("--learning_rate", type=float, default=5e-5, help="Learning rate for the optimizer.")
-    parser.add_parent("--max_length", type=int, default=128, help="Maximum sequence length for the tokenizer.")
+    # --- FIX: Changed add_parent to the correct method name: add_argument ---
+    parser.add_argument("--max_length", type=int, default=128, help="Maximum sequence length for the tokenizer.")
     parser.add_argument("--sanity_check_steps", type=int, default=500, help="Perform a sanity check every N steps.")
 
     args = parser.parse_args()
