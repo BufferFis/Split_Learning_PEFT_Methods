@@ -66,7 +66,7 @@ class E2EJsonDataset(Dataset):
             "labels": labels
         }
 
-# --- 2. U-Shaped Split Architecture Components (FIX in HeadModel) ---
+# --- 2. U-Shaped Split Architecture Components (FIXED) ---
 class HeadModel(nn.Module):
     def __init__(self, base_model):
         super().__init__()
@@ -76,7 +76,7 @@ class HeadModel(nn.Module):
         self.drop = base_model.transformer.drop
         self.h = nn.ModuleList([base_model.transformer.h[i] for i in range(4)])
 
-    def forward(self, input_ids=None, past_key_values=None, attention_mask=None, **kwargs):
+    def forward(self, input_ids=None, past_key_values=None, attention_mask=None, use_cache=None, **kwargs):
         if input_ids is not None:
             input_shape = input_ids.size()
             input_ids = input_ids.view(-1, input_shape[-1])
@@ -87,7 +87,6 @@ class HeadModel(nn.Module):
         device = input_ids.device
 
         past_length = 0
-        # --- FIX: Check that the content of past_key_values is not None before subscripting ---
         if past_key_values is not None and past_key_values[0] is not None:
             past_length = past_key_values[0][0].size(-2)
 
@@ -106,11 +105,14 @@ class HeadModel(nn.Module):
         presents = []
         for i, block in enumerate(self.h):
             layer_past = past_key_values[i] if past_key_values is not None else None
-            outputs = block(hidden_states, layer_past=layer_past, attention_mask=attention_mask_4d, use_cache=True)
+            # --- FIX: Pass use_cache flag down to the block ---
+            outputs = block(hidden_states, layer_past=layer_past, attention_mask=attention_mask_4d, use_cache=use_cache)
             hidden_states = outputs[0]
-            presents.append(outputs[1])
+            # --- FIX: Conditionally append cache only if it's returned ---
+            if use_cache:
+                presents.append(outputs[1])
 
-        return hidden_states, tuple(presents)
+        return hidden_states, tuple(presents) if use_cache else None
 
 class ServerModel(nn.Module):
     def __init__(self, base_model):
@@ -118,7 +120,7 @@ class ServerModel(nn.Module):
         self.config = base_model.config
         self.h = nn.ModuleList([base_model.transformer.h[i] for i in range(4, 8)])
 
-    def forward(self, hidden_states, past_key_values=None, attention_mask=None, **kwargs):
+    def forward(self, hidden_states, past_key_values=None, attention_mask=None, use_cache=None, **kwargs):
         batch_size = hidden_states.shape[0]
         if attention_mask is not None:
             attention_mask_4d = attention_mask.view(batch_size, 1, 1, -1)
@@ -128,11 +130,14 @@ class ServerModel(nn.Module):
         presents = []
         for i, block in enumerate(self.h):
             layer_past = past_key_values[i] if past_key_values is not None else None
-            outputs = block(hidden_states, layer_past=layer_past, attention_mask=attention_mask_4d, use_cache=True)
+            # --- FIX: Pass use_cache flag down to the block ---
+            outputs = block(hidden_states, layer_past=layer_past, attention_mask=attention_mask_4d, use_cache=use_cache)
             hidden_states = outputs[0]
-            presents.append(outputs[1])
+            # --- FIX: Conditionally append cache only if it's returned ---
+            if use_cache:
+                presents.append(outputs[1])
 
-        return hidden_states, tuple(presents)
+        return hidden_states, tuple(presents) if use_cache else None
 
 class TailModel(nn.Module):
     def __init__(self, base_model):
@@ -141,7 +146,7 @@ class TailModel(nn.Module):
         self.ln_f = base_model.transformer.ln_f
         self.lm_head = base_model.lm_head
 
-    def forward(self, hidden_states, past_key_values=None, attention_mask=None, **kwargs):
+    def forward(self, hidden_states, past_key_values=None, attention_mask=None, use_cache=None, **kwargs):
         batch_size = hidden_states.shape[0]
         if attention_mask is not None:
             attention_mask_4d = attention_mask.view(batch_size, 1, 1, -1)
@@ -151,25 +156,26 @@ class TailModel(nn.Module):
         presents = []
         for i, block in enumerate(self.h):
             layer_past = past_key_values[i] if past_key_values is not None else None
-            outputs = block(hidden_states, layer_past=layer_past, attention_mask=attention_mask_4d, use_cache=True)
+            # --- FIX: Pass use_cache flag down to the block ---
+            outputs = block(hidden_states, layer_past=layer_past, attention_mask=attention_mask_4d, use_cache=use_cache)
             hidden_states = outputs[0]
-            presents.append(outputs[1])
+            # --- FIX: Conditionally append cache only if it's returned ---
+            if use_cache:
+                presents.append(outputs[1])
 
         hidden_states = self.ln_f(hidden_states)
         lm_logits = self.lm_head(hidden_states)
 
-        return lm_logits, tuple(presents)
+        return lm_logits, tuple(presents) if use_cache else None
 
 
-# --- Inherit from GenerationMixin to silence the warning and ensure future compatibility ---
 class UShaped_GPT2_Model(GPT2PreTrainedModel, GenerationMixin):
     def __init__(self, config):
         super().__init__(config)
-        base_model = GPT2LMHeadModel(config) # Create base model from the CORRECT config
+        base_model = GPT2LMHeadModel(config)
         self.head = HeadModel(base_model)
         self.server = ServerModel(base_model)
         self.tail = TailModel(base_model)
-        # Ensure the main_input_name is defined for GenerationMixin
         self.main_input_name = "input_ids"
 
     def get_input_embeddings(self):
@@ -186,7 +192,6 @@ class UShaped_GPT2_Model(GPT2PreTrainedModel, GenerationMixin):
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
         token_type_ids = kwargs.get("token_type_ids", None)
-
         if past_key_values:
             input_ids = input_ids[:, -1].unsqueeze(-1)
             if token_type_ids is not None:
@@ -222,11 +227,13 @@ class UShaped_GPT2_Model(GPT2PreTrainedModel, GenerationMixin):
         server_past = tuple(past_key_values[i] for i in range(4, 8))
         tail_past = tuple(past_key_values[i] for i in range(8, 12))
 
-        hidden_states, head_present = self.head(input_ids=input_ids, past_key_values=head_past, attention_mask=attention_mask, **kwargs)
-        hidden_states, server_present = self.server(hidden_states=hidden_states, past_key_values=server_past, attention_mask=attention_mask, **kwargs)
-        logits, tail_present = self.tail(hidden_states=hidden_states, past_key_values=tail_past, attention_mask=attention_mask, **kwargs)
+        hidden_states, head_present = self.head(input_ids=input_ids, past_key_values=head_past, attention_mask=attention_mask, use_cache=use_cache, **kwargs)
+        hidden_states, server_present = self.server(hidden_states=hidden_states, past_key_values=server_past, attention_mask=attention_mask, use_cache=use_cache, **kwargs)
+        logits, tail_present = self.tail(hidden_states=hidden_states, past_key_values=tail_past, attention_mask=attention_mask, use_cache=use_cache, **kwargs)
 
-        past_key_values_present = head_present + server_present + tail_present if use_cache else None
+        past_key_values_present = None
+        if use_cache:
+            past_key_values_present = head_present + server_present + tail_present
 
         loss = None
         if labels is not None:
@@ -241,10 +248,9 @@ class UShaped_GPT2_Model(GPT2PreTrainedModel, GenerationMixin):
             past_key_values=past_key_values_present,
         )
 
-# --- 3. Model and Tokenizer Setup (Modified) ---
+# --- 3. Model and Tokenizer Setup ---
 def setup_model_and_tokenizer(model_name):
     tokenizer = GPT2Tokenizer.from_pretrained(model_name)
-
     special_tokens_dict = {
         'bos_token': '<|endoftext|>',
         'eos_token': '<|endoftext|>',
@@ -252,23 +258,17 @@ def setup_model_and_tokenizer(model_name):
         'additional_special_tokens': ['<MR>', '<REF>']
     }
     tokenizer.add_special_tokens(special_tokens_dict)
-
     config = GPT2LMHeadModel.from_pretrained(model_name).config
     config.pad_token_id = tokenizer.pad_token_id
-
     config.vocab_size = len(tokenizer)
-
     u_shaped_model = UShaped_GPT2_Model(config)
-
     u_shaped_model.resize_token_embeddings(len(tokenizer))
-
     return u_shaped_model, tokenizer
 
-# --- 4. Apply DoRA PEFT to U-shaped model (Simplified) ---
+# --- 4. Apply DoRA PEFT to U-shaped model ---
 def apply_dora_peft(model):
     peft_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
-        inference_mode=False,
         r=8,
         lora_alpha=32,
         lora_dropout=0.1,
@@ -279,48 +279,41 @@ def apply_dora_peft(model):
     model.print_trainable_parameters()
     return model
 
-# --- Data Collator (Unchanged) ---
+# --- Data Collator ---
 class E2EDataCollator:
     def __init__(self, tokenizer, pad_to_multiple_of=8):
         self.tok = tokenizer
         self.mult = pad_to_multiple_of
-
     def _pad(self, seq, pad_id, max_len):
         return seq + [pad_id] * (max_len - len(seq))
-
     def __call__(self, features):
         max_len = max(len(f["input_ids"]) for f in features)
         if self.mult:
             max_len = ((max_len + self.mult - 1) // self.mult) * self.mult
-
         input_ids, attn, labels = [], [], []
         for f in features:
             input_ids.append(self._pad(f["input_ids"], self.tok.pad_token_id, max_len))
             attn.append(self._pad(f["attention_mask"], 0, max_len))
             labels.append(self._pad(f["labels"], -100, max_len))
-
         return {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(attn, dtype=torch.float),
             "labels": torch.tensor(labels, dtype=torch.long),
         }
 
-# --- 5. Generation Function for Sanity Checks (Unchanged) ---
+# --- 5. Generation Function for Sanity Checks ---
 def generate_sanity_check(model, tokenizer, device):
     model.eval()
     test_examples = [
         "name[The Wrestlers], eatType[pub], food[English], priceRange[more than £30], customer rating[high], area[city centre], familyFriendly[no], near[Café Sicilia]",
         "name[Alimentum], area[riverside], familyFriendly[yes], near[Burger King]"
     ]
-
     print("\n" + "="*20 + " GENERATION SANITY CHECK " + "="*20)
     for i, test_mr in enumerate(test_examples):
         print(f"\n--- Test {i+1} ---")
         print(f"Input MR: {test_mr}")
-
         input_text = f"<MR> {test_mr} <REF>"
         inputs = tokenizer(input_text, return_tensors="pt").to(device)
-
         with torch.no_grad():
             output_sequences = model.generate(
                 input_ids=inputs['input_ids'],
@@ -331,32 +324,26 @@ def generate_sanity_check(model, tokenizer, device):
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id
             )
-
         input_length = inputs['input_ids'].shape[1]
         generated_tokens = output_sequences[0][input_length:]
         generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-
         print(f"Generated: {generated_text.strip()}")
     print("="*63 + "\n")
     model.train()
 
-# --- 6. Main Training Function (Unchanged) ---
+# --- 6. Main Training Function ---
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-
     model, tokenizer = setup_model_and_tokenizer(args.model_name)
     model = apply_dora_peft(model)
     model.to(device)
-
     train_dataset = E2EJsonDataset(json_file=args.train_file, tokenizer=tokenizer, max_length=args.max_length)
     data_collator = E2EDataCollator(tokenizer, pad_to_multiple_of=8)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=data_collator)
-
     optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.learning_rate, weight_decay=0.01)
     total_steps = len(train_loader) * args.num_epochs
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0.1 * total_steps, num_training_steps=total_steps)
-
     for epoch in range(args.num_epochs):
         print(f"--- Epoch {epoch+1}/{args.num_epochs} ---")
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
@@ -364,30 +351,23 @@ def main(args):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
-
             model.zero_grad()
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
             loss = outputs.loss
             loss.backward()
-
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             scheduler.step()
-
             progress_bar.set_postfix({'loss': loss.item()})
-
             if (i + 1) % args.sanity_check_steps == 0:
                 generate_sanity_check(model, tokenizer, device)
-
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
-
     model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
-
     print(f"\nTraining complete. Model saved to {args.output_dir}")
 
-# --- 7. Entry Point and Argument Parsing (Unchanged) ---
+# --- 7. Entry Point and Argument Parsing ---
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Fine-tune a U-shaped GPT-2 model on E2E NLG from JSON data.")
     parser.add_argument("--train_file", type=str, required=True, help="Path to the training JSON file.")
@@ -399,9 +379,7 @@ if __name__ == '__main__':
     parser.add_argument("--learning_rate", type=float, default=5e-5, help="Learning rate for the optimizer.")
     parser.add_argument("--max_length", type=int, default=128, help="Maximum sequence length for the tokenizer.")
     parser.add_argument("--sanity_check_steps", type=int, default=500, help="Perform a sanity check every N steps.")
-
     args = parser.parse_args()
-
     if not os.path.exists(args.train_file) or not os.path.exists(args.dev_file):
         print(f"Error: Make sure '{args.train_file}' and '{args.dev_file}' are present.")
     else:
