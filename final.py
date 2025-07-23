@@ -1047,6 +1047,7 @@ class SplitLoRATrainer:
                         inputs_embeds=b_states,
                         attention_mask=attention_mask,
                         past_key_values=None,
+                        use_cache = False
                     ).logits
 
                     # shift for CE
