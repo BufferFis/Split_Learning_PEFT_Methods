@@ -78,7 +78,7 @@ class Split3GPT2(nn.Module):
         self.tail_blocks = nn.ModuleList(base.transformer.h[num_blocks-tail_split:])
         self.ln_f = base.transformer.ln_f
         self.lm_head = base.lm_head
-        self.register_buffer("position_ids", torch.arange(max_length).unsqueeze(0))
+        self.register_buffer("position_ids", torch.arange(max_length).unsqueeze(0).to(device))
 
     def forward(self, input_ids, attention_mask=None, labels=None):
         bsz, seq_len = input_ids.size()
