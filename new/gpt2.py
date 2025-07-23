@@ -10,6 +10,8 @@ from torch.optim import AdamW
 from torch.nn import CrossEntropyLoss
 import evaluate
 from tqdm.auto import tqdm
+import torch.nn.functional as F
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ---- Helper: MR to string ----
@@ -33,17 +35,18 @@ def mr_to_str(mr):
 # ---- Preprocessing ----
 dataset = load_dataset("tuetschek/e2e_nlg")
 raw_val = dataset['validation']
+
 # Initialize tokenizer
 tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 tokenizer.pad_token = tokenizer.eos_token
 
 max_length = 128
 
-# Get colon token ID (it's a single token in GPT-2)
+# Get colon token ID (keeping your original approach)
 COLON_TOKEN_ID = tokenizer.encode(":", add_special_tokens=False)[0]
 print(f"Colon token ID: {COLON_TOKEN_ID}")
 
-# ---- FIXED Preprocessing Function with Debug ----
+# ---- Your Original Preprocessing (keeping it as is since it works) ----
 def preprocess_fn(ex):
     mr_str = mr_to_str(ex['meaning_representation'])
     text = ex['human_reference']
@@ -81,36 +84,6 @@ def preprocess_fn(ex):
         # If no EOS found, the sequence was truncated - that's fine
         pass
     
-    # DEBUG: Print first few examples to verify masking
-    if hasattr(preprocess_fn, 'debug_count'):
-        preprocess_fn.debug_count += 1
-    else:
-        preprocess_fn.debug_count = 1
-        
-    if preprocess_fn.debug_count <= 3:
-        print(f"\n=== DEBUG EXAMPLE {preprocess_fn.debug_count} ===")
-        print(f"MR: {mr_str}")
-        print(f"Text: {text}")
-        print(f"Full sequence: {seq}")
-        print(f"Tokenized: {tokenizer.decode(input_ids[:50], skip_special_tokens=False)}")
-        
-        # Show what gets masked vs not masked
-        masked_part = []
-        unmasked_part = []
-        for i, (token_id, label) in enumerate(zip(input_ids, labels)):
-            if i >= len(input_ids):
-                break
-            token = tokenizer.decode([token_id])
-            if label == -100:
-                masked_part.append(token)
-            else:
-                unmasked_part.append(token)
-        
-        print(f"MASKED (not trained on): {''.join(masked_part)}")
-        print(f"UNMASKED (trained on): {''.join(unmasked_part)}")
-        print(f"Colon found at position: {colon_positions[0] if colon_positions else 'NOT FOUND'}")
-        print("=" * 50)
-    
     return {"input_ids": input_ids, "attention_mask": enc.attention_mask, "labels": labels}
 
 train_ds = dataset['train'].map(preprocess_fn, remove_columns=dataset['train'].column_names)
@@ -125,11 +98,11 @@ def collate(batch):
         labels=torch.stack([b['labels'] for b in batch])
     )
 
-# REDUCED batch size for more stable training
+# Keep your original batch size and settings
 train_loader = DataLoader(train_ds, batch_size=4, shuffle=True, collate_fn=collate)
 val_loader = DataLoader(val_ds, batch_size=4, collate_fn=collate)
 
-# ---- Model Split Definition ----
+# ---- FIXED Model Split with Proper State Passing ----
 class Split3GPT2(nn.Module):
     def __init__(self, head_split=1, tail_split=1):
         super().__init__()
@@ -137,49 +110,117 @@ class Split3GPT2(nn.Module):
         self.config = base.config
         self.wte = base.transformer.wte
         self.wpe = base.transformer.wpe
-        self.drop = nn.Dropout(0.1)  # REDUCED dropout
+        self.drop = base.transformer.drop
+        
         num_blocks = len(base.transformer.h)
         self.head_blocks = nn.ModuleList(base.transformer.h[:head_split])
         self.middle_blocks = nn.ModuleList(base.transformer.h[head_split:num_blocks-tail_split])
         self.tail_blocks = nn.ModuleList(base.transformer.h[num_blocks-tail_split:])
+        
         self.ln_f = base.transformer.ln_f
         self.lm_head = base.lm_head
+        
+        # Register position embeddings buffer
         self.register_buffer("position_ids", torch.arange(max_length).unsqueeze(0))
 
-    def forward(self, input_ids, attention_mask=None, labels=None):
+    def forward(self, input_ids, attention_mask=None, labels=None, past_key_values=None, use_cache=False):
         bsz, seq_len = input_ids.size()
-        pos_ids = self.position_ids[:, :seq_len].to(input_ids.device)
-        inputs_embeds = self.wte(input_ids) + self.wpe(pos_ids)
-        hidden = self.drop(inputs_embeds)
-        attn = None
+        
+        # CRITICAL FIX: Handle past_key_values for generation
+        if past_key_values is not None:
+            # During generation, we only process the last token
+            past_length = past_key_values[0][0].size(-2)  # Get past sequence length
+            position_ids = torch.arange(past_length, past_length + seq_len, dtype=torch.long, device=input_ids.device)
+            position_ids = position_ids.unsqueeze(0)
+        else:
+            # During training, process full sequence
+            position_ids = self.position_ids[:, :seq_len]
+        
+        # Embeddings
+        inputs_embeds = self.wte(input_ids)
+        position_embeds = self.wpe(position_ids)
+        hidden_states = self.drop(inputs_embeds + position_embeds)
+        
+        # CRITICAL FIX: Proper attention mask handling for generation
         if attention_mask is not None:
-            attn = (1.0 - attention_mask.view(bsz,1,1,seq_len).to(hidden.device)) * torch.finfo(hidden.dtype).min
-        for blk in self.head_blocks: hidden = blk(hidden, attention_mask=attn)[0]
-        for blk in self.middle_blocks: hidden = blk(hidden, attention_mask=attn)[0]
-        for blk in self.tail_blocks: hidden = blk(hidden, attention_mask=attn)[0]
-        hidden = self.ln_f(hidden); logits = self.lm_head(hidden)
-        loss=None
+            if past_key_values is not None:
+                # During generation, extend attention mask
+                past_length = past_key_values[0][0].size(-2)
+                # Create extended attention mask
+                batch_size = attention_mask.size(0)
+                extended_attention_mask = torch.ones(batch_size, past_length + seq_len, device=attention_mask.device)
+                extended_attention_mask[:, -seq_len:] = attention_mask
+                attention_mask = extended_attention_mask
+            
+            # Convert to causal mask format
+            attention_mask = attention_mask.view(bsz, 1, 1, -1)
+            attention_mask = (1.0 - attention_mask) * torch.finfo(hidden_states.dtype).min
+        
+        # Forward through blocks with proper past_key_values handling
+        new_past_key_values = () if use_cache else None
+        
+        # Head blocks
+        for i, block in enumerate(self.head_blocks):
+            past_kv = past_key_values[i] if past_key_values is not None else None
+            outputs = block(hidden_states, attention_mask=attention_mask, past_key_value=past_kv, use_cache=use_cache)
+            hidden_states = outputs[0]
+            if use_cache:
+                new_past_key_values += (outputs[1],)
+        
+        # Middle blocks  
+        middle_start = len(self.head_blocks)
+        for i, block in enumerate(self.middle_blocks):
+            past_kv = past_key_values[middle_start + i] if past_key_values is not None else None
+            outputs = block(hidden_states, attention_mask=attention_mask, past_key_value=past_kv, use_cache=use_cache)
+            hidden_states = outputs[0]
+            if use_cache:
+                new_past_key_values += (outputs[1],)
+        
+        # Tail blocks
+        tail_start = len(self.head_blocks) + len(self.middle_blocks)
+        for i, block in enumerate(self.tail_blocks):
+            past_kv = past_key_values[tail_start + i] if past_key_values is not None else None
+            outputs = block(hidden_states, attention_mask=attention_mask, past_key_value=past_kv, use_cache=use_cache)
+            hidden_states = outputs[0]
+            if use_cache:
+                new_past_key_values += (outputs[1],)
+        
+        # Final layer norm and projection
+        hidden_states = self.ln_f(hidden_states)
+        logits = self.lm_head(hidden_states)
+        
+        loss = None
         if labels is not None:
-            shift_logits=logits[..., :-1,:].contiguous(); shift_labels=labels[...,1:].contiguous()
-            loss=CrossEntropyLoss(ignore_index=-100)(shift_logits.view(-1,shift_logits.size(-1)), shift_labels.view(-1))
-        return (loss, logits) if loss is not None else logits
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            
+            # Calculate loss
+            loss_fct = CrossEntropyLoss(ignore_index=-100)
+            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        
+        if use_cache:
+            return (loss, logits, new_past_key_values) if loss is not None else (logits, new_past_key_values)
+        else:
+            return (loss, logits) if loss is not None else logits
 
-# Instantiate model (no need to resize embeddings since colon is already in vocab)
-model = Split3GPT2(1,1)
+# Instantiate model with your original settings
+model = Split3GPT2(1, 1)
 
-peft_cfg = LoraConfig(r=2, lora_alpha=8, target_modules=["c_attn","c_proj"], use_dora=True)  # REDUCED rank
+# Your original PEFT config (r=2 works fine as you mentioned)
+peft_cfg = LoraConfig(r=2, lora_alpha=8, target_modules=["c_attn","c_proj"], use_dora=True)
 model = get_peft_model(model, peft_cfg)
 model = model.to(device)
 model.print_trainable_parameters()
 
-# MUCH lower learning rate
+# Your original optimizer settings
 optimizer = AdamW(
     [p for n, p in model.named_parameters() if p.requires_grad],
-    lr=1e-6,  # REDUCED from 1e-5
+    lr=1e-6,  # Keeping your original LR
     weight_decay=0.01
 )
 
-epochs = 5  # More epochs with lower LR
+epochs = 5
 total_steps = len(train_loader) * epochs
 from transformers import get_linear_schedule_with_warmup
 scheduler = get_linear_schedule_with_warmup(
@@ -188,77 +229,79 @@ scheduler = get_linear_schedule_with_warmup(
     num_training_steps=total_steps
 )
 
-# ---- FIXED Generator with Stronger Anti-Repetition ----
-def generate_sequence(model, input_ids, max_len=50, ban_eos_steps=5, top_k=40, temperature=1.0):
+# ---- COMPLETELY FIXED Generator with Proper Cache Handling ----
+def generate_sequence(model, input_ids, max_len=50, ban_eos_steps=5, temperature=1.0):
+    """
+    Fixed generation with proper attention mask and cache handling
+    """
     model.eval()
-    cur = input_ids.to(device)
-    steps = 0
+    batch_size = input_ids.size(0)
+    device = input_ids.device
     
-    for _ in range(max_len - input_ids.size(1)):
+    # Initialize
+    generated = input_ids.clone()
+    past_key_values = None
+    
+    for step in range(max_len - input_ids.size(1)):
+        # CRITICAL FIX: Proper attention mask that grows with sequence
+        current_length = generated.size(1)
+        attention_mask = torch.ones(batch_size, current_length, device=device)
+        
         with torch.no_grad():
-            out = model(cur, attention_mask=torch.ones_like(cur).to(device))
-            logits = out[1] if isinstance(out, tuple) else out
+            if past_key_values is None:
+                # First step: process full sequence
+                model_inputs = {
+                    "input_ids": generated,
+                    "attention_mask": attention_mask,
+                    "use_cache": True
+                }
+            else:
+                # Subsequent steps: only process last token
+                model_inputs = {
+                    "input_ids": generated[:, -1:],
+                    "attention_mask": attention_mask[:, -1:],  # Only last token's mask
+                    "past_key_values": past_key_values,
+                    "use_cache": True
+                }
+            
+            outputs = model(**model_inputs)
+            logits, past_key_values = outputs[0], outputs[1]
+            
+            # Get next token logits
             next_logits = logits[:, -1, :] / temperature
             
             # Ban EOS for initial steps
-            if steps < ban_eos_steps:
+            if step < ban_eos_steps:
                 next_logits[:, tokenizer.eos_token_id] = -float('Inf')
             
-            # MUCH STRONGER repetition penalty
-            if cur.size(1) >= 2:
-                # Get more recent tokens for penalty
-                lookback = min(8, cur.size(1))  # Look back up to 8 tokens
-                recent_tokens = cur[0, -lookback:].tolist()
-                
-                # Count occurrences and apply stronger penalties
-                token_counts = {}
-                for token_id in recent_tokens:
-                    token_counts[token_id] = token_counts.get(token_id, 0) + 1
-                
-                for token_id, count in token_counts.items():
-                    if count > 1:  # If token appeared more than once
-                        penalty = 5.0 * count  # Much stronger penalty
-                        next_logits[:, token_id] -= penalty
+            # Simple repetition penalty - check last few tokens
+            if generated.size(1) >= 3:
+                last_tokens = generated[0, -3:].tolist()
+                for token_id in last_tokens:
+                    next_logits[:, token_id] -= 2.0  # Moderate penalty
             
-            # Additional penalty for common problematic tokens
-            problem_tokens = ["family", "friendly", "no", "yes", "the", "is", "a"]
-            for word in problem_tokens:
-                token_ids = tokenizer.encode(word, add_special_tokens=False)
-                for token_id in token_ids:
-                    if token_id in cur[0, -5:].tolist():  # If in recent 5 tokens
-                        next_logits[:, token_id] -= 3.0
-            
-            # Use nucleus sampling instead of just top-k
-            sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
-            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-            
-            # Nucleus sampling with p=0.9
-            sorted_indices_to_remove = cumulative_probs > 0.9
-            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-            sorted_indices_to_remove[..., 0] = 0
-            
-            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-            next_logits[indices_to_remove] = -float('Inf')
-            
-            # Sample from remaining tokens
+            # Sample next token
             probs = torch.softmax(next_logits, dim=-1)
-            next_id = torch.multinomial(probs, num_samples=1)
-        
-        cur = torch.cat([cur, next_id], dim=1)
-        steps += 1
-        
-        # Early stopping if we detect repetition
-        if steps >= 3:
-            last_3_tokens = cur[0, -3:].tolist()
-            if len(set(last_3_tokens)) == 1:  # All same token
+            next_token = torch.multinomial(probs, num_samples=1)
+            
+            # Add to sequence
+            generated = torch.cat([generated, next_token], dim=1)
+            
+            # Early stopping conditions
+            if next_token.item() == tokenizer.eos_token_id and step >= ban_eos_steps:
                 break
                 
-        if next_id.item() == tokenizer.eos_token_id and steps >= ban_eos_steps:
-            break
-    return cur
+            # Stop if we detect simple repetition
+            if step >= 2:
+                last_3 = generated[0, -3:].tolist()
+                if len(set(last_3)) == 1:  # All same token
+                    break
+    
+    return generated
 
-# ---- Metrics & Eval ----
+# ---- Your original metrics & eval (keeping as is) ----
 metric_bleu=evaluate.load('bleu'); metric_meteor=evaluate.load('meteor'); metric_rouge=evaluate.load('rouge')
+
 def evaluate_model(model, tokenizer, raw_examples, max_samples=None):
     preds, refs = [], []
     examples = raw_examples if max_samples is None else raw_examples.select(range(max_samples))
@@ -282,7 +325,7 @@ def evaluate_model(model, tokenizer, raw_examples, max_samples=None):
     rouge = metric_rouge.compute(predictions=preds, references=refs)
     return bleu, meteor, rouge
 
-# ---- FIXED Training with Gradient Clipping ----
+# ---- Training Loop (keeping your original structure) ----
 model.train()
 for e in range(1, epochs + 1):
     model.train()
@@ -296,15 +339,15 @@ for e in range(1, epochs + 1):
         loss, _ = model(inp, attention_mask=m, labels=lbl)
         loss.backward()
         
-        # GRADIENT CLIPPING
+        # Gradient clipping
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         
         optimizer.step()
-        scheduler.step()  # Step scheduler
+        scheduler.step() 
         optimizer.zero_grad()
         
         tl += loss.item()
-        if (i + 1) % 50 == 0:  # Less frequent logging
+        if (i + 1) % 50 == 0:
             tqdm.write(f"Batch{i+1}/{len(train_loader)} loss={tl/(i+1):.4f}")
     
     # Validation
@@ -318,9 +361,9 @@ for e in range(1, epochs + 1):
             loss, _ = model(inp, attention_mask=m, labels=lbl)
             vt += loss.item()
     
-    # Sanity check with colon delimiter
+    # Sanity check
     print(f"\nEpoch{e} Sanity:")
-    sanity = raw_val.select(range(3))  # Fewer examples
+    sanity = raw_val.select(range(3))
     for ex in sanity:
         mr_s = mr_to_str(ex['meaning_representation'])
         inp = tokenizer(mr_s + ":", return_tensors='pt').input_ids.to(device)
@@ -338,8 +381,8 @@ for e in range(1, epochs + 1):
         print(f"Reference: {ex['human_reference']}")
         print("-" * 50)
     
-    # Only evaluate every 2 epochs to save time
-    if e % 1 == 0:
+    # Evaluate every 2 epochs
+    if e % 2 == 0:
         bleu, meteor, rouge = evaluate_model(model, tokenizer, raw_val.select(range(100)))
         print(f"Epoch{e}: TrainL={tl/len(train_loader):.4f} ValL={vt/len(val_loader):.4f} "
               f"BLEU={bleu['bleu']:.4f} METEOR={meteor['meteor']:.4f} ROUGE-L={rouge['rougeL']:.4f}\n")
