@@ -1040,7 +1040,7 @@ class SplitLoRATrainer:
                     body_out, _ = self.server.forward_train(
                         h_states, attention_mask=attention_mask
                     )
-                    b_states = body_out.last_hidden_state
+                    b_states = body_out
 
                     # 3) Tail forward & compute loss
                     logits = self.tail_client.tail_model(
