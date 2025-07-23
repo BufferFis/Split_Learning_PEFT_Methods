@@ -71,7 +71,8 @@ class Split3GPT2(nn.Module):
         self.config = base.config
         self.wte = base.transformer.wte
         self.wpe = base.transformer.wpe
-        self.drop = base.transformer.drop
+        # increase dropout to regularize and avoid overfitting
+        self.drop = nn.Dropout(0.3)  # originally base.transformer.drop
         num_blocks = len(base.transformer.h)
         self.head_blocks = nn.ModuleList(base.transformer.h[:head_split])
         self.middle_blocks = nn.ModuleList(base.transformer.h[head_split:num_blocks-tail_split])
@@ -104,31 +105,58 @@ model = get_peft_model(model, peft_cfg)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu"); model.to(device)
 
 # ---- Generator (custom) ----
-def generate_sequence(model, input_ids, max_len=50):
+def generate_sequence(model, input_ids, max_len=50, ban_eos_steps=2, top_k=50):
+    """
+    Autoregressive generation with sampling to prevent MR copy:
+
+    1. **Input**: `input_ids` are the tokenized MR plus the EOS separator.
+    2. **Ban EOS**: For the first `ban_eos_steps` time steps, the EOS token's logit is set to -inf so the model cannot immediately terminate generation.
+    3. **Top-k sampling**: Instead of always choosing the highest-probability token (greedy), we limit to the top_k most likely next tokens and sample among them according to their softmax probabilities. This discourages simply replicating the input sequence and introduces variability.
+    4. **Stop condition**: Once EOS is sampled _after_ the ban steps, generation stops early.
+
+    These two changes (EOS ban + top-k sampling) help push the model away from memorizing and regurgitating the MR and encourage it to produce fluent outputs.
+    """
     cur = input_ids
+    steps = 0
     for _ in range(max_len - input_ids.size(1)):
         with torch.no_grad():
             out = model(cur, attention_mask=torch.ones_like(cur).to(device))
-            # out is (loss, logits) when labels provided; here labels=None so out == logits
             logits = out[1] if isinstance(out, tuple) else out
-            next_id = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+            next_logits = logits[:, -1, :]
+            # ban EOS for initial steps
+            if steps < ban_eos_steps:
+                next_logits[:, tokenizer.eos_token_id] = -float('Inf')
+            # top-k sampling to encourage diversity
+            values, indices = torch.topk(next_logits, top_k)
+            probs = torch.softmax(values, dim=-1)
+            choice = torch.multinomial(probs, num_samples=1)
+            next_id = indices.gather(-1, choice)
         cur = torch.cat([cur, next_id], dim=1)
-        if next_id.item() == tokenizer.eos_token_id:
+        steps += 1
+        # stop if EOS sampled after ban period
+        if next_id.item() == tokenizer.eos_token_id and steps >= ban_eos_steps:
             break
     return cur
 
 # ---- Metrics & Eval ----
 metric_bleu=evaluate.load('bleu'); metric_meteor=evaluate.load('meteor'); metric_rouge=evaluate.load('rouge')
-def evaluate_model(model, tokenizer, raw_examples):
+def evaluate_model(model, tokenizer, raw_examples, max_samples=None):
+    """
+    Compute BLEU, METEOR, ROUGE-L over raw_examples.
+    max_samples: limit number to speed up eval (None for all).
+    """
     preds, refs = [], []
-    for ex in raw_examples:
-        mr_s = mr_to_str(ex['meaning_representation']); inp = tokenizer(mr_s+tokenizer.eos_token, return_tensors='pt').input_ids.to(device)
+    examples = raw_examples if max_samples is None else raw_examples.select(range(max_samples))
+    for ex in tqdm(examples, desc="Metric Eval", leave=False):
+        mr_s = mr_to_str(ex['meaning_representation'])
+        inp = tokenizer(mr_s+tokenizer.eos_token, return_tensors='pt').input_ids.to(device)
         out = generate_sequence(model, inp, max_len=100)
         txt = tokenizer.decode(out[0], skip_special_tokens=True).split(tokenizer.eos_token,1)[-1].strip()
         preds.append(txt); refs.append(ex['human_reference'])
-    return (metric_bleu.compute(predictions=preds,references=[[r] for r in refs]),
-            metric_meteor.compute(predictions=preds,references=refs),
-            metric_rouge.compute(predictions=preds,references=refs))
+    bleu = metric_bleu.compute(predictions=preds, references=[[r] for r in refs])
+    meteor = metric_meteor.compute(predictions=preds, references=refs)
+    rouge = metric_rouge.compute(predictions=preds, references=refs)
+    return bleu, meteor, rouge
 
 # ---- Training w/ Progress & Eval ----
 opt=AdamW(model.parameters(),lr=5e-5); epochs=3; sanity=raw_val.select(range(5))
