@@ -108,10 +108,13 @@ def generate_sequence(model, input_ids, max_len=50):
     cur = input_ids
     for _ in range(max_len - input_ids.size(1)):
         with torch.no_grad():
-            _, logits = model(cur, attention_mask=torch.ones_like(cur).to(device))
+            out = model(cur, attention_mask=torch.ones_like(cur).to(device))
+            # out is (loss, logits) when labels provided; here labels=None so out == logits
+            logits = out[1] if isinstance(out, tuple) else out
             next_id = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
         cur = torch.cat([cur, next_id], dim=1)
-        if next_id.item() == tokenizer.eos_token_id: break
+        if next_id.item() == tokenizer.eos_token_id:
+            break
     return cur
 
 # ---- Metrics & Eval ----
