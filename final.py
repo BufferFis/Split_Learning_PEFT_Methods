@@ -299,7 +299,16 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
 
             return logits, present_key_values
 
+    # Create the model instances
+    head_model = HeadModel(model, head_layers)
+    body_model = BodyModel(model, head_layers, body_layers)
+    tail_model = TailModel(model, head_layers + body_layers)
 
+    # Set up weight tying
+    tail_model.lm_head.weight = head_model.wte.weight
+    
+    # CRITICAL: Return the models - this was missing!
+    return head_model, body_model, tail_model
 
 class ServerModel:
     """Server component handling the body layers"""
