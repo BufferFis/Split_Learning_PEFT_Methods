@@ -78,7 +78,7 @@ class Split3GPT2(nn.Module):
         self.tail_blocks = nn.ModuleList(base.transformer.h[num_blocks-tail_split:])
         self.ln_f = base.transformer.ln_f
         self.lm_head = base.lm_head
-        self.register_buffer("position_ids", torch.arange(max_length).unsqueeze(0).to(device))
+        self.register_buffer("position_ids", torch.arange(max_length).unsqueeze(0))
 
     def forward(self, input_ids, attention_mask=None, labels=None):
         bsz, seq_len = input_ids.size()
@@ -102,6 +102,7 @@ class Split3GPT2(nn.Module):
 model = Split3GPT2(1,1)
 peft_cfg = LoraConfig(r=4, lora_alpha=16, target_modules=["c_attn","c_proj"], use_dora=True)
 model = get_peft_model(model, peft_cfg)
+model = model.to(device)
 model.print_trainable_parameters()
 
 optimizer = AdamW(
@@ -121,7 +122,8 @@ scheduler = get_linear_schedule_with_warmup(
 
 # ---- Generator (custom) ----
 def generate_sequence(model, input_ids, max_len=50, ban_eos_steps=2, top_k=50):
-    cur = input_ids
+    model.eval()
+    cur = input_ids.to(device)
     steps = 0
     for _ in range(max_len - input_ids.size(1)):
         with torch.no_grad():
@@ -158,16 +160,19 @@ def evaluate_model(model, tokenizer, raw_examples, max_samples=None):
 
 # ---- Training w/ Progress & Eval ----
 opt=AdamW(model.parameters(),lr=5e-5); epochs=3; sanity=raw_val.select(range(5))
+model.train()
 for e in range(1,epochs+1):
     model.train(); tl=0.0
     for i,b in enumerate(tqdm(train_loader,desc=f"Epoch{e} Train")):
         inp=b['input_ids'].to(device); m=b['attention_mask'].to(device); lbl=b['labels'].to(device)
         loss,_=model(inp,attention_mask=m,labels=lbl); loss.backward(); opt.step(); opt.zero_grad()
         tl+=loss.item(); tqdm.write(f"Batch{i+1}/{len(train_loader)} loss={tl/(i+1):.4f}")
-    vt=0.0
-    for j,b in enumerate(tqdm(val_loader,desc=f"Epoch{e} Val")):
-        inp=b['input_ids'].to(device); m=b['attention_mask'].to(device); lbl=b['labels'].to(device)
-        loss,_=model(inp,attention_mask=m,labels=lbl); vt+=loss.item(); tqdm.write(f"ValBatch{j+1}/{len(val_loader)} loss={vt/(j+1):.4f}")
+    model.eval()
+    with torch.no_grad():
+        vt=0.0
+        for j,b in enumerate(tqdm(val_loader,desc=f"Epoch{e} Val")):
+            inp=b['input_ids'].to(device); m=b['attention_mask'].to(device); lbl=b['labels'].to(device)
+            loss,_=model(inp,attention_mask=m,labels=lbl); vt+=loss.item(); tqdm.write(f"ValBatch{j+1}/{len(val_loader)} loss={vt/(j+1):.4f}")
     print(f"\nEpoch{e} Sanity:")
     for ex in sanity:
         mr_s=mr_to_str(ex['meaning_representation']); inp=tokenizer(mr_s+tokenizer.eos_token, return_tensors='pt').input_ids.to(device)
