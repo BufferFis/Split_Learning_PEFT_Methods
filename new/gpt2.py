@@ -126,8 +126,8 @@ def collate(batch):
     )
 
 # REDUCED batch size for more stable training
-train_loader = DataLoader(train_ds, batch_size=4, shuffle=True, collate_fn=collate)
-val_loader = DataLoader(val_ds, batch_size=4, collate_fn=collate)
+train_loader = DataLoader(train_ds, batch_size=8, shuffle=True, collate_fn=collate)
+val_loader = DataLoader(val_ds, batch_size=8, collate_fn=collate)
 
 # ---- Model Split Definition ----
 class Split3GPT2(nn.Module):
@@ -175,7 +175,7 @@ model.print_trainable_parameters()
 # MUCH lower learning rate
 optimizer = AdamW(
     [p for n, p in model.named_parameters() if p.requires_grad],
-    lr=1e-6,  # REDUCED from 1e-5
+    lr=4e-5,  # REDUCED from 1e-5
     weight_decay=0.01
 )
 
