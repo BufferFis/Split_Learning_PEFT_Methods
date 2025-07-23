@@ -20,7 +20,7 @@ tokenizer.pad_token = tokenizer.eos_token
 max_length = 128
 
 # Preprocessing function: combine MR and text, mask MR in labels
- def preprocess_fn(ex):
+def preprocess_fn(ex):
     mr = ex["meaning_representation"]
     text = ex["human_reference"]
     seq = mr + tokenizer.eos_token + text
@@ -53,27 +53,48 @@ class Split3GPT2(nn.Module):
         super().__init__()
         base = GPT2LMHeadModel.from_pretrained("gpt2")
         self.config = base.config
+        # Embeddings
         self.wte = base.transformer.wte
         self.wpe = base.transformer.wpe
         self.drop = base.transformer.drop
-        num = len(base.transformer.h)
+        # Transformer blocks split
+        num_blocks = len(base.transformer.h)
         self.head_blocks = nn.ModuleList(base.transformer.h[:head_split])
-        self.middle_blocks = nn.ModuleList(base.transformer.h[head_split:num-tail_split])
-        self.tail_blocks = nn.ModuleList(base.transformer.h[num-tail_split:])
+        self.middle_blocks = nn.ModuleList(base.transformer.h[head_split:num_blocks-tail_split])
+        self.tail_blocks = nn.ModuleList(base.transformer.h[num_blocks-tail_split:])
         self.ln_f = base.transformer.ln_f
+        # LM head
         self.lm_head = base.lm_head
+        # Position IDs buffer
         self.register_buffer("position_ids", torch.arange(max_length).unsqueeze(0))
 
     def forward(self, input_ids, attention_mask=None, labels=None):
         bsz, seq_len = input_ids.size()
+        device = input_ids.device
+        # Embeddings
         inputs_embeds = self.wte(input_ids) + self.wpe(self.position_ids[:, :seq_len])
         hidden = self.drop(inputs_embeds)
+
+        # Prepare 4D causal attention mask like client implementation
+        if attention_mask is not None:
+            # attention_mask: [bsz, seq_len] -> [bsz, 1, 1, seq_len]
+            attn_mask = attention_mask.view(bsz, -1)
+            attn_mask = attn_mask[:, None, None, :].to(dtype=self.config.dtype, device=device)
+            attn_mask = (1.0 - attn_mask) * torch.finfo(self.config.dtype).min
+        else:
+            attn_mask = None
+
+        # Pass through head blocks
         for block in self.head_blocks:
-            hidden = block(hidden, attention_mask=attention_mask)[0]
+            hidden = block(hidden, attention_mask=attn_mask)[0]
+        # Middle (server)
         for block in self.middle_blocks:
-            hidden = block(hidden, attention_mask=attention_mask)[0]
+            hidden = block(hidden, attention_mask=attn_mask)[0]
+        # Tail blocks
         for block in self.tail_blocks:
-            hidden = block(hidden, attention_mask=attention_mask)[0]
+            hidden = block(hidden, attention_mask=attn_mask)[0]
+
+        # Final layer norm and LM head
         hidden = self.ln_f(hidden)
         logits = self.lm_head(hidden)
         loss = None
@@ -85,10 +106,8 @@ class Split3GPT2(nn.Module):
             )
         return (loss, logits) if loss is not None else logits
 
-# Instantiate model
+# Instantiate and apply DoRA
 model = Split3GPT2(head_split=1, tail_split=1)
-
-# ---- Apply DoRA (LoRA variant) ----
 peft_config = LoraConfig(
     r=4,
     lora_alpha=16,
@@ -105,20 +124,20 @@ metric_meteor = evaluate.load('meteor')
 metric_rouge = evaluate.load('rouge')
 
 # ---- Evaluation Function ----
+
 def evaluate_model(model, tokenizer, examples, max_gen_len=100):
     model.eval()
     preds, refs = [], []
-    for ex in examples:
-        mr = ex['meaning_representation']
-        prompt = mr + tokenizer.eos_token
-        input_ids = tokenizer(prompt, return_tensors='pt').input_ids.to(device)
-        # greedy generate
-        out = model.generate(input_ids, max_length=max_gen_len, pad_token_id=tokenizer.eos_token_id)
-        gen = tokenizer.decode(out[0], skip_special_tokens=True)
-        # strip prompt
-        text = gen.split(tokenizer.eos_token, 1)[-1].strip()
-        preds.append(text)
-        refs.append(ex['human_reference'])
+    with torch.no_grad():
+        for ex in examples:
+            mr = ex['meaning_representation']
+            prompt = mr + tokenizer.eos_token
+            input_ids = tokenizer(prompt, return_tensors='pt').input_ids.to(device)
+            out = model.generate(input_ids, max_length=max_gen_len, pad_token_id=tokenizer.eos_token_id)
+            gen = tokenizer.decode(out[0], skip_special_tokens=True)
+            text = gen.split(tokenizer.eos_token, 1)[-1].strip()
+            preds.append(text)
+            refs.append(ex['human_reference'])
     bleu = metric_bleu.compute(predictions=preds, references=[[r] for r in refs])
     meteor = metric_meteor.compute(predictions=preds, references=refs)
     rouge = metric_rouge.compute(predictions=preds, references=refs)
@@ -127,9 +146,7 @@ def evaluate_model(model, tokenizer, examples, max_gen_len=100):
 # ---- Training Loop with Sanity Check & Eval ----
 optimizer = AdamW(model.parameters(), lr=5e-5)
 num_epochs = 3
-# sample few validation examples for sanity
 sanity_samples = dataset['validation'][:5]
-
 for epoch in range(num_epochs):
     model.train()
     total_loss = 0.0
@@ -144,17 +161,16 @@ for epoch in range(num_epochs):
         total_loss += loss.item()
     avg_train = total_loss / len(train_loader)
 
-    # mid-training sanity generation
+    # Mid-training sanity check
     print(f"Epoch {epoch+1} Sanity Check:")
     for ex in sanity_samples:
-        mr = ex['meaning_representation']
-        prompt = mr + tokenizer.eos_token
+        prompt = ex['meaning_representation'] + tokenizer.eos_token
         input_ids = tokenizer(prompt, return_tensors='pt').input_ids.to(device)
         out = model.generate(input_ids, max_length=50, pad_token_id=tokenizer.eos_token_id)
-        print(f"MR:", mr)
-        print(f"Gen:", tokenizer.decode(out[0], skip_special_tokens=True).split(tokenizer.eos_token,1)[-1].strip())
+        print("MR:", ex['meaning_representation'])
+        print("Gen:", tokenizer.decode(out[0], skip_special_tokens=True).split(tokenizer.eos_token,1)[-1].strip())
 
-    # validation loss
+    # Validation loss
     model.eval()
     val_loss = 0.0
     with torch.no_grad():
@@ -166,13 +182,13 @@ for epoch in range(num_epochs):
             val_loss += loss.item()
     avg_val = val_loss / len(val_loader)
 
-    # full eval metrics on validation set
+    # Full eval metrics
     bleu, meteor, rouge = evaluate_model(model, tokenizer, dataset['validation'])
     print(f"Epoch {epoch+1}: Train Loss={avg_train:.4f}, Val Loss={avg_val:.4f}")
     print(f" BLEU={bleu['bleu']:.4f}, METEOR={meteor['meteor']:.4f}, ROUGE-L={rouge['rougeL']:.4f}\n")
 
 # ---- Save the fine-tuned model ----
 out_dir = "./split3_gpt2_dora"
- os.makedirs(out_dir, exist_ok=True)
+os.makedirs(out_dir, exist_ok=True)
 model.save_pretrained(out_dir)
 tokenizer.save_pretrained(out_dir)
