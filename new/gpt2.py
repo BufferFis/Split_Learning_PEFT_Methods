@@ -216,7 +216,7 @@ model.print_trainable_parameters()
 # Your original optimizer settings
 optimizer = AdamW(
     [p for n, p in model.named_parameters() if p.requires_grad],
-    lr=1e-6,  # Keeping your original LR
+    lr=4e-5,  # Keeping your original LR
     weight_decay=0.01
 )
 
