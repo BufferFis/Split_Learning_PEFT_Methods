@@ -235,10 +235,10 @@ model = get_peft_model(model, peft_cfg)
 model = model.to(device)
 model.print_trainable_parameters()
 
-# ADJUSTED: Slower learning rate to address fast loss drop
+# Your original optimizer settings - high LR is fine with scheduler
 optimizer = AdamW(
     [p for n, p in model.named_parameters() if p.requires_grad],
-    lr=5e-5,  # Reduced from 2e-4 to slow down learning
+    lr=2e-4,  # Keeping your original LR - scheduler will handle the decay
     weight_decay=0.01
 )
 
