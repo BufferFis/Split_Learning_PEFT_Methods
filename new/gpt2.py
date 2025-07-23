@@ -10,7 +10,7 @@ from torch.optim import AdamW
 from torch.nn import CrossEntropyLoss
 import evaluate
 from tqdm.auto import tqdm
-
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ---- Helper: MR to string ----
 def mr_to_str(mr):
     """
@@ -115,6 +115,7 @@ optimizer = AdamW(
     weight_decay=0.01
 )
 # Scheduler: linear warmup + decay
+epochs = 3
 total_steps = len(train_loader) * epochs
 from transformers import get_linear_schedule_with_warmup
 scheduler = get_linear_schedule_with_warmup(
