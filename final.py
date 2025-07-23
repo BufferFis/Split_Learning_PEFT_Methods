@@ -1038,7 +1038,7 @@ class SplitLoRATrainer:
 
                     # 2) Body forward (no cache)
                     body_out, _ = self.server.forward_train(
-                        h_states, attention_mask=attention_mask, past_key_values=None
+                        h_states, attention_mask=attention_mask
                     )
                     b_states = body_out.last_hidden_state
 
