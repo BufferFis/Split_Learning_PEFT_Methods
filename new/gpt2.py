@@ -99,8 +99,8 @@ def collate(batch):
     )
 
 # Keep your original batch size and settings
-train_loader = DataLoader(train_ds, batch_size=4, shuffle=True, collate_fn=collate)
-val_loader = DataLoader(val_ds, batch_size=4, collate_fn=collate)
+train_loader = DataLoader(train_ds, batch_size=8, shuffle=True, collate_fn=collate)
+val_loader = DataLoader(val_ds, batch_size=8, collate_fn=collate)
 
 # ---- FIXED Model Split with Proper State Passing ----
 class Split3GPT2(nn.Module):
@@ -159,31 +159,53 @@ class Split3GPT2(nn.Module):
         # Forward through blocks with proper past_key_values handling
         new_past_key_values = () if use_cache else None
         
-        # Head blocks
+        # FIXED: Head blocks with proper output handling
         for i, block in enumerate(self.head_blocks):
             past_kv = past_key_values[i] if past_key_values is not None else None
             outputs = block(hidden_states, attention_mask=attention_mask, past_key_value=past_kv, use_cache=use_cache)
-            hidden_states = outputs[0]
-            if use_cache:
-                new_past_key_values += (outputs[1],)
+            
+            # Handle different output formats
+            if isinstance(outputs, tuple):
+                hidden_states = outputs[0]
+                if use_cache and len(outputs) > 1:
+                    new_past_key_values += (outputs[1],)
+            else:
+                hidden_states = outputs
+                if use_cache:
+                    # If no cache returned but use_cache=True, add None
+                    new_past_key_values += (None,)
         
-        # Middle blocks  
+        # FIXED: Middle blocks  
         middle_start = len(self.head_blocks)
         for i, block in enumerate(self.middle_blocks):
             past_kv = past_key_values[middle_start + i] if past_key_values is not None else None
             outputs = block(hidden_states, attention_mask=attention_mask, past_key_value=past_kv, use_cache=use_cache)
-            hidden_states = outputs[0]
-            if use_cache:
-                new_past_key_values += (outputs[1],)
+            
+            # Handle different output formats
+            if isinstance(outputs, tuple):
+                hidden_states = outputs[0] 
+                if use_cache and len(outputs) > 1:
+                    new_past_key_values += (outputs[1],)
+            else:
+                hidden_states = outputs
+                if use_cache:
+                    new_past_key_values += (None,)
         
-        # Tail blocks
+        # FIXED: Tail blocks
         tail_start = len(self.head_blocks) + len(self.middle_blocks)
         for i, block in enumerate(self.tail_blocks):
             past_kv = past_key_values[tail_start + i] if past_key_values is not None else None
             outputs = block(hidden_states, attention_mask=attention_mask, past_key_value=past_kv, use_cache=use_cache)
-            hidden_states = outputs[0]
-            if use_cache:
-                new_past_key_values += (outputs[1],)
+            
+            # Handle different output formats
+            if isinstance(outputs, tuple):
+                hidden_states = outputs[0]
+                if use_cache and len(outputs) > 1:
+                    new_past_key_values += (outputs[1],)
+            else:
+                hidden_states = outputs
+                if use_cache:
+                    new_past_key_values += (None,)
         
         # Final layer norm and projection
         hidden_states = self.ln_f(hidden_states)
@@ -213,10 +235,10 @@ model = get_peft_model(model, peft_cfg)
 model = model.to(device)
 model.print_trainable_parameters()
 
-# Your original optimizer settings
+# ADJUSTED: Slower learning rate to address fast loss drop
 optimizer = AdamW(
     [p for n, p in model.named_parameters() if p.requires_grad],
-    lr=2e-4,  # Keeping your original LR
+    lr=5e-5,  # Reduced from 2e-4 to slow down learning
     weight_decay=0.01
 )
 
@@ -265,7 +287,14 @@ def generate_sequence(model, input_ids, max_len=50, ban_eos_steps=5, temperature
                 }
             
             outputs = model(**model_inputs)
-            logits, past_key_values = outputs[0], outputs[1]
+            
+            # FIXED: Handle different output formats from model
+            if isinstance(outputs, tuple) and len(outputs) >= 2:
+                logits = outputs[0] if outputs[0] is not None else outputs[1]
+                past_key_values = outputs[2] if len(outputs) > 2 else outputs[1]
+            else:
+                logits = outputs
+                past_key_values = None
             
             # Get next token logits
             next_logits = logits[:, -1, :] / temperature
@@ -320,16 +349,20 @@ def evaluate_model(model, tokenizer, raw_examples, max_samples=None):
             txt = tokenizer.decode(out[0], skip_special_tokens=True).split(mr_s, 1)[-1].strip()
         
         preds.append(txt); refs.append(ex['human_reference'])
+    
     bleu = metric_bleu.compute(predictions=preds, references=[[r] for r in refs])
     meteor = metric_meteor.compute(predictions=preds, references=refs)
     rouge = metric_rouge.compute(predictions=preds, references=refs)
     return bleu, meteor, rouge
 
-# ---- Training Loop (keeping your original structure) ----
+# ---- Training Loop with Enhanced Monitoring ----
 model.train()
 for e in range(1, epochs + 1):
     model.train()
     tl = 0.0
+    
+    # Track learning progress more granularly
+    batch_losses = []
     
     for i, b in enumerate(tqdm(train_loader, desc=f"Epoch{e} Train")):
         inp = b['input_ids'].to(device)
@@ -346,9 +379,14 @@ for e in range(1, epochs + 1):
         scheduler.step() 
         optimizer.zero_grad()
         
-        tl += loss.item()
+        batch_loss = loss.item()
+        tl += batch_loss
+        batch_losses.append(batch_loss)
+        
         if (i + 1) % 50 == 0:
-            tqdm.write(f"Batch{i+1}/{len(train_loader)} loss={tl/(i+1):.4f}")
+            avg_loss = tl/(i+1)
+            recent_avg = sum(batch_losses[-10:]) / min(10, len(batch_losses))
+            tqdm.write(f"Batch{i+1}/{len(train_loader)} loss={avg_loss:.4f} recent_avg={recent_avg:.4f}")
     
     # Validation
     model.eval()
@@ -381,10 +419,18 @@ for e in range(1, epochs + 1):
         print(f"Reference: {ex['human_reference']}")
         print("-" * 50)
     
+    # Monitor training dynamics
+    final_avg_loss = tl/len(train_loader)
+    val_avg_loss = vt/len(val_loader)
+    print(f"Epoch {e} Loss Analysis:")
+    print(f"  Train Loss: {final_avg_loss:.4f}")
+    print(f"  Val Loss: {val_avg_loss:.4f}")
+    print(f"  Loss Variance: {torch.tensor(batch_losses).var().item():.4f}")
+    
     # Evaluate every 2 epochs
     if e % 2 == 0:
         bleu, meteor, rouge = evaluate_model(model, tokenizer, raw_val.select(range(100)))
-        print(f"Epoch{e}: TrainL={tl/len(train_loader):.4f} ValL={vt/len(val_loader):.4f} "
+        print(f"Epoch{e}: TrainL={final_avg_loss:.4f} ValL={val_avg_loss:.4f} "
               f"BLEU={bleu['bleu']:.4f} METEOR={meteor['meteor']:.4f} ROUGE-L={rouge['rougeL']:.4f}\n")
 
 # Save
