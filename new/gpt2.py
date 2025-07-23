@@ -235,10 +235,10 @@ model = get_peft_model(model, peft_cfg)
 model = model.to(device)
 model.print_trainable_parameters()
 
-# Your original optimizer settings - high LR is fine with scheduler
+
 optimizer = AdamW(
     [p for n, p in model.named_parameters() if p.requires_grad],
-    lr=2e-4,  # Keeping your original LR - scheduler will handle the decay
+    lr=1e-4,  
     weight_decay=0.01
 )
 
