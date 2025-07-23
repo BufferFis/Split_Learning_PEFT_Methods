@@ -126,12 +126,22 @@ class Split3GPT2(nn.Module):
     def forward(self, input_ids, attention_mask=None, labels=None, past_key_values=None, use_cache=False):
         bsz, seq_len = input_ids.size()
         
-        # CRITICAL FIX: Handle past_key_values for generation
-        if past_key_values is not None:
-            # During generation, we only process the last token
-            past_length = past_key_values[0][0].size(-2)  # Get past sequence length
-            position_ids = torch.arange(past_length, past_length + seq_len, dtype=torch.long, device=input_ids.device)
-            position_ids = position_ids.unsqueeze(0)
+        # CRITICAL FIX: Handle past_key_values for generation with proper validation
+        if past_key_values is not None and len(past_key_values) > 0:
+            # Safely get past length - handle case where past_key_values might contain None
+            try:
+                if past_key_values[0] is not None and len(past_key_values[0]) > 0:
+                    past_length = past_key_values[0][0].size(-2)  # Get past sequence length
+                else:
+                    past_length = 0
+            except (IndexError, AttributeError):
+                past_length = 0
+            
+            if past_length > 0:
+                position_ids = torch.arange(past_length, past_length + seq_len, dtype=torch.long, device=input_ids.device)
+                position_ids = position_ids.unsqueeze(0)
+            else:
+                position_ids = self.position_ids[:, :seq_len]
         else:
             # During training, process full sequence
             position_ids = self.position_ids[:, :seq_len]
@@ -143,14 +153,19 @@ class Split3GPT2(nn.Module):
         
         # CRITICAL FIX: Proper attention mask handling for generation
         if attention_mask is not None:
-            if past_key_values is not None:
-                # During generation, extend attention mask
-                past_length = past_key_values[0][0].size(-2)
-                # Create extended attention mask
-                batch_size = attention_mask.size(0)
-                extended_attention_mask = torch.ones(batch_size, past_length + seq_len, device=attention_mask.device)
-                extended_attention_mask[:, -seq_len:] = attention_mask
-                attention_mask = extended_attention_mask
+            if past_key_values is not None and len(past_key_values) > 0:
+                # During generation, extend attention mask - but only if we have valid past
+                try:
+                    if past_key_values[0] is not None and len(past_key_values[0]) > 0:
+                        past_length = past_key_values[0][0].size(-2)
+                        # Create extended attention mask
+                        batch_size = attention_mask.size(0)
+                        extended_attention_mask = torch.ones(batch_size, past_length + seq_len, device=attention_mask.device)
+                        extended_attention_mask[:, -seq_len:] = attention_mask
+                        attention_mask = extended_attention_mask
+                except (IndexError, AttributeError):
+                    # If past_key_values is malformed, just use current attention_mask
+                    pass
             
             # Convert to causal mask format
             attention_mask = attention_mask.view(bsz, 1, 1, -1)
@@ -159,9 +174,12 @@ class Split3GPT2(nn.Module):
         # Forward through blocks with proper past_key_values handling
         new_past_key_values = () if use_cache else None
         
-        # FIXED: Head blocks with proper output handling
+        # FIXED: Head blocks with robust past_key_values handling
         for i, block in enumerate(self.head_blocks):
-            past_kv = past_key_values[i] if past_key_values is not None else None
+            past_kv = None
+            if past_key_values is not None and len(past_key_values) > i:
+                past_kv = past_key_values[i]
+            
             outputs = block(hidden_states, attention_mask=attention_mask, past_key_value=past_kv, use_cache=use_cache)
             
             # Handle different output formats
@@ -178,7 +196,10 @@ class Split3GPT2(nn.Module):
         # FIXED: Middle blocks  
         middle_start = len(self.head_blocks)
         for i, block in enumerate(self.middle_blocks):
-            past_kv = past_key_values[middle_start + i] if past_key_values is not None else None
+            past_kv = None
+            if past_key_values is not None and len(past_key_values) > (middle_start + i):
+                past_kv = past_key_values[middle_start + i]
+            
             outputs = block(hidden_states, attention_mask=attention_mask, past_key_value=past_kv, use_cache=use_cache)
             
             # Handle different output formats
@@ -194,7 +215,10 @@ class Split3GPT2(nn.Module):
         # FIXED: Tail blocks
         tail_start = len(self.head_blocks) + len(self.middle_blocks)
         for i, block in enumerate(self.tail_blocks):
-            past_kv = past_key_values[tail_start + i] if past_key_values is not None else None
+            past_kv = None
+            if past_key_values is not None and len(past_key_values) > (tail_start + i):
+                past_kv = past_key_values[tail_start + i]
+            
             outputs = block(hidden_states, attention_mask=attention_mask, past_key_value=past_kv, use_cache=use_cache)
             
             # Handle different output formats
@@ -235,10 +259,10 @@ model = get_peft_model(model, peft_cfg)
 model = model.to(device)
 model.print_trainable_parameters()
 
-
+# Your original optimizer settings - high LR is fine with scheduler
 optimizer = AdamW(
     [p for n, p in model.named_parameters() if p.requires_grad],
-    lr=1e-4,  
+    lr=2e-4,  # Keeping your original LR - scheduler will handle the decay
     weight_decay=0.01
 )
 
