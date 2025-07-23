@@ -83,7 +83,7 @@ class Split3GPT2(nn.Module):
 
     def forward(self, input_ids, attention_mask=None, labels=None):
         bsz, seq_len = input_ids.size(); device = input_ids.device
-        inputs_embeds = self.wte(input_ids) + self.wpe(self.position_ids[:, :seq_len])
+        inputs_embeds = self.wte(input_ids) + self.wpe(self.position_ids[:, :seq_len].to(device))
         hidden = self.drop(inputs_embeds)
         attn = None
         if attention_mask is not None:
