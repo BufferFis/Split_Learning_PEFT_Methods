@@ -78,9 +78,9 @@ class Split3GPT2(nn.Module):
         # Prepare 4D causal attention mask like client implementation
         if attention_mask is not None:
             # attention_mask: [bsz, seq_len] -> [bsz, 1, 1, seq_len]
-            attn_mask = attention_mask.view(bsz, -1)
-            attn_mask = attn_mask[:, None, None, :].to(dtype=self.config.dtype, device=device)
-            attn_mask = (1.0 - attn_mask) * torch.finfo(self.config.dtype).min
+            attn_mask = attention_mask.view(bsz, -1).to(device)
+            attn_mask = attn_mask[:, None, None, :].to(dtype=hidden.dtype)
+            attn_mask = (1.0 - attn_mask) * torch.finfo(hidden.dtype).min
         else:
             attn_mask = None
 
@@ -124,7 +124,6 @@ metric_meteor = evaluate.load('meteor')
 metric_rouge = evaluate.load('rouge')
 
 # ---- Evaluation Function ----
-
 def evaluate_model(model, tokenizer, examples, max_gen_len=100):
     model.eval()
     preds, refs = [], []
@@ -189,6 +188,7 @@ for epoch in range(num_epochs):
 
 # ---- Save the fine-tuned model ----
 out_dir = "./split3_gpt2_dora"
+# create output directory
 os.makedirs(out_dir, exist_ok=True)
 model.save_pretrained(out_dir)
 tokenizer.save_pretrained(out_dir)
