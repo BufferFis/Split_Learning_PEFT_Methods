@@ -71,8 +71,7 @@ class Split3GPT2(nn.Module):
         self.config = base.config
         self.wte = base.transformer.wte
         self.wpe = base.transformer.wpe
-        # increase dropout to regularize and avoid overfitting
-        self.drop = nn.Dropout(0.3)  # originally base.transformer.drop
+        self.drop = nn.Dropout(0.3)
         num_blocks = len(base.transformer.h)
         self.head_blocks = nn.ModuleList(base.transformer.h[:head_split])
         self.middle_blocks = nn.ModuleList(base.transformer.h[head_split:num_blocks-tail_split])
@@ -82,12 +81,13 @@ class Split3GPT2(nn.Module):
         self.register_buffer("position_ids", torch.arange(max_length).unsqueeze(0))
 
     def forward(self, input_ids, attention_mask=None, labels=None):
-        bsz, seq_len = input_ids.size(); device = input_ids.device
-        inputs_embeds = self.wte(input_ids) + self.wpe(self.position_ids[:, :seq_len].to(device))
+        bsz, seq_len = input_ids.size()
+        pos_ids = self.position_ids[:, :seq_len].to(input_ids.device)
+        inputs_embeds = self.wte(input_ids) + self.wpe(pos_ids)
         hidden = self.drop(inputs_embeds)
         attn = None
         if attention_mask is not None:
-            attn = (1.0 - attention_mask.view(bsz,1,1,seq_len).to(device)) * torch.finfo(hidden.dtype).min
+            attn = (1.0 - attention_mask.view(bsz,1,1,seq_len).to(hidden.device)) * torch.finfo(hidden.dtype).min
         for blk in self.head_blocks: hidden = blk(hidden, attention_mask=attn)[0]
         for blk in self.middle_blocks: hidden = blk(hidden, attention_mask=attn)[0]
         for blk in self.tail_blocks: hidden = blk(hidden, attention_mask=attn)[0]
@@ -102,10 +102,8 @@ class Split3GPT2(nn.Module):
 model = Split3GPT2(1,1)
 peft_cfg = LoraConfig(r=4, lora_alpha=16, target_modules=["c_attn","c_proj"], use_dora=True)
 model = get_peft_model(model, peft_cfg)
-# LoRA adapters already manage trainable parameters internally
 model.print_trainable_parameters()
 
-# Prepare optimizer: only adapter parameters, with weight decay
 optimizer = AdamW(
     [p for n, p in model.named_parameters() if p.requires_grad],
     lr=1e-5,
@@ -113,7 +111,6 @@ optimizer = AdamW(
 )
 
 epochs = 3
-# Scheduler: linear warmup + decay
 total_steps = len(train_loader) * epochs
 from transformers import get_linear_schedule_with_warmup
 scheduler = get_linear_schedule_with_warmup(
@@ -122,19 +119,8 @@ scheduler = get_linear_schedule_with_warmup(
     num_training_steps=total_steps
 )
 
-
 # ---- Generator (custom) ----
 def generate_sequence(model, input_ids, max_len=50, ban_eos_steps=2, top_k=50):
-    """
-    Autoregressive generation with sampling to prevent MR copy:
-
-    1. **Input**: `input_ids` are the tokenized MR plus the EOS separator.
-    2. **Ban EOS**: For the first `ban_eos_steps` time steps, the EOS token's logit is set to -inf so the model cannot immediately terminate generation.
-    3. **Top-k sampling**: Instead of always choosing the highest-probability token (greedy), we limit to the top_k most likely next tokens and sample among them according to their softmax probabilities. This discourages simply replicating the input sequence and introduces variability.
-    4. **Stop condition**: Once EOS is sampled _after_ the ban steps, generation stops early.
-
-    These two changes (EOS ban + top-k sampling) help push the model away from memorizing and regurgitating the MR and encourage it to produce fluent outputs.
-    """
     cur = input_ids
     steps = 0
     for _ in range(max_len - input_ids.size(1)):
@@ -142,17 +128,14 @@ def generate_sequence(model, input_ids, max_len=50, ban_eos_steps=2, top_k=50):
             out = model(cur, attention_mask=torch.ones_like(cur).to(device))
             logits = out[1] if isinstance(out, tuple) else out
             next_logits = logits[:, -1, :]
-            # ban EOS for initial steps
             if steps < ban_eos_steps:
                 next_logits[:, tokenizer.eos_token_id] = -float('Inf')
-            # top-k sampling to encourage diversity
             values, indices = torch.topk(next_logits, top_k)
             probs = torch.softmax(values, dim=-1)
             choice = torch.multinomial(probs, num_samples=1)
             next_id = indices.gather(-1, choice)
         cur = torch.cat([cur, next_id], dim=1)
         steps += 1
-        # stop if EOS sampled after ban period
         if next_id.item() == tokenizer.eos_token_id and steps >= ban_eos_steps:
             break
     return cur
@@ -160,10 +143,6 @@ def generate_sequence(model, input_ids, max_len=50, ban_eos_steps=2, top_k=50):
 # ---- Metrics & Eval ----
 metric_bleu=evaluate.load('bleu'); metric_meteor=evaluate.load('meteor'); metric_rouge=evaluate.load('rouge')
 def evaluate_model(model, tokenizer, raw_examples, max_samples=None):
-    """
-    Compute BLEU, METEOR, ROUGE-L over raw_examples.
-    max_samples: limit number to speed up eval (None for all).
-    """
     preds, refs = [], []
     examples = raw_examples if max_samples is None else raw_examples.select(range(max_samples))
     for ex in tqdm(examples, desc="Metric Eval", leave=False):
