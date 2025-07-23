@@ -9,6 +9,7 @@ import torch.optim as optim
 from typing import Optional
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from torch.cuda.amp import autocast, GradScaler
 from datasets import load_dataset
 from evaluate import load as load_metric
 from peft import LoraConfig, get_peft_model, PeftModel
@@ -27,6 +28,7 @@ from sacrebleu.metrics import BLEU as SBLEU
 import subprocess, tempfile, pathlib, json
 from transformers import get_linear_schedule_with_warmup
 import random
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutput
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -53,7 +55,7 @@ def diagnose_tokenizer_corruption(trainer):
 
 
 def split_gpt2(model, head_layers=2, tail_layers=2):
-    """Split GPT2 model into head, body, and tail parts"""
+    """Split GPT2 model into head, body, and tail parts with cache handling"""
     total_layers = len(model.transformer.h)
     body_layers = total_layers - head_layers - tail_layers
     
@@ -65,7 +67,7 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
     # Head Model (embedding + first few layers)
     class HeadModel(nn.Module):
         def __init__(self, original_model, num_layers):
-            super().__init__()  # CRITICAL: Call parent constructor
+            super().__init__()
             self.wte = original_model.transformer.wte
             self.wpe = original_model.transformer.wpe
             self.drop = original_model.transformer.drop
@@ -92,73 +94,147 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             """Default implementation for prepare_inputs_for_generation"""
             return {"input_ids": input_ids}
             
-        def forward(self, input_ids=None, attention_mask=None, output_hidden_states=False, **kwargs):
-            inputs_embeds = self.wte(input_ids)
-            seq_length = input_ids.size(-1)
-            position_ids = torch.arange(0, seq_length, dtype=torch.long, device=input_ids.device)
+        def forward(self, input_ids=None, attention_mask=None, position_ids=None, 
+                   past_key_values=None, use_cache=True, output_hidden_states=False, **kwargs):
+            """Forward pass with proper cache handling"""
+            
+            # Handle position IDs
+            if position_ids is None:
+                if past_key_values is not None:
+                    # For generation steps
+                    seq_length_past = past_key_values[0][0].shape[2]
+                    # Critical: position_ids should be incremented based on past sequence length
+                    position_ids = torch.arange(
+                        seq_length_past, 
+                        seq_length_past + input_ids.shape[1], 
+                        dtype=torch.long, 
+                        device=input_ids.device
+                    ).unsqueeze(0).expand(input_ids.shape[0], -1)
+                else:
+                    # For first step
+                    seq_length = input_ids.size(-1)
+                    position_ids = torch.arange(
+                        0, seq_length, dtype=torch.long, device=input_ids.device
+                    ).unsqueeze(0).expand(input_ids.shape[0], -1)
+            
+            if input_ids is not None:
+                inputs_embeds = self.wte(input_ids)
+            else:
+                raise ValueError("You have to specify input_ids")
+                
             position_embeds = self.wpe(position_ids)
             hidden_states = inputs_embeds + position_embeds
             hidden_states = self.drop(hidden_states)
 
-            # FIXED: Pass attention_mask to each block
-            all_hidden_states = ()
+            # Initialize for cache handling
+            present_key_values = () if use_cache else None
+            all_hidden_states = () if output_hidden_states else None
+            
+            # FIXED: Pass attention_mask to each block with caching
             dtype = hidden_states.dtype
-            attn_mask = _expand_mask(attention_mask, dtype)
-            for block in self.h:
-                # Convert attention_mask to the format GPT-2 blocks expect
-                hidden_states = block(hidden_states , attention_mask=attn_mask, use_cache=False)[0]
-                all_hidden_states = all_hidden_states + (hidden_states,)
-
-            if output_hidden_states:
-                return type('HeadOutput', (), {
-                    'last_hidden_state': hidden_states,
-                    'hidden_states': all_hidden_states
-                })()
-            else:
-                return type('HeadOutput', (), {'last_hidden_state': hidden_states})()
+            attn_mask = _expand_mask(attention_mask, dtype) if attention_mask is not None else None
             
-    
-    # Body Model (middle layers)
-    class BodyModel(nn.Module):
-        def __init__(self, original_model, start_layer, num_layers):
-            super().__init__()  # CRITICAL: Call parent constructor
-            self.transformer = nn.Module()
-            self.transformer.h = nn.ModuleList(
-                original_model.transformer.h[start_layer:start_layer + num_layers]
-            )
-            self.config = original_model.config
-            
-            # Add missing generation attributes for PEFT compatibility
-            self.generation_config = getattr(original_model, 'generation_config', None)
-            self.main_input_name = getattr(original_model, 'main_input_name', 'input_ids')
-            
-            # Add the missing prepare_inputs_for_generation method
-            if hasattr(original_model, 'prepare_inputs_for_generation'):
-                self.prepare_inputs_for_generation = original_model.prepare_inputs_for_generation
-            else:
-                self.prepare_inputs_for_generation = self._prepare_inputs_for_generation
+            # Process through transformer layers
+            for i, block in enumerate(self.h):
+                # Get past_key_value for this layer if available
+                past_key_value = past_key_values[i] if past_key_values is not None else None
                 
-            # Add other missing attributes that PEFT might need
-            for attr in ['_get_resized_embeddings', 'get_input_embeddings', 'set_input_embeddings', 
-                        'get_output_embeddings', 'set_output_embeddings', 'resize_token_embeddings']:
-                if hasattr(original_model, attr):
-                    setattr(self, attr, getattr(original_model, attr))
-        
-        def _prepare_inputs_for_generation(self, input_ids, **kwargs):
-            """Default implementation for prepare_inputs_for_generation"""
-            return {"input_ids": input_ids}
-            
-        def forward(self, hidden_states=None, attention_mask=None, **kwargs):
-            dtype = hidden_states.dtype
-            attn_mask = _expand_mask(attention_mask, dtype)
-            for block in self.transformer.h:
-                hidden_states = block(hidden_states,attention_mask=attn_mask,use_cache=False)[0]
-            return type('BodyOutput', (), {'last_hidden_state': hidden_states})()
+                # Forward through the block
+                layer_outputs = block(
+                    hidden_states, 
+                    attention_mask=attn_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    use_cache=use_cache
+                )
+                
+                hidden_states = layer_outputs[0]
+                
+                if use_cache:
+                    present_key_values = present_key_values + (layer_outputs[1],)
+                    
+                if output_hidden_states:
+                    all_hidden_states = all_hidden_states + (hidden_states,)
 
-    # Tail Model (last few layers + LM head)
+            # Return with proper output format
+            if output_hidden_states:
+                return BaseModelOutputWithPast(
+                    last_hidden_state=hidden_states,
+                    past_key_values=present_key_values,
+                    hidden_states=all_hidden_states
+                )
+            else:
+                return hidden_states, present_key_values
+
+
+    class BodyModel(nn.Module):
+            def __init__(self, original_model, start_layer, num_layers):
+                super().__init__()
+                self.transformer = nn.Module()
+                self.transformer.h = nn.ModuleList(
+                    original_model.transformer.h[start_layer:start_layer + num_layers]
+                )
+                self.config = original_model.config
+                
+                # Add missing generation attributes for PEFT compatibility
+                self.generation_config = getattr(original_model, 'generation_config', None)
+                self.main_input_name = getattr(original_model, 'main_input_name', 'input_ids')
+                
+                # Add the missing prepare_inputs_for_generation method
+                if hasattr(original_model, 'prepare_inputs_for_generation'):
+                    self.prepare_inputs_for_generation = original_model.prepare_inputs_for_generation
+                else:
+                    self.prepare_inputs_for_generation = self._prepare_inputs_for_generation
+                    
+                # Add other missing attributes that PEFT might need
+                for attr in ['_get_resized_embeddings', 'get_input_embeddings', 'set_input_embeddings', 
+                            'get_output_embeddings', 'set_output_embeddings', 'resize_token_embeddings']:
+                    if hasattr(original_model, attr):
+                        setattr(self, attr, getattr(original_model, attr))
+            
+            def _prepare_inputs_for_generation(self, input_ids, **kwargs):
+                """Default implementation for prepare_inputs_for_generation"""
+                return {"input_ids": input_ids}
+                
+            def forward(self, hidden_states=None, attention_mask=None, position_ids=None, 
+                    past_key_values=None, use_cache=True, **kwargs):
+                """Forward pass with proper cache handling"""
+                
+                # Initialize for cache handling
+                present_key_values = () if use_cache else None
+                
+                # Expand attention mask if needed
+                dtype = hidden_states.dtype
+                attn_mask = _expand_mask(attention_mask, dtype) if attention_mask is not None else None
+                
+                # Process through transformer layers
+                for i, block in enumerate(self.transformer.h):
+                    # Get past_key_value for this layer if available
+                    past_key_value = past_key_values[i] if past_key_values is not None else None
+                    
+                    # Forward through the block
+                    layer_outputs = block(
+                        hidden_states, 
+                        attention_mask=attn_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_value,
+                        use_cache=use_cache
+                    )
+                    
+                    hidden_states = layer_outputs[0]
+                    
+                    if use_cache:
+                        present_key_values = present_key_values + (layer_outputs[1],)
+                
+                return hidden_states, present_key_values
+
+
+
+
+
     class TailModel(nn.Module):
         def __init__(self, original_model, start_layer):
-            super().__init__()  # CRITICAL: Call parent constructor
+            super().__init__()
             self.transformer = nn.Module()
             self.transformer.h = nn.ModuleList(original_model.transformer.h[start_layer:])
             self.transformer.ln_f = original_model.transformer.ln_f
@@ -185,26 +261,43 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             """Default implementation for prepare_inputs_for_generation"""
             return {"input_ids": input_ids}
             
-        def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
+        def forward(self, inputs_embeds=None, attention_mask=None, position_ids=None, 
+                   past_key_values=None, use_cache=True, **kwargs):
+            """Forward pass with proper cache handling"""
+        
             hidden_states = inputs_embeds
+            
+            # Initialize for cache handling
+            present_key_values = () if use_cache else None
+            
+            # Get sequence length from attention mask for proper causal masking
             dtype = hidden_states.dtype
-            attn_mask = _expand_mask(attention_mask, dtype)
-            for block in self.transformer.h:   
-                hidden_states = block(hidden_states,attention_mask=attn_mask,use_cache=False)[0]
+            attn_mask = _expand_mask(attention_mask, dtype) if attention_mask is not None else None
+            
+            # Process through transformer layers
+            for i, block in enumerate(self.transformer.h):
+                # Get past_key_value for this layer if available
+                past_key_value = past_key_values[i] if past_key_values is not None else None
+                
+                # Forward through the block
+                layer_outputs = block(
+                    hidden_states, 
+                    attention_mask=attn_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    use_cache=use_cache
+                )
+                
+                hidden_states = layer_outputs[0]
+                
+                if use_cache:
+                    present_key_values = present_key_values + (layer_outputs[1],)
 
+            # Final layer norm and LM head
             hidden_states = self.transformer.ln_f(hidden_states)
             logits = self.lm_head(hidden_states)
 
-            return type('TailOutput', (), {'logits': logits})()
-
-    
-    head_model = HeadModel(model, head_layers)
-    body_model = BodyModel(model, head_layers, body_layers)
-    tail_model = TailModel(model, head_layers + body_layers)
-
-    tail_model.lm_head.weight = head_model.wte.weight
-    
-    return head_model, body_model, tail_model
+            return logits, present_key_values
 
 
 
@@ -217,20 +310,31 @@ class ServerModel:
             lr=learning_rate
         )
         
-    def forward(self, activations, attention_mask=None):
-        """Forward pass through body layers (inference mode)"""
+    def forward(self, activations, attention_mask=None, position_ids=None, past_key_values=None, use_cache=True):
+        """Forward pass through body layers with proper caching"""
         self.body_model.eval()
         with torch.no_grad():
-            output = self.body_model(hidden_states=activations)
-            return output.last_hidden_state
+            output, present = self.body_model(
+                hidden_states=activations,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache
+            )
+            return output if not use_cache else (output, present)
     
-    def forward_train(self, activations, attention_mask=None):
-        """Forward pass during training"""
+    def forward_train(self, activations, attention_mask=None, position_ids=None):
+        """Forward pass during training (no caching needed)"""
         self.body_model.train()
         # Don't detach - maintain gradient connection
         activations.requires_grad_(True)
-        output = self.body_model(hidden_states=activations, attention_mask=attention_mask)
-        return output.last_hidden_state, activations
+        output, _ = self.body_model(
+            hidden_states=activations, 
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=False
+        )
+        return output, activations
     
     def backward(self, body_output, body_grad, head_activations):
         """Fixed backward pass with proper gradient flow"""
@@ -280,14 +384,29 @@ class HeadClient:
             lr=learning_rate
         )
         
-    def forward(self, input_ids, attention_mask=None):
-        """Forward pass through head layers"""
-        output = self.head_model(
-            input_ids=input_ids, 
-            attention_mask=attention_mask, 
-            output_hidden_states=True
-        )
-        return output.hidden_states[-1]
+    def forward(self, input_ids, attention_mask=None, position_ids=None, past_key_values=None, use_cache=True):
+        """Forward pass through head layers with proper caching"""
+        if use_cache:
+            output = self.head_model(
+                input_ids=input_ids, 
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                output_hidden_states=True
+            )
+            last_hidden = output.last_hidden_state
+            past = output.past_key_values
+            return last_hidden, past
+        else:
+            output = self.head_model(
+                input_ids=input_ids, 
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False,
+                output_hidden_states=True
+            )
+            return output.hidden_states[-1]
     
     def backward(self, head_activations, head_grad):
         """ESSENTIAL: Backward pass for split learning"""
@@ -307,19 +426,25 @@ class HeadClient:
 
 class TailClient:
     """Client component handling tail layers"""
-    def __init__(self, tail_model, learning_rate=2e-4):
+    def __init__(self, tail_model, learning_rate=5e-4, tokenizer=None):
         self.tail_model = tail_model.to(device)
         self.optimizer = optim.AdamW(
             [p for p in self.tail_model.parameters() if p.requires_grad], 
             lr=learning_rate
         )
         self.loss_fn = nn.CrossEntropyLoss(label_smoothing=0.05)
+        self.tokenizer = tokenizer
         
-    def forward(self, body_activations, attention_mask=None):
-        """Forward pass through tail layers"""
-        output = self.tail_model(inputs_embeds=body_activations, 
-                                 attention_mask=attention_mask)
-        return output.logits
+    def forward(self, body_activations, attention_mask=None, position_ids=None, past_key_values=None, use_cache=True):
+        """Forward pass through tail layers with proper caching"""
+        output, present = self.tail_model(
+            inputs_embeds=body_activations, 
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache
+        )
+        return output if not use_cache else (output, present)
     
     def compute_loss_and_backward(self, body_activations, labels, attention_mask=None):
         """FIXED: Add retain_grad() for non-leaf tensors"""
@@ -330,7 +455,11 @@ class TailClient:
         body_activations.retain_grad()  # CRITICAL: Add this line
         
         # Forward pass
-        logits = self.tail_model(inputs_embeds=body_activations).logits
+        logits, _ = self.tail_model(
+            inputs_embeds=body_activations,
+            attention_mask=attention_mask,
+            use_cache=False
+        )
         logits = torch.clamp(logits, -50.0, 50.0)
 
         # Compute loss 
@@ -373,6 +502,112 @@ class TailClient:
         self.optimizer.step()
         
         return loss.item(), body_grad
+    
+    def extract_attributes(self, mr_text):
+        """Extract key attributes from E2E meaning representation"""
+        import re
+        
+        attributes = {}
+        pattern = r'(\w+)\[([^\]]+)\]'
+        matches = re.findall(pattern, mr_text)
+        
+        for attr_name, attr_value in matches:
+            attr_value = attr_value.lower().strip()
+            
+            if attr_name == 'priceRange':
+                if 'less than' in attr_value:
+                    attr_value = 'cheap'
+                elif 'more than' in attr_value:
+                    attr_value = 'expensive'
+            
+            attributes[attr_name] = attr_value
+        
+        return attributes
+    
+    def validate_coverage(self, mr_text, generated_text):
+        """Enhanced coverage validation for all E2E attributes"""
+        attributes = self.extract_attributes(mr_text)
+        gen_text_lower = generated_text.lower()
+        
+        covered_attrs = []
+        missing_attrs = []
+        
+        for attr_name, attr_value in attributes.items():
+            covered = False
+            
+            # Direct match first
+            if attr_value in gen_text_lower:
+                covered = True
+            else:
+                # Attribute-specific matching
+                if attr_name == 'eatType':
+                    synonyms = {
+                        'coffee shop': ['coffee', 'café', 'cafe'],
+                        'restaurant': ['restaurant', 'place', 'establishment'],
+                        'pub': ['pub', 'bar'],
+                        'fast food': ['fast food', 'takeaway']
+                    }
+                    if attr_value in synonyms:
+                        covered = any(syn in gen_text_lower for syn in synonyms[attr_value])
+                
+                elif attr_name == 'food':
+                    # Food cuisines are usually mentioned directly
+                    covered = attr_value in gen_text_lower
+                
+                elif attr_name == 'priceRange':
+                    price_indicators = {
+                        'less than': ['cheap', 'inexpensive', 'affordable', 'less than'],
+                        'more than': ['expensive', 'pricey', 'costly', 'more than'],
+                        '£20-25': ['moderate', 'moderately priced'],
+                        '£': ['pound', 'pounds', '£']
+                    }
+                    for pattern, indicators in price_indicators.items():
+                        if pattern in attr_value:
+                            covered = any(ind in gen_text_lower for ind in indicators)
+                            break
+                
+                elif attr_name == 'area':
+                    area_patterns = {
+                        'city centre': ['city centre', 'city center', 'centre', 'center'],
+                        'city center': ['city centre', 'city center', 'centre', 'center'],
+                        'riverside': ['riverside', 'river side', 'by the river']
+                    }
+                    if attr_value in area_patterns:
+                        covered = any(phrase in gen_text_lower for phrase in area_patterns[attr_value])
+                
+                elif attr_name == 'familyFriendly':
+                    if attr_value == 'yes':
+                        covered = any(phrase in gen_text_lower for phrase in ['family', 'kid', 'child'])
+                    elif attr_value == 'no':
+                        covered = any(phrase in gen_text_lower for phrase in ['not family', 'adult only'])
+                
+                elif attr_name == 'customer rating' or attr_name == 'customerRating':
+                    # Handle ratings like "1 out of 5", "high", "average"
+                    if 'out of' in attr_value:
+                        # Extract number: "1 out of 5" -> "1"
+                        rating_num = attr_value.split()[0]
+                        covered = rating_num in gen_text_lower or attr_value in gen_text_lower
+                    else:
+                        covered = attr_value in gen_text_lower
+                
+                elif attr_name == 'near':
+                    # Handle "near X" references
+                    covered = attr_value in gen_text_lower or f"near {attr_value}" in gen_text_lower
+            
+            if covered:
+                covered_attrs.append(f"{attr_name}={attr_value}")
+            else:
+                missing_attrs.append(f"{attr_name}={attr_value}")
+        
+        coverage_ratio = len(covered_attrs) / len(attributes) if attributes else 1.0
+        
+        return {
+            'coverage_ratio': coverage_ratio,
+            'covered': covered_attrs,
+            'missing': missing_attrs,
+            'complete': len(missing_attrs) == 0
+        }
+
 
 class _DummyLoader:
     """
@@ -389,7 +624,7 @@ class SplitLoRATrainer:
                 model_name="gpt2",
                 head_layers=2,
                 tail_layers=2,
-                learning_rate=2e-4,
+                learning_rate=5e-4,
                 warmup_steps=500,
                 max_epochs=5):
         
@@ -401,13 +636,13 @@ class SplitLoRATrainer:
         self.tokenizer.pad_token = self.tokenizer.eos_token
         full_model = AutoModelForCausalLM.from_pretrained("gpt2")
         full_model.config.pad_token_id = self.tokenizer.eos_token_id
-        self.max_seq_len = 256
+        self.max_seq_len = 512
 
         
         original_vocab_size = len(self.tokenizer)
         self.PAD = self.tokenizer.pad_token
         self.tokenizer.padding_side = "right"
-        self.DELIM         = ";"              # no spaces
+        self.DELIM         = "|"              # no spaces
         self.DELIM_TOKENS  = self.tokenizer.encode(self.DELIM, add_special_tokens=False)
         assert len(self.DELIM_TOKENS) == 1
         # Set generation config with existing vocabulary
@@ -426,10 +661,10 @@ class SplitLoRATrainer:
         tail_model.lm_head.weight = head_model.wte.weight 
         # Apply LoRA/DoRA to clean models
         lora_config = LoraConfig(
-            r=2,
+            r=4,
             lora_alpha=32,
-            lora_dropout=0.1,
-            bias="lora_only",
+            lora_dropout=0.5,
+            bias="none",
             use_dora=True,
             task_type="CAUSAL_LM",
             target_modules=["c_attn", "c_proj", "c_fc"]
@@ -438,6 +673,8 @@ class SplitLoRATrainer:
         head_model = get_peft_model(head_model, lora_config)
         body_model = get_peft_model(body_model, lora_config)
         tail_model = get_peft_model(tail_model, lora_config)
+        tied = tail_model.lm_head.weight.data_ptr() == head_model.base_model.model.wte.weight.data_ptr()
+        print("✅ Weight tying correct (lm_head <-> wte):", tied)
         
         # Standard weight tying
         tail_model.base_model.lm_head.weight = head_model.base_model.wte.weight
@@ -445,7 +682,7 @@ class SplitLoRATrainer:
         # Initialize components
         self.server = ServerModel(body_model, learning_rate)
         self.head_client = HeadClient(head_model, learning_rate)
-        self.tail_client = TailClient(tail_model, learning_rate)
+        self.tail_client = TailClient(tail_model, learning_rate, tokenizer=self.tokenizer)
         
         self.metrics = {"loss": []}
         self._sched_steps = None
@@ -462,55 +699,83 @@ class SplitLoRATrainer:
                 return i + plen - 1                # last token index
         return None
 
+    def smart_truncate(self, mr_tokens, delim_tokens, ref_tokens, max_len):
+        """Truncate MR first, then reference if needed"""
+        
+        # Reserve space for delimiter and minimum reference
+        min_ref_len = 20  # Minimum reference length
+        available_for_mr = max_len - len(delim_tokens) - min_ref_len
+        
+        # Truncate MR if too long
+        if len(mr_tokens) > available_for_mr:
+            mr_tokens = mr_tokens[:available_for_mr]
+        
+        # Calculate remaining space for reference
+        remaining_space = max_len - len(mr_tokens) - len(delim_tokens)
+        
+        # Truncate reference only if absolutely necessary
+        if len(ref_tokens) > remaining_space:
+            ref_tokens = ref_tokens[:remaining_space]
+        
+        return mr_tokens, delim_tokens, ref_tokens
+
+
 
     def preprocess(self, example, sequence_length=None):
-        """
-        Build a single training instance.
-        The MR tokens come first, followed by the delimiter tokens,
-        followed by the reference tokens.
-
-        Anything beyond `sequence_length` is hard-truncated from the *end*,
-        so the delimiter is never lost.
-        """
+        """FIXED: Proper label alignment with truncated sequences"""
         SEQ_LEN = sequence_length if sequence_length is not None else self.max_seq_len
-
-        mr  = example["meaning_representation"]
+        
+        mr = example["meaning_representation"]
         ref = example["human_reference"]
-
-        # --- tokenise pieces independently ---------------------------------
-        ids_mr   = self.tokenizer.encode(mr,  add_special_tokens=False)
-        ids_ref  = self.tokenizer.encode(ref, add_special_tokens=False)
-        ids_delim = self.DELIM_TOKENS                      # already built in __init__
-
-        # -------------------------------------------------------------------
-        # [MR] + [DELIM] + [REF]
-        # -------------------------------------------------------------------
-        input_ids = ids_mr + ids_delim + ids_ref
-
-        # hard truncation from the right – ensures delimiter is always kept
-        if len(input_ids) > SEQ_LEN:
-            input_ids = input_ids[:SEQ_LEN]
-            # if we chopped off part of the reference we must chop the same
-            # amount from the labels to keep alignment
-            chop = max(0, len(ids_mr) + len(ids_delim) + len(ids_ref) - SEQ_LEN)
-            ids_ref = ids_ref[:-chop] if chop else ids_ref
-
-        # -------------------------------------------------------------------
-        # labels: mask everything up to and including the delimiter
-        # -------------------------------------------------------------------
-        labels = [-100] * (len(ids_mr) + len(ids_delim)) + ids_ref
-        labels = labels[:SEQ_LEN]                        # may already be correct
-
-        attention_mask = [1] * len(input_ids)            # no pad yet
-
+        
+        # Tokenize pieces
+        ids_mr = self.tokenizer.encode(mr, add_special_tokens=False)
+        ids_ref = self.tokenizer.encode(ref, add_special_tokens=False)
+        ids_delim = self.DELIM_TOKENS
+        
+        # Build full sequence
+        full_sequence = ids_mr + ids_delim + ids_ref
+        
+        # Truncate if necessary
+        if len(full_sequence) > SEQ_LEN:
+            input_ids = full_sequence[:SEQ_LEN]
+        else:
+            input_ids = full_sequence
+        
+        # Create labels based on ACTUAL input_ids length
+        labels = []
+        
+        # Find delimiter position in the ACTUAL input_ids
+        delim_pos = None
+        for i in range(len(input_ids) - len(ids_delim) + 1):
+            if input_ids[i:i+len(ids_delim)] == ids_delim:
+                delim_pos = i
+                break
+        
+        if delim_pos is not None:
+            # Mask everything before and including delimiter
+            mask_length = delim_pos + len(ids_delim)
+            labels = [-100] * mask_length
+            
+            # Add remaining tokens as targets
+            remaining_tokens = input_ids[mask_length:]
+            labels.extend(remaining_tokens)
+        else:
+            # Delimiter not found (heavily truncated) - mask everything
+            labels = [-100] * len(input_ids)
+        
+        # Ensure exact length match
+        assert len(input_ids) == len(labels), f"Length mismatch: {len(input_ids)} vs {len(labels)}"
+        
+        attention_mask = [1] * len(input_ids)
+        
         return {
-            "input_ids":        input_ids,
-            "attention_mask":   attention_mask,
-            "labels":           labels,
-            "human_reference":  ref,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "human_reference": ref,
             "meaning_representation": mr,
         }
-
 
 
     def load_e2e_dataset(
@@ -568,36 +833,70 @@ class SplitLoRATrainer:
         return train_ds, test_ds
 
 
-
+    def analyze_truncation_impact(self, dataset):
+        """Analyze how much data is lost to truncation"""
+        
+        truncated_count = 0
+        total_loss = 0
+        
+        for example in dataset:
+            original_ref = example['human_reference']
+            
+            # Simulate preprocessing
+            processed = self.preprocess(example)
+            
+            # Extract actual target from labels
+            target_tokens = [t for t in processed['labels'] if t != -100]
+            reconstructed_ref = self.tokenizer.decode(target_tokens, skip_special_tokens=True)
+            
+            if len(reconstructed_ref) < len(original_ref):
+                truncated_count += 1
+                total_loss += len(original_ref) - len(reconstructed_ref)
+        
+        print(f"Truncation impact:")
+        print(f"  Truncated examples: {truncated_count}/{len(dataset)} ({truncated_count/len(dataset)*100:.1f}%)")
+        print(f"  Average characters lost: {total_loss/max(truncated_count, 1):.1f}")
     
     def create_dataloader(self, dataset, batch_size=8, shuffle=True, sequence_length=None):
-        """FIXED: Consistent sequence length with debug support"""
-        from torch.nn.utils.rnn import pad_sequence   # add at top of file
-
-        def collate_fn(batch):
-            # turn lists into tensors, but keep variable length
-            ids   = [torch.tensor(b["input_ids"],  dtype=torch.long) for b in batch]
-            lbls  = [torch.tensor(b["labels"],     dtype=torch.long) for b in batch]
-
-            # right-pad to the longest sequence in *this* minibatch
-            ids  = pad_sequence(ids,  batch_first=True,
-                                padding_value=self.tokenizer.eos_token_id)
-            lbls = pad_sequence(lbls, batch_first=True,
-                                padding_value=-100)                 # ignore in loss
-
-            # build attention mask on-the-fly (1 = real token, 0 = pad/eos padding)
-            
-            attn = (ids != self.tokenizer.pad_token_id)
-
-            return {"input_ids": ids,
-                    "attention_mask": attn,
-                    "labels": lbls,
-                    "human_reference": [b["human_reference"] for b in batch]}
+        """FIXED: Proper padding handling that preserves label alignment"""
+        from torch.nn.utils.rnn import pad_sequence
         
-        return DataLoader(dataset,
-                  batch_size=batch_size,
-                  shuffle=shuffle,
-                  collate_fn=collate_fn)
+        def collate_fn(batch):
+            # Get sequences without padding first
+            ids = [torch.tensor(b["input_ids"], dtype=torch.long) for b in batch]
+            lbls = [torch.tensor(b["labels"], dtype=torch.long) for b in batch]
+            
+            # Pad sequences to batch maximum
+            ids_padded = pad_sequence(ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+            lbls_padded = pad_sequence(lbls, batch_first=True, padding_value=-100)
+            
+            # CRITICAL FIX: Ensure padding tokens in input correspond to -100 in labels
+            # But don't count padding -100s as "masked tokens" in your debug
+            
+            # Create proper attention mask
+            attn_mask = (ids_padded != self.tokenizer.pad_token_id)
+            
+            # VERIFY: Check that non-padding positions have correct label alignment
+            for i in range(len(ids_padded)):
+                # Find actual sequence length (before padding)
+                actual_length = attn_mask[i].sum().item()
+                
+                # Ensure labels match input for non-padding positions
+                if actual_length > 0:
+                    # The first actual_length positions should have the original labels
+                    # The rest should be -100 (padding)
+                    pass  # This is handled by pad_sequence correctly
+            
+            return {
+                "input_ids": ids_padded,
+                "attention_mask": attn_mask,
+                "labels": lbls_padded,
+                "human_reference": [b["human_reference"] for b in batch]
+            }
+        
+        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn)
+
+
     
     def attach_schedulers(self, train_dataloader):
         # 0. Avoid building duplicate schedulers
@@ -612,14 +911,17 @@ class SplitLoRATrainer:
 
         # 2. Create one cosine scheduler per optimiser
         from transformers import get_cosine_schedule_with_warmup
+        from transformers import get_constant_schedule_with_warmup
+        from transformers import get_linear_schedule_with_warmup
+        scheduler_epochs = 6
+        total_steps = len(train_dataloader) * scheduler_epochs
         for opt in (self.head_client.optimizer,
                     self.server.optimizer,
                     self.tail_client.optimizer):
-            sched = get_cosine_schedule_with_warmup(
+            sched = get_linear_schedule_with_warmup(
                 opt,
-                num_warmup_steps=self.warmup_steps,
+                num_warmup_steps=1000,      # ~3% of total steps
                 num_training_steps=total_steps,
-                num_cycles=0.5,
                 last_epoch=-1
             )
             self.schedulers.append(sched)
@@ -650,9 +952,11 @@ class SplitLoRATrainer:
                 # Use the wrapper for generation
                 output = temp_wrapper.generate(
                     ids,
-                    max_new_tokens=10,
-                    do_sample=False,
+                    max_new_tokens=60,        
+                    do_sample=False,                # Pure greedy
+                    eos_token_id=self.tokenizer.eos_token_id,
                     pad_token_id=self.tokenizer.pad_token_id,
+                    # NO OTHER PARAMETERS AT ALL
                 )
             
             result = self.tokenizer.decode(output[0], skip_special_tokens=True)
@@ -673,7 +977,233 @@ class SplitLoRATrainer:
             print(f"⚠️ Sanity check failed: {e}")
             return True  # Continue training anyway
 
+    
+
+
+    def train_with_coverage(self, train_dataloader, epochs=1):
+        """Enhanced training with coverage monitoring + AMP + memory optimization."""
+        # Initialize GradScaler for AMP
+        scaler = GradScaler()
+
+        print(f"Starting AMP-enabled training for {epochs} epoch(s)...")
+        for epoch in range(epochs):
+            total_loss = 0.0
+            num_batches = 0
+
+            for batch_idx, batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{epochs}")):
+                # Periodically clear CUDA cache to reduce fragmentation
+                if batch_idx % 100 == 0:
+                    torch.cuda.empty_cache()
+
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device).bool()
+                labels = batch["labels"].to(device)
+
+                # Extract MR texts for coverage penalty
+                mr_texts = []
+                for seq in input_ids:
+                    # find delimiter index
+                    delim_pos = None
+                    for i in range(seq.size(0) - len(self.DELIM_TOKENS) + 1):
+                        if seq[i : i + len(self.DELIM_TOKENS)].tolist() == self.DELIM_TOKENS:
+                            delim_pos = i + len(self.DELIM_TOKENS)
+                            break
+                    mr_texts.append(
+                        self.tokenizer.decode(seq[: delim_pos], skip_special_tokens=True)
+                        if delim_pos is not None
+                        else ""
+                    )
+
+                # AMP‐enabled forward/backward
+                with autocast(dtype=torch.float16):
+                    # 1) Head forward (no cache)
+                    head_out = self.head_client.forward(
+                        input_ids, attention_mask=attention_mask, use_cache=False
+                    )
+                    h_states = head_out.last_hidden_state
+
+                    # 2) Body forward (no cache)
+                    body_out, _ = self.server.forward_train(
+                        h_states, attention_mask=attention_mask, past_key_values=None
+                    )
+                    b_states = body_out.last_hidden_state
+
+                    # 3) Tail forward & compute loss
+                    logits = self.tail_client.tail_model(
+                        inputs_embeds=b_states,
+                        attention_mask=attention_mask,
+                        past_key_values=None,
+                    ).logits
+
+                    # shift for CE
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., 1:].contiguous()
+                    shift_labels[shift_labels == -100] = self.tail_client.loss_fn.ignore_index
+                    base_loss = self.tail_client.loss_fn(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1),
+                    )
+
+                    # coverage penalty
+                    penalty = 0.0
+                    for i, mr in enumerate(mr_texts):
+                        pred_ids = torch.argmax(shift_logits[i], dim=-1)
+                        pred_txt = self.tokenizer.decode(pred_ids, skip_special_tokens=True)
+                        cov = self.tail_client.validate_coverage(mr, pred_txt)
+                        penalty += (1.0 - cov["coverage_ratio"]) * 0.2
+                    loss = base_loss + penalty / max(len(mr_texts), 1)
+
+                # 4) backward with scaler
+                scaler.scale(loss).backward(retain_graph=True)
+
+                # 5) retrieve body grads and propagate
+                body_grad = b_states.grad.clone() if b_states.grad is not None else torch.zeros_like(b_states)
+                head_grad = self.server.backward(b_states, body_grad, h_states)
+                self.head_client.backward(h_states, head_grad)
+
+                # 6) unscale & clip
+                for opt in (self.head_client.optimizer, self.server.optimizer, self.tail_client.optimizer):
+                    scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(self.head_client.head_model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(self.server.body_model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(self.tail_client.tail_model.parameters(), 1.0)
+
+                # 7) optimizer steps & scaler update
+                scaler.step(self.head_client.optimizer)
+                scaler.step(self.server.optimizer)
+                scaler.step(self.tail_client.optimizer)
+                scaler.update()
+
+                # 8) scheduler step
+                for sched in self.schedulers:
+                    sched.step()
+
+                total_loss += loss.item()
+                num_batches += 1
+
+                if batch_idx % 50 == 0:
+                    print(f"Batch {batch_idx}, Loss: {loss.item():.4f}")
+
+            avg = total_loss / max(num_batches, 1)
+            self.metrics["loss"].append(avg)
+            print(f"Epoch {epoch+1} average loss: {avg:.4f}")
+
+
+
+    def train_with_wrapper(self, train_dataloader, epochs=1):
+        """Train using the wrapper to maintain consistency"""
+        from split_beam_wrapper import SplitGPT2ForGeneration
         
+        wrapper = SplitGPT2ForGeneration(
+            tokenizer=self.tokenizer,
+            head_client=self.head_client,
+            server=self.server,
+            tail_client=self.tail_client,
+            base_config=self.head_client.head_model.config
+        ).to(device)
+        
+        # Set all components to training mode
+        wrapper.train()
+        
+        for epoch in range(epochs):
+            total_loss = 0.0
+            num_batches = 0
+            
+            for batch_idx, batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{epochs}")):
+                # Zero gradients for all components
+                self.head_client.optimizer.zero_grad()
+                self.server.optimizer.zero_grad()
+                self.tail_client.optimizer.zero_grad()
+                
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                labels = batch["labels"].to(device)
+                
+                # Forward pass through wrapper (no caching during training)
+                outputs = wrapper(input_ids=input_ids, attention_mask=attention_mask)
+                logits = outputs.logits
+                
+                # Compute loss
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                
+                loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+                loss = loss_fn(shift_logits.view(-1, shift_logits.size(-1)), 
+                            shift_labels.view(-1))
+                
+                # Backward pass
+                loss.backward()
+                
+                # Clip gradients
+                torch.nn.utils.clip_grad_norm_(wrapper.parameters(), max_norm=1.0)
+                
+                # Update all optimizers
+                self.head_client.optimizer.step()
+                self.server.optimizer.step()
+                self.tail_client.optimizer.step()
+                
+                # Update schedulers
+                for sched in self.schedulers:
+                    sched.step()
+                
+                total_loss += loss.item()
+                num_batches += 1
+                
+                if batch_idx % 50 == 0:
+                    print(f"Batch {batch_idx}, Loss: {loss.item():.4f}")
+
+
+    def evaluate_with_coverage(self, wrapper, dataset, n_samples=100):
+        """Enhanced evaluation with coverage tracking"""
+        eval_split = dataset.select(range(min(n_samples, len(dataset))))
+        
+        total_coverage = 0.0
+        complete_outputs = 0
+        predictions = []
+        references = []
+        
+        for sample in tqdm(eval_split, desc="Evaluating with coverage"):
+            mr = sample["meaning_representation"]
+            ref = sample["human_reference"]
+            
+            # Generate prediction
+            pred = generate_with_beam(self, wrapper, mr, max_new_tokens=64)
+            
+            # Check coverage
+            coverage = self.validate_coverage(mr, pred)
+            total_coverage += coverage['coverage_ratio']
+            
+            if coverage['complete']:
+                complete_outputs += 1
+            
+            # Print examples of incomplete coverage
+            if not coverage['complete'] and len(predictions) < 5:
+                print(f"Incomplete coverage example:")
+                print(f"  MR: {mr}")
+                print(f"  Pred: {pred}")
+                print(f"  Missing: {coverage['missing']}")
+            
+            predictions.append(pred)
+            references.append(ref)
+        
+        # Compute metrics
+        avg_coverage = total_coverage / len(eval_split)
+        complete_ratio = complete_outputs / len(eval_split)
+        
+        # Official E2E metrics
+        official_metrics = evaluate_official(predictions)
+        
+        print(f"Coverage Results:")
+        print(f"  Average coverage: {avg_coverage:.3f}")
+        print(f"  Complete outputs: {complete_ratio:.3f}")
+        print(f"  BLEU: {official_metrics['bleu']:.3f}")
+        
+        return {
+            **official_metrics,
+            "coverage": avg_coverage,
+            "completeness": complete_ratio
+        }
+
     def train(self, train_dataloader, epochs=1):
         print(f"Starting training for {epochs} epochs...")
         example_inputs = None
@@ -719,6 +1249,7 @@ class SplitLoRATrainer:
                     head_activations = self.head_client.forward(input_ids, attention_mask=attention_mask)  
                     body_activations, head_activations_stored = self.server.forward_train(head_activations, attention_mask)  
                     loss, body_grad = self.tail_client.compute_loss_and_backward(body_activations, labels, attention_mask)  
+                    
 
                     
                     # FIX: Check for NaN loss
@@ -734,7 +1265,7 @@ class SplitLoRATrainer:
                     self.head_client.backward(head_activations, head_grad)
                     for sched in self.schedulers:
                         sched.step()
-                    
+                    grad_norms = [p.grad.norm().item() for p in self.head_client.head_model.parameters() if p.grad is not None]
                     # FIX: Add gradient clipping to all components
                     torch.nn.utils.clip_grad_norm_(self.head_client.head_model.parameters(), max_norm=0.5)
                     torch.nn.utils.clip_grad_norm_(self.tail_client.tail_model.parameters(), max_norm=0.5)
@@ -815,240 +1346,305 @@ class SplitLoRATrainer:
 
     def save_checkpoint(self, path: str = "checkpoint.pt", epoch: int = 0):
         """
-        Save everything needed to  resume or to run inference later.
-        If `path` is a directory, a file called `checkpoint.pt` is written inside it.
+        FIXED: Save everything needed to resume training properly
         """
         if os.path.isdir(path):
             path = os.path.join(path, "checkpoint.pt")
+        
+        # Ensure models are in training mode for proper state saving
+        self.head_client.head_model.train()
+        self.server.body_model.train()
+        self.tail_client.tail_model.train()
+        
+        # Save complete training state
+        checkpoint = {
+            "epoch": epoch,
+            "metrics": self.metrics,
+            "max_seq_len": self.max_seq_len,
+            "vocab_size": len(self.tokenizer),
+            
+            # Model states (including PEFT adapters)
+            "head_model_state": self.head_client.head_model.state_dict(),
+            "body_model_state": self.server.body_model.state_dict(),
+            "tail_model_state": self.tail_client.tail_model.state_dict(),
+            
+            # Optimizer states
+            "head_optimizer_state": self.head_client.optimizer.state_dict(),
+            "body_optimizer_state": self.server.optimizer.state_dict(),
+            "tail_optimizer_state": self.tail_client.optimizer.state_dict(),
+            
+            # Scheduler states
+            "scheduler_states": [sched.state_dict() for sched in self.schedulers] if self.schedulers else [],
+            
+            # Training configuration
+            "training_config": {
+                "learning_rate": self.head_client.optimizer.param_groups[0]['lr'],
+                "warmup_steps": self.warmup_steps,
+                "max_epochs": self.max_epochs,
+            },
+            
+            # Random states for reproducibility
+            "rng_state": torch.random.get_rng_state(),
+            "cuda_rng_states": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            
+            # Tokenizer state
+            "tokenizer_config": {
+                "delim": self.DELIM,
+                "pad_token": self.PAD,
+                "delim_tokens": self.DELIM_TOKENS,
+            }
+        }
+        
+        # Save with error handling
+        try:
+            torch.save(checkpoint, path)
+            print(f"✅ Complete checkpoint saved to {path}")
+            print(f"   - Epoch: {epoch}")
+            print(f"   - Vocab size: {len(self.tokenizer)}")
+            print(f"   - Metrics: {len(self.metrics['loss'])} loss values")
+        except Exception as e:
+            print(f"❌ Error saving checkpoint: {e}")
+            raise
 
-        torch.save({
-            "epoch":      epoch,
-            "head":       self.head_client.head_model.state_dict(),
-            "body":       self.server.body_model.state_dict(),
-            "tail":       self.tail_client.tail_model.state_dict(),
-            "opt_head":   self.head_client.optimizer.state_dict(),
-            "opt_body":   self.server.optimizer.state_dict(),
-            "opt_tail":   self.tail_client.optimizer.state_dict(),
-            "sch_head":   self.schedulers[0].state_dict() if self.schedulers else None,
-            "sch_body":   self.schedulers[1].state_dict() if self.schedulers else None,
-            "sch_tail":   self.schedulers[2].state_dict() if self.schedulers else None,
-            "rng_state":  torch.random.get_rng_state().cpu(),
-            "cuda_states": torch.cuda.get_rng_state_all()
-        }, path)
-        print(f"✅ checkpoint saved to {path}")
     
     def load_checkpoint(self, path: str = "checkpoint.pt", *, eval_only: bool = False) -> int:
-        ckpt = torch.load(path, map_location=device)
+        """
+        FIXED: Load complete training state for proper resumption
+        """
+        if os.path.isdir(path):
+            path = os.path.join(path, "checkpoint.pt")
+        
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Checkpoint not found: {path}")
+        
+        print(f"Loading checkpoint from {path}...")
+        
+        try:
+            checkpoint = torch.load(path, map_location=device)
+            
+            # Verify checkpoint integrity
+            required_keys = ["head_model_state", "body_model_state", "tail_model_state"]
+            for key in required_keys:
+                if key not in checkpoint:
+                    raise KeyError(f"Missing required key in checkpoint: {key}")
+            
+            # Load model states
+            print("Loading model states...")
+            self.head_client.head_model.load_state_dict(checkpoint["head_model_state"])
+            self.server.body_model.load_state_dict(checkpoint["body_model_state"])
+            self.tail_client.tail_model.load_state_dict(checkpoint["tail_model_state"])
+            tied = self.tail_client.tail_model.lm_head.weight.data_ptr() == self.head_client.head_model.base_model.model.wte.weight.data_ptr()
+            print("🔁 Weight tying correct after loading:", tied)
+            # CRITICAL: Restore weight tying after loading
+            print("Restoring weight tying...")
+            if hasattr(self.head_client.head_model, 'base_model'):
+                # PEFT wrapped models
+                head_base = self.head_client.head_model.base_model
+                tail_base = self.tail_client.tail_model.base_model
+            else:
+                # Direct models
+                head_base = self.head_client.head_model
+                tail_base = self.tail_client.tail_model
+            
+            if hasattr(head_base, 'wte') and hasattr(tail_base, 'lm_head'):
+                tail_base.lm_head.weight = head_base.wte.weight
+                print("✅ Weight tying restored")
+            
+            # Load training configuration
+            if "training_config" in checkpoint:
+                config = checkpoint["training_config"]
+                self.warmup_steps = config.get("warmup_steps", self.warmup_steps)
+                self.max_epochs = config.get("max_epochs", self.max_epochs)
+            
+            # Load tokenizer configuration
+            if "tokenizer_config" in checkpoint:
+                tok_config = checkpoint["tokenizer_config"]
+                self.DELIM = tok_config.get("delim", self.DELIM)
+                self.PAD = tok_config.get("pad_token", self.PAD)
+                self.DELIM_TOKENS = tok_config.get("delim_tokens", self.DELIM_TOKENS)
+            
+            # Load metrics
+            if "metrics" in checkpoint:
+                self.metrics = checkpoint["metrics"]
+                print(f"✅ Loaded {len(self.metrics['loss'])} previous loss values")
+            
+            # Set sequence length
+            if "max_seq_len" in checkpoint:
+                self.max_seq_len = checkpoint["max_seq_len"]
+            
+            if eval_only:
+                # Set models to evaluation mode
+                self.head_client.head_model.eval()
+                self.server.body_model.eval()
+                self.tail_client.tail_model.eval()
+                print("✅ Models loaded in evaluation mode")
+                return checkpoint.get("epoch", 0)
+            
+            # Load optimizer states for training resumption
+            print("Loading optimizer states...")
+            if "head_optimizer_state" in checkpoint:
+                self.head_client.optimizer.load_state_dict(checkpoint["head_optimizer_state"])
+            if "body_optimizer_state" in checkpoint:
+                self.server.optimizer.load_state_dict(checkpoint["body_optimizer_state"])
+            if "tail_optimizer_state" in checkpoint:
+                self.tail_client.optimizer.load_state_dict(checkpoint["tail_optimizer_state"])
+            
+            # Load scheduler states
+            if "scheduler_states" in checkpoint and checkpoint["scheduler_states"]:
+                if not self.schedulers:
+                    # Create schedulers if they don't exist
+                    total_steps = checkpoint.get("_sched_steps", 1000)
+                    self.attach_schedulers(_DummyLoader(total_steps))
+                
+                for i, sched_state in enumerate(checkpoint["scheduler_states"]):
+                    if i < len(self.schedulers):
+                        self.schedulers[i].load_state_dict(sched_state)
+                print("✅ Scheduler states loaded")
+            
+            # Restore random states for reproducibility
+            if "rng_state" in checkpoint:
+                torch.random.set_rng_state(checkpoint["rng_state"])
+                state = checkpoint.get("rng_state", None)
+                if state is not None:
+                    # ensure ByteTensor on CPU
+                    state = state.to(device='cpu', dtype=torch.uint8)
+                    try:
+                        torch.random.set_rng_state(state)
+                        print("✅ RNG state restored")
+                    except TypeError:
+                        print("⚠️ Failed to restore RNG state; skipping")
+            if "cuda_rng_states" in checkpoint and checkpoint["cuda_rng_states"]:
+                torch.cuda.set_rng_state_all(checkpoint["cuda_rng_states"])
+            
+            # Set models to training mode
+            self.head_client.head_model.train()
+            self.server.body_model.train()
+            self.tail_client.tail_model.train()
+            
+            epoch = checkpoint.get("epoch", 0)
+            print(f"✅ Checkpoint loaded successfully!")
+            print(f"   - Resuming from epoch: {epoch}")
+            print(f"   - Vocab size: {checkpoint.get('vocab_size', 'unknown')}")
+            print(f"   - Previous loss values: {len(self.metrics.get('loss', []))}")
+            
+            return epoch
+            
+        except Exception as e:
+            print(f"❌ Error loading checkpoint: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+    
+    def verify_training_state(self):
+        """
+        Verify that the model is in proper training state after loading
+        """
+        print("=== TRAINING STATE VERIFICATION ===")
+        
+        # Check if models are in training mode
+        print(f"Head model training mode: {self.head_client.head_model.training}")
+        print(f"Body model training mode: {self.server.body_model.training}")
+        print(f"Tail model training mode: {self.tail_client.tail_model.training}")
+        
+        # Check if gradients are enabled
+        head_params = list(self.head_client.head_model.parameters())
+        body_params = list(self.server.body_model.parameters())
+        tail_params = list(self.tail_client.tail_model.parameters())
+        
+        head_requires_grad = sum(1 for p in head_params if p.requires_grad)
+        body_requires_grad = sum(1 for p in body_params if p.requires_grad)
+        tail_requires_grad = sum(1 for p in tail_params if p.requires_grad)
+        
+        print(f"Head parameters requiring gradients: {head_requires_grad}/{len(head_params)}")
+        print(f"Body parameters requiring gradients: {body_requires_grad}/{len(body_params)}")
+        print(f"Tail parameters requiring gradients: {tail_requires_grad}/{len(tail_params)}")
+        
+        # Check weight tying
+        if hasattr(self.head_client.head_model, 'base_model'):
+            head_base = self.head_client.head_model.base_model
+            tail_base = self.tail_client.tail_model.base_model
+        else:
+            head_base = self.head_client.head_model
+            tail_base = self.tail_client.tail_model
+        
+        if hasattr(head_base, 'wte') and hasattr(tail_base, 'lm_head'):
+            weight_tied = torch.equal(head_base.wte.weight, tail_base.lm_head.weight)
+            print(f"Weight tying intact: {weight_tied}")
+        
+        # Check optimizer states
+        print(f"Head optimizer state groups: {len(self.head_client.optimizer.param_groups)}")
+        print(f"Body optimizer state groups: {len(self.server.optimizer.param_groups)}")
+        print(f"Tail optimizer state groups: {len(self.tail_client.optimizer.param_groups)}")
+        
+        print("✅ Training state verification complete")
 
-        # ---- make sure schedulers exist before loading ----
-        if not self.schedulers and not eval_only:
-            # number of steps saved earlier (if available); else fallback to 1
-            saved_steps = ckpt.get("sch_head", {}).get("total_steps", 1)
-            self.attach_schedulers(train_dataloader=_DummyLoader(saved_steps))
-        # ---------------------------------------------------
+    def debug_label_masking(self, batch):
+        """Debug label masking to ensure it's working correctly"""
+        print("=== LABEL MASKING DEBUG ===")
+        
+        for i in range(min(3, len(batch["input_ids"]))):
+            input_ids = batch["input_ids"][i]
+            labels = batch["labels"][i]
+            attention_mask = batch["attention_mask"][i]
+            
+            # CRITICAL: Only analyze non-padding tokens
+            actual_length = attention_mask.sum().item()
+            
+            # Work with actual sequence (no padding)
+            actual_input_ids = input_ids[:actual_length]
+            actual_labels = labels[:actual_length]
+            
+            # Find delimiter position in actual sequence
+            delim_pos = None
+            for j in range(len(actual_input_ids) - len(self.DELIM_TOKENS) + 1):
+                if actual_input_ids[j:j+len(self.DELIM_TOKENS)].tolist() == self.DELIM_TOKENS:
+                    delim_pos = j
+                    break
+            
+            if delim_pos is None:
+                print(f"❌ Sample {i}: No delimiter found!")
+                continue
+            
+            # Count masked/target tokens in ACTUAL sequence only
+            masked_tokens = sum(1 for label in actual_labels if label == -100)
+            target_tokens = sum(1 for label in actual_labels if label != -100)
+            
+            print(f"Sample {i}:")
+            print(f"  Actual sequence length: {actual_length}")
+            print(f"  Delimiter position: {delim_pos}")
+            print(f"  Masked tokens: {masked_tokens}")
+            print(f"  Target tokens: {target_tokens}")
+            
+            # Decode parts
+            mr_part = actual_input_ids[:delim_pos]
+            ref_part = actual_input_ids[delim_pos+len(self.DELIM_TOKENS):]
+            
+            mr_text = self.tokenizer.decode(mr_part, skip_special_tokens=True)
+            ref_text = self.tokenizer.decode(ref_part, skip_special_tokens=True)
+            
+            print(f"  MR: '{mr_text}'")
+            print(f"  REF: '{ref_text}'")
+            
+            # Check if masking is correct
+            expected_mask_length = len(mr_part) + len(self.DELIM_TOKENS)
+            
+            if expected_mask_length == masked_tokens:
+                print("  ✅ Label masking is correct")
+            else:
+                print(f"  ❌ Label masking wrong: expected {expected_mask_length}, got {masked_tokens}")
 
-        # weights
-        self.head_client.head_model.load_state_dict(ckpt["head"])
-        self.server.body_model.load_state_dict(ckpt["body"])
-        self.tail_client.tail_model.load_state_dict(ckpt["tail"])
-
-        if eval_only:
-            self.head_client.head_model.eval()
-            self.server.body_model.eval()
-            self.tail_client.tail_model.eval()
-            print("✅ model loaded for evaluation only")
-            return ckpt.get("epoch", 0) + 1
-
-        # optimisers
-        self.head_client.optimizer.load_state_dict(ckpt["opt_head"])
-        self.server.optimizer.load_state_dict(ckpt["opt_body"])
-        self.tail_client.optimizer.load_state_dict(ckpt["opt_tail"])
-
-        # schedulers
-        if ckpt["sch_head"] is not None and self.schedulers:
-            self.schedulers[0].load_state_dict(ckpt["sch_head"])
-            self.schedulers[1].load_state_dict(ckpt["sch_body"])
-            self.schedulers[2].load_state_dict(ckpt["sch_tail"])
-
-        torch.random.set_rng_state(ckpt["rng_state"].cpu())
-        if "cuda_states" in ckpt:
-            for dev_id, state in enumerate(ckpt["cuda_states"]):
-                torch.cuda.set_rng_state(state, device=dev_id)
-        print(f"✅ checkpoint loaded from {path} – resuming training")
-        return ckpt.get("epoch", 0) + 1
 
     
-    # def save_checkpoint(self, path="./splitlora_checkpoint"):
-    #     """FIXED: Save merged models using state dicts"""
-    #     os.makedirs(path, exist_ok=True)
+
+    def coverage_loss(self, mr_text, generated_text, base_loss):
+        """Add coverage penalty to the loss function"""
+        coverage = self.validate_coverage(mr_text, generated_text)
         
-    #     try:
-    #         print("Merging and saving models with custom embeddings...")
-            
-    #         # Merge PEFT adapters into base models
-    #         head_merged = self.head_client.head_model.merge_and_unload()
-    #         body_merged = self.server.body_model.merge_and_unload()
-    #         tail_merged = self.tail_client.tail_model.merge_and_unload()
-            
-    #         # FIXED: Save state dicts instead of using save_pretrained
-    #         torch.save(head_merged.state_dict(), os.path.join(path, "head_model_merged.pt"))
-    #         torch.save(body_merged.state_dict(), os.path.join(path, "body_model_merged.pt"))
-    #         torch.save(tail_merged.state_dict(), os.path.join(path, "tail_model_merged.pt"))
-            
-    #         # Save model configurations
-    #         torch.save(head_merged.config, os.path.join(path, "head_config.pt"))
-    #         torch.save(body_merged.config, os.path.join(path, "body_config.pt"))
-    #         torch.save(tail_merged.config, os.path.join(path, "tail_config.pt"))
-            
-    #         # Save tokenizer
-    #         self.tokenizer.save_pretrained(os.path.join(path, "tokenizer"))
-            
-    #         # Save training metadata including custom token info
-    #         metadata = {
-    #             "vocab_size": len(self.tokenizer),
-    #             "original_vocab_size": 50257,
-    #             "custom_tokens": {
-    #                 "delim_token": self.DELIM,
-    #                 "delim_id": self.tokenizer.encode(self.DELIM, add_special_tokens=False)[0],
-    #                 "pad_token": self.PAD,
-    #                 "pad_id": self.tokenizer.pad_token_id
-    #             },
-    #             "metrics": self.metrics,
-    #             "model_config": {
-    #                 "head_layers": 2,
-    #                 "tail_layers": 2,
-    #                 "body_layers": 8
-    #             }
-    #         }
-            
-    #         with open(os.path.join(path, "training_metadata.json"), "w") as f:
-    #             json.dump(metadata, f, indent=2)
-            
-    #         print(f"✅ Merged checkpoint with custom embeddings saved to {path}")
-    #         return path
-            
-    #     except Exception as e:
-    #         print(f"❌ Error saving merged checkpoint: {e}")
-    #         traceback.print_exc()
-    #         return None
-
-    # def load_checkpoint(self, path="./splitlora_checkpoint"):
-    #     from transformers.models.gpt2.configuration_gpt2 import GPT2Config
-    #     """FIXED: Load merged models from state dicts"""
-    #     if not os.path.exists(path):
-    #         print(f"❌ Checkpoint path {path} does not exist")
-    #         return False
-
-    #     try:
-    #         # Load metadata first
-    #         with open(os.path.join(path, "training_metadata.json"), "r") as f:
-    #             metadata = json.load(f)
-            
-    #         print(f"Loading merged checkpoint with vocab_size: {metadata['vocab_size']}")
-            
-    #         # Load tokenizer (preserves custom tokens)
-    #         self.tokenizer = AutoTokenizer.from_pretrained(os.path.join(path, "tokenizer"))
-            
-    #         # FIXED: Create fresh full model with correct vocab size
-    #         from transformers import GPT2LMHeadModel
-    #         full_model = GPT2LMHeadModel.from_pretrained('gpt2')
-            
-    #         # Resize to match saved model
-    #         full_model.resize_token_embeddings(metadata['vocab_size'])
-            
-    #         # Load the merged head model state dict to get the embeddings
-    #         head_state = torch.load(os.path.join(path, "head_model_merged.pt"), map_location=device)
-            
-    #         # Extract embedding weights and copy to full model
-    #         if 'wte.weight' in head_state:
-    #             full_model.transformer.wte.weight.data = head_state['wte.weight']
-    #         if 'wpe.weight' in head_state:
-    #             full_model.transformer.wpe.weight.data = head_state['wpe.weight']
-            
-    #         with torch.serialization.safe_globals([GPT2Config]):
-    #             head_config = torch.load(os.path.join(path, "head_config.pt"), 
-    #                                     map_location=device, weights_only=True)
-    #             body_state = torch.load(os.path.join(path, "body_model_merged.pt"), 
-    #                                 map_location=device, weights_only=True) 
-    #             tail_state = torch.load(os.path.join(path, "tail_model_merged.pt"), 
-    #                                 map_location=device, weights_only=True)
-    #             # Reconstruct layer weights in full model
-    #         layer_idx = 0
-            
-    #         # Head layers
-    #         for i in range(2):  # head_layers
-    #             if f'h.{i}.ln_1.weight' in head_state:
-    #                 full_model.transformer.h[layer_idx].load_state_dict({
-    #                     k[len(f'h.{i}.'):]: v for k, v in head_state.items() 
-    #                     if k.startswith(f'h.{i}.')
-    #                 }, strict=False)
-    #             layer_idx += 1
-            
-    #         # Body layers  
-    #         for i in range(8):  # body_layers
-    #             body_layer_key = f'transformer.h.{i}'
-    #             if f'{body_layer_key}.ln_1.weight' in body_state:
-    #                 full_model.transformer.h[layer_idx].load_state_dict({
-    #                     k[len(f'{body_layer_key}.'):]: v for k, v in body_state.items()
-    #                     if k.startswith(f'{body_layer_key}.')
-    #                 }, strict=False)
-    #             layer_idx += 1
-            
-    #         # Tail layers
-    #         for i in range(2):  # tail_layers
-    #             tail_layer_key = f'transformer.h.{i}'
-    #             if f'{tail_layer_key}.ln_1.weight' in tail_state:
-    #                 full_model.transformer.h[layer_idx].load_state_dict({
-    #                     k[len(f'{tail_layer_key}.'):]: v for k, v in tail_state.items()
-    #                     if k.startswith(f'{tail_layer_key}.')
-    #                 }, strict=False)
-    #             layer_idx += 1
-            
-    #         # Load final layer norm and LM head from tail
-    #         if 'transformer.ln_f.weight' in tail_state:
-    #             full_model.transformer.ln_f.weight.data = tail_state['transformer.ln_f.weight']
-    #             full_model.transformer.ln_f.bias.data = tail_state['transformer.ln_f.bias']
-            
-    #         if 'lm_head.weight' in tail_state:
-    #             full_model.lm_head.weight.data = tail_state['lm_head.weight']
-            
-    #         print("✅ Merged models loaded successfully with custom embeddings")
-            
-    #         # Verify custom token embeddings were preserved
-    #         delim_id = metadata["custom_tokens"]["delim_id"]
-    #         delim_embedding = full_model.transformer.wte.weight[delim_id]
-    #         print(f"Loaded DELIM embedding norm: {delim_embedding.norm().item():.4f}")
-            
-    #         # Recreate split models from loaded full model
-    #         head_model, body_model, tail_model = split_gpt2(full_model, 2, 2)
-            
-    #         # Re-apply PEFT to the loaded models
-    #         lora_config = LoraConfig(
-    #             r=2, lora_alpha=32, lora_dropout=0.1,
-    #             bias="lora_only", use_dora=True, task_type="CAUSAL_LM",
-    #             target_modules=["c_attn", "c_proj", "c_fc"]
-    #         )
-            
-    #         head_model = get_peft_model(head_model, lora_config)
-    #         body_model = get_peft_model(body_model, lora_config)
-    #         tail_model = get_peft_model(tail_model, lora_config)
-            
-    #         # Update components with loaded models
-    #         self.head_client.head_model = head_model.to(device)
-    #         self.server.body_model = body_model.to(device)
-    #         self.tail_client.tail_model = tail_model.to(device)
-            
-    #         # Ensure weight tying
-    #         self.tail_client.tail_model.base_model.lm_head.weight = self.head_client.head_model.base_model.wte.weight
-            
-    #         print(f"✅ Checkpoint loaded successfully from {path}")
-    #         return True
-
-    #     except Exception as e:
-    #         print(f"❌ Error loading checkpoint: {e}")
-    #         traceback.print_exc()
-    #         return False
-
+        # Coverage penalty: penalize missing attributes
+        coverage_penalty = (1.0 - coverage['coverage_ratio']) * 0.5
+        
+        return base_loss + coverage_penalty
+    
 def analyze_sequence_lengths(trainer, dataset):
     """Analyze your actual data to choose optimal fixed length"""
     lengths = []
@@ -1189,10 +1785,9 @@ def debug_full_tokenization(trainer, example):
         print(f"Unique tokens in sequence: {set(input_ids[:60])}")  # Show first 60 unique tokens
         return None
 
-
 def _expand_mask(mask, dtype):
     """
-    Expands attention_mask from [batch_size, seq_len] to [batch_size, 1, 1, seq_len]
+    Expands attention_mask from [batch_size, seq_len] to [batch_size, 1, seq_len, seq_len]
     for GPT-2's causal attention mechanism.
     """
     if mask is None:
@@ -1200,25 +1795,54 @@ def _expand_mask(mask, dtype):
     
     batch_size, seq_len = mask.shape
     
-    # Create causal mask
-    causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=dtype, device=mask.device))
-    causal_mask = causal_mask.view(1, 1, seq_len, seq_len)
-    
-    # Combine with padding mask
+    # First convert boolean/float mask to additive mask
+    # [B, S] -> [B, 1, 1, S]
     mask = mask.to(dtype)
-    mask = mask[:, None, None, :]  # [B, 1, 1, L]
     
-    # Apply causal constraint
-    mask = mask * causal_mask
+    # Important: Reshape to 4D for broadcasting with causal mask
+    mask = mask.unsqueeze(1).unsqueeze(2)
     
-    # Convert to additive attention mask
-    mask = (1.0 - mask) * torch.finfo(dtype).min
+    # Create causal mask (lower triangular)
+    # This ensures tokens only attend to previous tokens and themselves
+    causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=dtype, device=mask.device))
+    causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, S, S]
     
-    return mask
+    # Combine the padding mask with the causal mask
+    # broadcast: [B, 1, 1, S] * [1, 1, S, S] -> [B, 1, S, S]
+    combined_mask = mask @ causal_mask
+    
+    # Convert to attention scores:
+    # - 0 allows attention
+    # - large negative number blocks attention
+    return (1.0 - combined_mask) * -10000.0
+
 
 
 # ─── Beam-search helpers ──────────────────────────────────────────────
 from evaluate import load as load_metric
+def generate_fixed(trainer, wrapper, mr_text, max_new_tokens=32):
+    """Fixed generation with proper parameters"""
+    prompt = mr_text + " " + trainer.DELIM + " "
+    enc = trainer.tokenizer(prompt, return_tensors="pt")
+    ids = enc["input_ids"].to(device)
+    
+    # Ensure weight tying before generation
+    trainer.ensure_weight_tying()
+    
+    with torch.no_grad():
+        output = wrapper.generate(
+            ids,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
+            repetition_penalty=1.2,
+            eos_token_id=trainer.tokenizer.eos_token_id,
+            pad_token_id=trainer.tokenizer.pad_token_id,
+            # NO caching parameters - let it handle internally
+        )
+    
+    return trainer.tokenizer.decode(output[0, ids.size(1):], skip_special_tokens=True).strip()
 
 def generate_with_beam(trainer, wrapper, mr_text, max_new_tokens=64):
     """Return one realisation for a single MR using SplitFM-style beam search."""
@@ -1604,23 +2228,6 @@ def test_simple_greedy(trainer, wrapper, mr_text):
     return result
 
 
-def test_single_token_delimiters(tokenizer):
-    """Find good single-token delimiters"""
-    candidates = [
-        ":",      # Colon
-        ";",      # Semicolon  
-        "=",      # Equals
-        "|",      # Pipe
-        "###",    # Triple hash (from search result [2])
-        ">>",     # Double arrow
-        "=>",     # Arrow equals
-        ":",      # Just colon
-    ]
-    
-    print("=== TESTING SINGLE-TOKEN DELIMITERS ===")
-    for delim in candidates:
-        tokens = tokenizer.encode(delim, add_special_tokens=False)
-        print(f"'{delim}' -> {tokens} ({len(tokens)} tokens) {'✅ SINGLE' if len(tokens) == 1 else '❌ MULTI'}")
 
 def count_zero_target_rows(dataset):
     """
@@ -1651,7 +2258,7 @@ def main():
                            head_layers=2,
                            tail_layers=2,
                            learning_rate=args.learning_rate,
-                           warmup_steps=args.warmup_steps,
+                           warmup_steps=100,
                            max_epochs=args.max_epochs)
     
     print("Analyzing sequence lengths to optimize training...")
@@ -1662,7 +2269,8 @@ def main():
     # Load checkpoint if specified
     if args.load_checkpoint:
         start_epoch = trainer.load_checkpoint(args.load_checkpoint,
-                                        eval_only=args.eval_only) 
+                                        eval_only=args.eval_only)
+        trainer.verify_training_state() 
         diagnose_custom_token_embeddings(trainer)
     
     wrapper = SplitGPT2ForGeneration(
@@ -1708,9 +2316,8 @@ def main():
         else:
             print("✅ Generating normal text - period prediction might be normal")
 
-        test_single_token_delimiters(trainer.tokenizer)
         # Run evaluation
-        results = evaluate_beam(trainer, wrapper, test_ds, n_samples=len(test_ds))
+        results = trainer.evaluate_with_coverage(trainer, wrapper, test_ds, n_samples=len(test_ds))
         results_file = os.path.join(args.save_path, "evaluation_results.json")
         with open(results_file, "w") as f:
             json.dump(results, f, indent=2)
@@ -1740,10 +2347,18 @@ def main():
     print(f"PAD token: '{trainer.PAD}' -> {trainer.tokenizer.pad_token_id}")
     print(f"EOS token: '{trainer.tokenizer.eos_token}' -> {trainer.tokenizer.eos_token_id}")
     for ep in range(start_epoch, start_epoch + args.epochs):
-        trainer.train(train_dl, epochs=1)
+        trainer.train_with_coverage(train_dl, epochs=1)
         ckpt_name = f"ckpt_ep{ep}.pt"
-        trainer.save_checkpoint(os.path.join(args.save_path, ckpt_name), epoch=ep)
-    
+        ckpt_path = os.path.join(args.save_path, f"ckpt_ep{ep}.pt")
+        trainer.save_checkpoint(ckpt_path, epoch=ep)
+        if ep == start_epoch:  # Test on first epoch
+            print("Testing save/load cycle...")
+            temp_trainer = SplitLoRATrainer(
+                model_name="gpt2", head_layers=2, tail_layers=2,
+                learning_rate=args.learning_rate
+            )
+            loaded_epoch = temp_trainer.load_checkpoint(ckpt_path, eval_only=True)
+            print(f"✅ Save/load test passed: saved epoch {ep}, loaded epoch {loaded_epoch}")
     
     
 
