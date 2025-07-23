@@ -102,15 +102,7 @@ class E2EJsonDataset(Dataset):
         
         attention_mask = [1] * len(input_ids)
         
-               # === DEBUG: show exactly which tokens are being trained on ===
-        non_masked = [i for i, l in enumerate(labels) if l != -100]
-        print(f"delimiter at {delim_pos}, mask_length = {mask_length}")
-        print("label positions (first 10):", non_masked[:10])
-        for i in non_masked[:10]:
-            tok = input_ids[i]
-            print(f"  idx={i:2d} token={tok:5d} → '{self.tokenizer.decode([tok])}'")
-
-        attention_mask = [1] * len(input_ids)
+        
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -450,9 +442,9 @@ def apply_dora_peft(model):
     head_peft_config = LoraConfig(
         task_type=None,  # Use None to avoid inputs_embeds issues
         inference_mode=False,
-        r=8,
+        r=4,
         lora_alpha=32,
-        lora_dropout=0.5,
+        lora_dropout=0.8,
         target_modules=["c_attn", "c_proj", "c_fc"],
         use_dora=True
     )
@@ -550,7 +542,9 @@ def generate_sanity_check(model, tokenizer, device):
                 input_ids=inputs['input_ids'],
                 attention_mask=inputs['attention_mask'],
                 max_new_tokens=30,       
-                do_sample=False,
+                do_sample=True,
+                top_p=0.9,
+                repetition_penalty=1.1,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id
             )
