@@ -102,7 +102,7 @@ class SplitGPT2_UShape(nn.Module):
         return full.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            max_new_tokens=60
+            max_new_tokens=60,
             do_sample=True,
             top_k=50,           # Increased from 30
             top_p=0.92,         # Increased from 0.85
