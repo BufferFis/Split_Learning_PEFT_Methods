@@ -68,8 +68,18 @@ def preprocess_fn(ex):
         mr_len = len(mr_ids)
         labels = [-100] * mr_len + input_ids[mr_len:]
     
-    # Ensure labels length matches input_ids
+    # Ensure labels length matches input_ids and handle padding properly
     labels = labels[:len(input_ids)]
+    
+    # Find the actual EOS token (not padding) and mask everything after it
+    try:
+        actual_eos_pos = input_ids.index(tokenizer.eos_token_id)
+        # Keep labels up to EOS, then mask padding
+        for i in range(actual_eos_pos + 1, len(labels)):
+            labels[i] = -100
+    except ValueError:
+        # If no EOS found, the sequence was truncated - that's fine
+        pass
     
     # DEBUG: Print first few examples to verify masking
     if hasattr(preprocess_fn, 'debug_count'):
