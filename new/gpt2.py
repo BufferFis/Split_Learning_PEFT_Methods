@@ -102,7 +102,27 @@ class Split3GPT2(nn.Module):
 model = Split3GPT2(1,1)
 peft_cfg = LoraConfig(r=4, lora_alpha=16, target_modules=["c_attn","c_proj"], use_dora=True)
 model = get_peft_model(model, peft_cfg)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu"); model.to(device)
+# Freeze all base model parameters, train only LoRA adapters
+for name, param in model.named_parameters():
+    if not name.startswith("lora_"):
+        param.requires_grad = False
+# Move to device
+model.to(device)
+# Prepare optimizer: only adapter parameters, with weight decay
+optimizer = AdamW(
+    [p for n, p in model.named_parameters() if p.requires_grad],
+    lr=1e-5,
+    weight_decay=0.01
+)
+# Scheduler: linear warmup + decay
+total_steps = len(train_loader) * epochs
+from transformers import get_linear_schedule_with_warmup
+scheduler = get_linear_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps=int(0.1 * total_steps),
+    num_training_steps=total_steps
+)
+
 
 # ---- Generator (custom) ----
 def generate_sequence(model, input_ids, max_len=50, ban_eos_steps=2, top_k=50):
