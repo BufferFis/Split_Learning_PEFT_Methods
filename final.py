@@ -415,7 +415,12 @@ class HeadClient:
                 use_cache=False,
                 output_hidden_states=True
             )
-            return output.hidden_states[-1]
+            # Instead of returning just the tensor, return a BaseModelOutputWithPast object
+            return BaseModelOutputWithPast(
+                last_hidden_state=output.hidden_states[-1],
+                past_key_values=None,
+                hidden_states=output.hidden_states
+            )
     
     def backward(self, head_activations, head_grad):
         """ESSENTIAL: Backward pass for split learning"""
