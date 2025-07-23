@@ -106,16 +106,21 @@ model = get_peft_model(model, peft_cfg)
 for name, param in model.named_parameters():
     if not name.startswith("lora_"):
         param.requires_grad = False
-# Move to device
-model.to(device)
+
+# Check trainable parameters
+trainable_params = [p for n, p in model.named_parameters() if p.requires_grad]
+if not trainable_params:
+    raise ValueError("No trainable parameters found. LoRA adapters may not have been initialized correctly.")
+
 # Prepare optimizer: only adapter parameters, with weight decay
 optimizer = AdamW(
     [p for n, p in model.named_parameters() if p.requires_grad],
     lr=1e-5,
     weight_decay=0.01
 )
-# Scheduler: linear warmup + decay
+
 epochs = 3
+# Scheduler: linear warmup + decay
 total_steps = len(train_loader) * epochs
 from transformers import get_linear_schedule_with_warmup
 scheduler = get_linear_schedule_with_warmup(
