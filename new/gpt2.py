@@ -102,15 +102,8 @@ class Split3GPT2(nn.Module):
 model = Split3GPT2(1,1)
 peft_cfg = LoraConfig(r=4, lora_alpha=16, target_modules=["c_attn","c_proj"], use_dora=True)
 model = get_peft_model(model, peft_cfg)
-# Freeze all base model parameters, train only LoRA adapters
-for name, param in model.named_parameters():
-    if not name.startswith("lora_"):
-        param.requires_grad = False
-
-# Check trainable parameters
-trainable_params = [p for n, p in model.named_parameters() if p.requires_grad]
-if not trainable_params:
-    raise ValueError("No trainable parameters found. LoRA adapters may not have been initialized correctly.")
+# LoRA adapters already manage trainable parameters internally
+model.print_trainable_parameters()
 
 # Prepare optimizer: only adapter parameters, with weight decay
 optimizer = AdamW(
