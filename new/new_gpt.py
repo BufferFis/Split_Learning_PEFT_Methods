@@ -54,28 +54,64 @@ class SplitGPT2_UShape(nn.Module):
             base = get_peft_model(base, peft_config)
             self.server = nn.Sequential(*[base.transformer.h[i] for i in range(2, 10)])
 
-    def forward(self, input_ids, attention_mask=None, labels=None):
+    def forward(self, input_ids, attention_mask=None, past_key_values=None, position_ids=None, labels=None):
         device = input_ids.device
-        position_ids = torch.arange(0, input_ids.size(-1), dtype=torch.long, device=device)
-        position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
         
-        inputs_embeds = self.wte(input_ids) + self.wpe(position_ids)
-        hidden = self.drop(inputs_embeds)
+        # Handle position IDs properly
+        if position_ids is None:
+            if past_key_values is not None:
+                # Position IDs for continuing sequence
+                seq_length = past_key_values[0][0].size(2) + input_ids.size(1)
+                position_ids = torch.arange(
+                    past_key_values[0][0].size(2), seq_length, dtype=torch.long, device=device
+                )
+                position_ids = position_ids.unsqueeze(0).expand(input_ids.size(0), -1)
+            else:
+                # Normal position IDs
+                position_ids = torch.arange(0, input_ids.size(-1), dtype=torch.long, device=device)
+                position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
+        
+        # Split past_key_values for different components
+        past_key_values_client_head = None
+        past_key_values_server = None
+        past_key_values_client_tail = None
+        new_past_key_values = []
+        
+        if past_key_values is not None:
+            # Split the past_key_values between components
+            past_key_values_client_head = past_key_values[:2]
+            past_key_values_server = past_key_values[2:10]
+            past_key_values_client_tail = past_key_values[10:]
+        
+        # Get embeddings
+        if past_key_values is None:
+            inputs_embeds = self.wte(input_ids) + self.wpe(position_ids)
+            hidden = self.drop(inputs_embeds)
+        else:
+            # Only embed new tokens for efficiency
+            inputs_embeds = self.wte(input_ids) + self.wpe(position_ids)
+            hidden = self.drop(inputs_embeds)
         
         # Forward through client head
-        for layer in self.client_head:
-            outputs = layer(hidden, attention_mask=attention_mask)
+        for i, layer in enumerate(self.client_head):
+            layer_past = None if past_key_values_client_head is None else past_key_values_client_head[i]
+            outputs = layer(hidden, attention_mask=attention_mask, past_key_value=layer_past, use_cache=True)
             hidden = outputs[0]
+            new_past_key_values.append(outputs[1])
         
         # Forward through server
-        for layer in self.server:
-            outputs = layer(hidden, attention_mask=attention_mask)
+        for i, layer in enumerate(self.server):
+            layer_past = None if past_key_values_server is None else past_key_values_server[i]
+            outputs = layer(hidden, attention_mask=attention_mask, past_key_value=layer_past, use_cache=True)
             hidden = outputs[0]
+            new_past_key_values.append(outputs[1])
         
         # Forward through client tail
-        for layer in self.client_tail:
-            outputs = layer(hidden, attention_mask=attention_mask)
+        for i, layer in enumerate(self.client_tail):
+            layer_past = None if past_key_values_client_tail is None else past_key_values_client_tail[i]
+            outputs = layer(hidden, attention_mask=attention_mask, past_key_value=layer_past, use_cache=True)
             hidden = outputs[0]
+            new_past_key_values.append(outputs[1])
         
         hidden = self.ln_f(hidden)
         logits = self.lm_head(hidden)
@@ -85,32 +121,116 @@ class SplitGPT2_UShape(nn.Module):
             loss_fct = SmoothCELoss(eps=0.1)
             loss = loss_fct(logits.view(-1, self.config.vocab_size), labels.view(-1))
         
-        return {'logits': logits, 'loss': loss}
+        return {'logits': logits, 'loss': loss, 'past_key_values': new_past_key_values}
 
     def generate(self, input_ids, attention_mask=None, **gen_kwargs):
-        # Create a complete model for generation
-        config = GPT2LMHeadModel.from_pretrained("gpt2").config
-        full = GPT2LMHeadModel(config=config).to(input_ids.device)
-        full.transformer.wte = self.wte
-        full.transformer.wpe = self.wpe
-        full.transformer.ln_f = self.ln_f
-        full.transformer.h = nn.ModuleList(list(self.client_head) + list(self.server) + list(self.client_tail))
-        full.lm_head = self.lm_head
-        full.config = self.config
-        full.eval()
+        device = input_ids.device
+        batch_size = input_ids.size(0)
         
-        return full.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=60,
-            do_sample=True,
-            top_k=50,           # Increased from 30
-            top_p=0.92,         # Increased from 0.85
-            temperature=0.8,    
-            repetition_penalty=1.2,  # Reduced from 1.5
-            pad_token_id=self.tokenizer.eos_token_id,
-            **gen_kwargs
-        )
+        # Initialize past_key_values as None
+        past_key_values = None
+        
+        # Initialize storage for generated tokens
+        generated_tokens = input_ids.clone()
+        
+        max_length = gen_kwargs.get('max_length', input_ids.shape[1] + 50)
+        if 'max_new_tokens' in gen_kwargs:
+            max_new_tokens = gen_kwargs['max_new_tokens']
+            max_length = input_ids.shape[1] + max_new_tokens
+        
+        # Create initial attention mask if none provided
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+            
+        # Generation parameters
+        do_sample = gen_kwargs.get('do_sample', True)
+        temperature = gen_kwargs.get('temperature', 0.8)
+        top_k = gen_kwargs.get('top_k', 50)
+        top_p = gen_kwargs.get('top_p', 0.92)
+        repetition_penalty = gen_kwargs.get('repetition_penalty', 1.2)
+        
+        # Autoregressive generation loop
+        with torch.no_grad():
+            for _ in range(max_length - input_ids.shape[1]):
+                # Get current inputs for this step (only the last token if using past_key_values)
+                if past_key_values is not None:
+                    current_input_ids = generated_tokens[:, -1].unsqueeze(-1)
+                else:
+                    current_input_ids = generated_tokens
+                
+                # Update attention mask for the new token
+                if past_key_values is not None:
+                    # Extend attention mask for the new token
+                    new_token_mask = torch.ones((batch_size, 1), device=device)
+                    attention_mask = torch.cat([attention_mask, new_token_mask], dim=-1)
+                
+                # Create causal attention mask
+                seq_length = attention_mask.shape[1]
+                causal_mask = torch.tril(torch.ones((seq_length, seq_length), device=device)).unsqueeze(0)
+                
+                # Forward pass with the model
+                outputs = self.forward(
+                    current_input_ids,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    position_ids=None  # Will be auto-calculated in forward
+                )
+                
+                # Get logits and update past_key_values for next iteration
+                logits = outputs['logits']
+                past_key_values = outputs['past_key_values']
+                
+                # Get next token prediction (last token in sequence)
+                next_token_logits = logits[:, -1, :]
+                
+                # Apply repetition penalty
+                if repetition_penalty != 1.0:
+                    for i in range(batch_size):
+                        for previous_token in generated_tokens[i]:
+                            next_token_logits[i, previous_token] /= repetition_penalty
+                
+                # Apply temperature
+                next_token_logits = next_token_logits / temperature
+                
+                # Filter with top-k / top-p
+                if do_sample:
+                    # Apply top-k filtering
+                    if top_k > 0:
+                        indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                        next_token_logits[indices_to_remove] = -float('Inf')
+                    
+                    # Apply top-p filtering
+                    if top_p < 1.0:
+                        sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                        
+                        # Remove tokens with cumulative probability above the threshold
+                        sorted_indices_to_remove = cumulative_probs > top_p
+                        # Shift the indices to the right to keep the first token above threshold
+                        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                        sorted_indices_to_remove[..., 0] = 0
+                        
+                        # Scatter sorted tensors to original indexing
+                        indices_to_remove = sorted_indices_to_remove.scatter(
+                            1, sorted_indices, sorted_indices_to_remove
+                        )
+                        next_token_logits[indices_to_remove] = -float('Inf')
+                    
+                    # Sample from the filtered distribution
+                    probs = torch.softmax(next_token_logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                else:
+                    # Take the token with highest probability (greedy decoding)
+                    next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+                
+                # Add the predicted token to the generated sequence
+                generated_tokens = torch.cat([generated_tokens, next_token], dim=-1)
+                
+                # Stop if we generated EOS token
+                if (next_token == self.tokenizer.eos_token_id).all():
+                    break
+        
+        return generated_tokens
 
 # ============ Dataset ============
 def linearize_mr_dict(mr_dict):
@@ -181,15 +301,15 @@ def train(args):
     
     # Improved optimizer settings
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=0.01, betas=(0.9, 0.999), eps=1e-8)
-    
+    epochs = 3
     # Better learning rate scheduler with longer warmup
-    total_steps = len(train_loader) * 10  # Training for 10 epochs
+    total_steps = len(train_loader) * 3  # Training for 10 epochs
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(0.1*total_steps), num_training_steps=total_steps)
 
     best_val_loss = float('inf')
     patience, max_patience = 0, 3
     
-    for epoch in range(1, 11):  # Increased epochs from 4 to 10
+    for epoch in range(0, epoch):  # Increased epochs from 4 to 10
         model.train()
         train_losses = []
         
@@ -230,7 +350,7 @@ def train(args):
         
         avg_train_loss = sum(train_losses) / len(train_losses)
         avg_val_loss = sum(val_losses) / len(val_losses)
-        print(f"Epoch {epoch} - Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+        print(f"Epoch {epoch + 1} - Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
         
         # Sample generation for monitoring
         print("\n=== Generation Examples ===")
