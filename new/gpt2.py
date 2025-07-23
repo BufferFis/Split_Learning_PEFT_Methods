@@ -126,8 +126,8 @@ def collate(batch):
     )
 
 # REDUCED batch size for more stable training
-train_loader = DataLoader(train_ds, batch_size=8, shuffle=True, collate_fn=collate)
-val_loader = DataLoader(val_ds, batch_size=8, collate_fn=collate)
+train_loader = DataLoader(train_ds, batch_size=4, shuffle=True, collate_fn=collate)
+val_loader = DataLoader(val_ds, batch_size=4, collate_fn=collate)
 
 # ---- Model Split Definition ----
 class Split3GPT2(nn.Module):
@@ -175,7 +175,7 @@ model.print_trainable_parameters()
 # MUCH lower learning rate
 optimizer = AdamW(
     [p for n, p in model.named_parameters() if p.requires_grad],
-    lr=4e-5,  # REDUCED from 1e-5
+    lr=1e-6,  # REDUCED from 1e-5
     weight_decay=0.01
 )
 
@@ -188,8 +188,8 @@ scheduler = get_linear_schedule_with_warmup(
     num_training_steps=total_steps
 )
 
-# ---- FIXED Generator ----
-def generate_sequence(model, input_ids, max_len=50, ban_eos_steps=5, top_k=50, temperature=0.8):
+# ---- FIXED Generator with Stronger Anti-Repetition ----
+def generate_sequence(model, input_ids, max_len=50, ban_eos_steps=5, top_k=40, temperature=1.0):
     model.eval()
     cur = input_ids.to(device)
     steps = 0
@@ -198,25 +198,61 @@ def generate_sequence(model, input_ids, max_len=50, ban_eos_steps=5, top_k=50, t
         with torch.no_grad():
             out = model(cur, attention_mask=torch.ones_like(cur).to(device))
             logits = out[1] if isinstance(out, tuple) else out
-            next_logits = logits[:, -1, :] / temperature  # Add temperature
+            next_logits = logits[:, -1, :] / temperature
             
             # Ban EOS for initial steps
             if steps < ban_eos_steps:
                 next_logits[:, tokenizer.eos_token_id] = -float('Inf')
             
-            # STRONGER repetition penalty - ban recent tokens
-            if cur.size(1) >= 3:
-                recent_tokens = cur[0, -3:].tolist()
+            # MUCH STRONGER repetition penalty
+            if cur.size(1) >= 2:
+                # Get more recent tokens for penalty
+                lookback = min(8, cur.size(1))  # Look back up to 8 tokens
+                recent_tokens = cur[0, -lookback:].tolist()
+                
+                # Count occurrences and apply stronger penalties
+                token_counts = {}
                 for token_id in recent_tokens:
-                    next_logits[:, token_id] -= 2.0  # Penalty for repetition
+                    token_counts[token_id] = token_counts.get(token_id, 0) + 1
+                
+                for token_id, count in token_counts.items():
+                    if count > 1:  # If token appeared more than once
+                        penalty = 5.0 * count  # Much stronger penalty
+                        next_logits[:, token_id] -= penalty
             
-            values, indices = torch.topk(next_logits, top_k)
-            probs = torch.softmax(values, dim=-1)
-            choice = torch.multinomial(probs, num_samples=1)
-            next_id = indices.gather(-1, choice)
+            # Additional penalty for common problematic tokens
+            problem_tokens = ["family", "friendly", "no", "yes", "the", "is", "a"]
+            for word in problem_tokens:
+                token_ids = tokenizer.encode(word, add_special_tokens=False)
+                for token_id in token_ids:
+                    if token_id in cur[0, -5:].tolist():  # If in recent 5 tokens
+                        next_logits[:, token_id] -= 3.0
+            
+            # Use nucleus sampling instead of just top-k
+            sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
+            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+            
+            # Nucleus sampling with p=0.9
+            sorted_indices_to_remove = cumulative_probs > 0.9
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = 0
+            
+            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+            next_logits[indices_to_remove] = -float('Inf')
+            
+            # Sample from remaining tokens
+            probs = torch.softmax(next_logits, dim=-1)
+            next_id = torch.multinomial(probs, num_samples=1)
         
         cur = torch.cat([cur, next_id], dim=1)
         steps += 1
+        
+        # Early stopping if we detect repetition
+        if steps >= 3:
+            last_3_tokens = cur[0, -3:].tolist()
+            if len(set(last_3_tokens)) == 1:  # All same token
+                break
+                
         if next_id.item() == tokenizer.eos_token_id and steps >= ban_eos_steps:
             break
     return cur
@@ -303,7 +339,7 @@ for e in range(1, epochs + 1):
         print("-" * 50)
     
     # Only evaluate every 2 epochs to save time
-    if e % 2 == 0:
+    if e % 1 == 0:
         bleu, meteor, rouge = evaluate_model(model, tokenizer, raw_val.select(range(100)))
         print(f"Epoch{e}: TrainL={tl/len(train_loader):.4f} ValL={vt/len(val_loader):.4f} "
               f"BLEU={bleu['bleu']:.4f} METEOR={meteor['meteor']:.4f} ROUGE-L={rouge['rougeL']:.4f}\n")
