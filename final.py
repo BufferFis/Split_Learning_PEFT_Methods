@@ -1047,7 +1047,6 @@ class SplitLoRATrainer:
 
     def validate_model_sanity(self):
         """Check if model can generate basic English using the wrapper"""
-        # FIXED: Use wrapper instead of individual head model
         try:
             from split_beam_wrapper import SplitGPT2ForGeneration
             
@@ -1060,41 +1059,117 @@ class SplitLoRATrainer:
                 base_config=self.head_client.head_model.base_model.config
             ).to(device).eval()
             
+            # Make sure weight tying is intact before generation
+            self.ensure_weight_tying()
+            
             test_prompt = "The restaurant is"
             enc = self.tokenizer(test_prompt, return_tensors="pt")
             ids = enc["input_ids"].to(device)
             
             with torch.no_grad():
-                # Use the wrapper for generation
-                output = temp_wrapper.generate(
-                    ids,
-                    max_new_tokens=60,        
-                    do_sample=False,                # Pure greedy
-                    eos_token_id=self.tokenizer.eos_token_id,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    # NO OTHER PARAMETERS AT ALL
-                )
-            
-            result = self.tokenizer.decode(output[0], skip_special_tokens=True)
-            print(f"Sanity check: '{result}'")
-            
-            # Check if output contains mostly punctuation/symbols
-            text_part = result[len(test_prompt):].strip()
-            symbol_ratio = sum(1 for c in text_part if c in '|[](){}') / max(len(text_part), 1)
-            
-            if symbol_ratio > 0.3:
-                print("❌ MODEL GENERATING GIBBERISH - TRAINING FAILED")
-                return False
-            else:
-                print("✅ Model generating reasonable text")
-                return True
-                
+                # Use simpler generation parameters
+                try:
+                    output = temp_wrapper.generate(
+                        ids,
+                        max_new_tokens=20,        
+                        do_sample=False,           # Pure greedy
+                        num_beams=1,              # No beam search
+                        use_cache=True,           # Enable caching
+                        eos_token_id=self.tokenizer.eos_token_id,
+                        pad_token_id=self.tokenizer.pad_token_id
+                    )
+                    
+                    result = self.tokenizer.decode(output[0], skip_special_tokens=True)
+                    print(f"Sanity check: '{result}'")
+                    
+                    # Check if output contains mostly punctuation/symbols
+                    text_part = result[len(test_prompt):].strip()
+                    
+                    if not text_part:
+                        print("❌ MODEL GENERATING NOTHING - TRAINING FAILING")
+                        return False
+                        
+                    symbol_ratio = sum(1 for c in text_part if c in '|[](){}') / max(len(text_part), 1)
+                    
+                    if symbol_ratio > 0.3:
+                        print(f"❌ MODEL GENERATING GIBBERISH ({symbol_ratio:.2f} symbol ratio) - TRAINING FAILING")
+                        return False
+                    else:
+                        print(f"✅ Model generating reasonable text ({len(text_part)} chars)")
+                        return True
+                except Exception as inner_e:
+                    print(f"⚠️ Generation failed in sanity check: {str(inner_e)}")
+                    import traceback
+                    traceback.print_exc()
+                    return False
+                    
         except Exception as e:
-            print(f"⚠️ Sanity check failed: {e}")
-            return True  # Continue training anyway
+            print(f"⚠️ Sanity check failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return False  # Changed to return False to indicate failure
 
-    
-
+    def check_wrapper_functionality(self):
+        """Diagnostic function to check if the wrapper is working correctly"""
+        print("Checking SplitGPT2ForGeneration wrapper...")
+        
+        try:
+            from split_beam_wrapper import SplitGPT2ForGeneration
+            
+            # Create wrapper
+            wrapper = SplitGPT2ForGeneration(
+                tokenizer=self.tokenizer,
+                head_client=self.head_client,
+                server=self.server,
+                tail_client=self.tail_client,
+                base_config=self.head_client.head_model.base_model.config
+            ).to(device).eval()
+            
+            # Test simple forward pass
+            test_input = "Hello, world"
+            encoded = self.tokenizer(test_input, return_tensors="pt").to(device)
+            
+            print("Testing forward pass...")
+            try:
+                with torch.no_grad():
+                    outputs = wrapper(
+                        input_ids=encoded["input_ids"],
+                        attention_mask=encoded["attention_mask"]
+                    )
+                print(f"Forward pass successful. Output type: {type(outputs)}")
+                
+                if hasattr(outputs, 'logits'):
+                    print(f"Logits shape: {outputs.logits.shape}")
+                    top_tokens = torch.topk(outputs.logits[0, -1], 5).indices
+                    print(f"Top 5 next tokens: {[self.tokenizer.decode([t]) for t in top_tokens]}")
+            except Exception as e:
+                print(f"Forward pass failed: {str(e)}")
+                import traceback
+                traceback.print_exc()
+            
+            # Test simple generation
+            print("\nTesting generation...")
+            try:
+                with torch.no_grad():
+                    gen_output = wrapper.generate(
+                        encoded["input_ids"],
+                        max_new_tokens=10,
+                        num_beams=1,
+                        do_sample=False
+                    )
+                generated_text = self.tokenizer.decode(gen_output[0], skip_special_tokens=True)
+                print(f"Generated: '{generated_text}'")
+            except Exception as e:
+                print(f"Generation failed: {str(e)}")
+                import traceback
+                traceback.print_exc()
+            
+            return True
+        except Exception as e:
+            print(f"Wrapper check failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return False
 
     def train_with_coverage(self, train_dataloader, epochs=1):
         """Enhanced training with coverage monitoring + AMP + memory optimization."""
@@ -1385,6 +1460,25 @@ class SplitLoRATrainer:
                 if batch_idx % 100 == 0:
                     torch.cuda.empty_cache()
                 
+                 # Periodic sanity check (every 500 batches)
+            if batch_idx > 0 and batch_idx % 500 == 0:
+                print(f"\nPerforming sanity check at batch {batch_idx}...")
+                # Switch to eval mode temporarily
+                self.head_client.head_model.eval()
+                self.server.body_model.eval()
+                self.tail_client.tail_model.eval()
+                
+                sanity_result = self.validate_model_sanity()
+                
+                # Switch back to training mode
+                self.head_client.head_model.train()
+                self.server.body_model.train()
+                self.tail_client.tail_model.train()
+                
+                if not sanity_result:
+                    print(f"❌ Sanity check failed at batch {batch_idx} - model is not generating properly")
+                    print("Continuing training but results may be poor")
+
                 try:
                     input_ids = batch["input_ids"].to(device)
                     attention_mask = batch["attention_mask"].to(device)
@@ -2509,11 +2603,13 @@ def main():
             tail_client = trainer.tail_client,
             base_config = trainer.head_client.head_model.config
          ).to(device).eval()
-
     wrapper.config.vocab_size = len(trainer.tokenizer)          # 50 259
     if hasattr(wrapper, "generation_config"):
         wrapper.generation_config.vocab_size = len(trainer.tokenizer)
     
+    trainer.check_wrapper_functionality()
+    if not trainer.validate_model_sanity():
+        print("⚠️ Warning: Model sanity check failed before training")
     
     if args.eval_only:
         train_ds, test_ds = trainer.load_e2e_dataset(debug_mode=False, 
