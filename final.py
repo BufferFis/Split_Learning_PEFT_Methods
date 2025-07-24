@@ -1220,13 +1220,20 @@ class SplitLoRATrainer:
         }
 
     def train(self, train_dataloader, epochs=1):
+        """Enhanced training method with numerical stability improvements"""
         print(f"Starting training for {epochs} epochs...")
         example_inputs = None
+        
         for epoch in range(epochs):
             total_loss = 0.0
             num_batches = 0
+            nan_batches = 0  # Track NaN batches for debugging
             
             for batch_idx, batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{epochs}")):
+                # Periodically clear CUDA cache to reduce fragmentation
+                if batch_idx % 100 == 0:
+                    torch.cuda.empty_cache()
+                    
                 if batch_idx == 0 and example_inputs is None:
                     example_inputs = {
                         'input_ids': batch["input_ids"][0:1].clone(),
@@ -1241,65 +1248,109 @@ class SplitLoRATrainer:
                 
                 # DEBUG: inspect the first batch once per epoch
                 if batch_idx == 0:
-                    # decode first two label sequences (remove -100 paddings)
                     for k in range(min(2, batch["labels"].size(0))):
                         lbl_ids = [t for t in batch["labels"][k].tolist() if t != -100]
                         print("   LABEL:", self.tokenizer.decode(lbl_ids))
+                
                 try:
                     input_ids = batch["input_ids"].to(device)
                     attention_mask = batch["attention_mask"].to(device).bool()
                     labels = batch["labels"].to(device)
-
-                    #print(f"Input attention mask sum: {attention_mask.sum()}")
-                    #print(f"Attention mask shape: {attention_mask.shape}")
-                    #print(f"Pad token positions: {(input_ids == self.tokenizer.pad_token_id).sum()}")
-
                     
-                    # FIX: Check for NaN inputs
+                    # Check for NaN inputs
                     if torch.isnan(input_ids.float()).any() or torch.isnan(labels.float()).any():
                         print(f"Skipping batch {batch_idx} due to NaN inputs")
+                        nan_batches += 1
                         continue
                     
                     # Forward through pipeline
-                    head_activations = self.head_client.forward(input_ids, attention_mask=attention_mask)  
-                    body_activations, head_activations_stored = self.server.forward_train(head_activations, attention_mask)  
-                    loss, body_grad = self.tail_client.compute_loss_and_backward(body_activations, labels, attention_mask)  
+                    head_out = self.head_client.forward(input_ids, attention_mask=attention_mask)
+                    h_states = head_out.last_hidden_state
                     
-
+                    body_out, head_activations_stored = self.server.forward_train(h_states, attention_mask)
+                    b_states = body_out
                     
-                    # FIX: Check for NaN loss
-                    if math.isnan(loss):
-                        print(f"NaN loss at batch {batch_idx}, skipping...")
+                    # IMPROVED: Add clamp to logits before computing loss
+                    logits, _ = self.tail_client.tail_model(
+                        inputs_embeds=b_states,
+                        attention_mask=attention_mask,
+                        past_key_values=None,
+                        use_cache=False
+                    )
+                    
+                    # Clamp logits for stability
+                    logits = torch.clamp(logits, -50.0, 50.0)
+                    
+                    # Compute loss with shifted logits
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., 1:].contiguous()
+                    shift_labels[shift_labels == -100] = self.tail_client.loss_fn.ignore_index
+                    
+                    # Check for NaN logits
+                    if torch.isnan(shift_logits).any():
+                        print(f"WARNING: NaN logits at batch {batch_idx}, skipping...")
+                        nan_batches += 1
                         continue
                     
-                    # Backward through body and head
+                    loss = self.tail_client.loss_fn(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1)
+                    )
                     
-                    # FIXED: Use the correct variable name
-                    head_grad = self.server.backward(body_activations, body_grad, head_activations_stored)
-
-                    self.head_client.backward(head_activations, head_grad)
+                    # Check for NaN loss
+                    if torch.isnan(loss) or math.isinf(loss.item()):
+                        print(f"NaN/Inf loss at batch {batch_idx}, skipping...")
+                        nan_batches += 1
+                        continue
+                    
+                    # Backward pass
+                    loss.backward(retain_graph=True)
+                    
+                    # Get gradients with proper checks
+                    b_states.requires_grad_(True)
+                    b_states.retain_grad()  # CRITICAL: Add this line
+                    
+                    body_grad = b_states.grad.clone() if b_states.grad is not None else torch.zeros_like(b_states)
+                    
+                    # Check for NaN gradients
+                    if torch.isnan(body_grad).any():
+                        print(f"NaN gradient at batch {batch_idx}, skipping optimizer step...")
+                        nan_batches += 1
+                        continue
+                    
+                    # Backward through body and head with proper error handling
+                    head_grad = self.server.backward(b_states, body_grad, head_activations_stored)
+                    if head_grad is None or torch.isnan(head_grad).any():
+                        print(f"Invalid head gradient, skipping backward...")
+                        nan_batches += 1
+                        continue
+                    
+                    self.head_client.backward(h_states, head_grad)
+                    
+                    # Update schedulers
                     for sched in self.schedulers:
                         sched.step()
-                    grad_norms = [p.grad.norm().item() for p in self.head_client.head_model.parameters() if p.grad is not None]
-                    # FIX: Add gradient clipping to all components
-                    torch.nn.utils.clip_grad_norm_(self.head_client.head_model.parameters(), max_norm=0.5)
-                    torch.nn.utils.clip_grad_norm_(self.tail_client.tail_model.parameters(), max_norm=0.5)
                     
-                    total_loss += loss
+                    # IMPROVED: Gradient clipping for all components
+                    torch.nn.utils.clip_grad_norm_(self.head_client.head_model.parameters(), max_norm=1.0)
+                    torch.nn.utils.clip_grad_norm_(self.server.body_model.parameters(), max_norm=1.0) 
+                    torch.nn.utils.clip_grad_norm_(self.tail_client.tail_model.parameters(), max_norm=1.0)
+                    
+                    total_loss += loss.item()
                     num_batches += 1
                     
-                    
                     if batch_idx % 50 == 0:
-                        print(f"Batch {batch_idx}, Loss: {loss:.4f}")
+                        print(f"Batch {batch_idx}, Loss: {loss.item():.4f}")
                     
                 except Exception as e:
-                    print(f"Training error: {e}")
+                    print(f"Training error at batch {batch_idx}: {e}")
                     traceback.print_exc()
+                    nan_batches += 1
                     continue
             
-            avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+            avg_loss = total_loss / max(num_batches, 1)
             self.metrics["loss"].append(avg_loss)
-            print(f"Epoch {epoch+1} average loss: {avg_loss:.4f}")
+            print(f"Epoch {epoch+1} average loss: {avg_loss:.4f} (skipped {nan_batches} batches)")
         
         print("Training completed!")
 
@@ -2362,7 +2413,7 @@ def main():
     print(f"PAD token: '{trainer.PAD}' -> {trainer.tokenizer.pad_token_id}")
     print(f"EOS token: '{trainer.tokenizer.eos_token}' -> {trainer.tokenizer.eos_token_id}")
     for ep in range(start_epoch, start_epoch + args.epochs):
-        trainer.train_with_coverage(train_dl, epochs=1)
+        trainer.train(train_dl, epochs=1)
         ckpt_name = f"ckpt_ep{ep}.pt"
         ckpt_path = os.path.join(args.save_path, f"ckpt_ep{ep}.pt")
         trainer.save_checkpoint(ckpt_path, epoch=ep)
