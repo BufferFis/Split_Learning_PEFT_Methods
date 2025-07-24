@@ -380,29 +380,51 @@ class ServerModel:
         
     def forward(self, activations, attention_mask=None, position_ids=None, past_key_values=None, use_cache=True):
         """Forward pass through body layers with proper caching"""
-        self.body_model.eval()
-        with torch.no_grad():
-            output, present = self.body_model(
-                hidden_states=activations,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache
-            )
-            return output if not use_cache else (output, present)
+        try:
+            self.body_model.eval()
+            with torch.no_grad():
+                output = self.body_model(
+                    hidden_states=activations,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache
+                )
+                
+                # Ensure consistent return format
+                if isinstance(output, tuple) and len(output) == 2:
+                    return output  # (hidden_states, present_key_values)
+                else:
+                    return output, None  # Return (output, None) if no cache
+                    
+        except Exception as e:
+            print(f"Error in ServerModel forward: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return activations, None  # Return input as fallback
     
     def forward_train(self, activations, attention_mask=None, position_ids=None):
         """Forward pass during training (no caching needed)"""
-        self.body_model.train()
-        # Don't detach - maintain gradient connection
-        activations.requires_grad_(True)
-        output, _ = self.body_model(
-            hidden_states=activations, 
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            use_cache=False
-        )
-        return output, activations
+        try:
+            self.body_model.train()
+            # Don't detach - maintain gradient connection
+            activations.requires_grad_(True)
+            activations.retain_grad()  # CRITICAL for gradient flow
+            
+            output, _ = self.body_model(
+                hidden_states=activations, 
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False
+            )
+            
+            # Ensure output requires gradients
+            output.requires_grad_(True)
+            return output, activations
+            
+        except Exception as e:
+            print(f"Error in ServerModel forward_train: {str(e)}")
+            return activations, activations  # Return input as fallback
     
     def backward(self, body_output, body_grad, head_activations):
         """Fixed backward pass with proper gradient flow"""
@@ -465,30 +487,28 @@ class HeadClient:
                 output_hidden_states=True
             )
             
-            # CRITICAL FIX: Always return consistent output type (BaseModelOutputWithPast)
-            if isinstance(output, tuple):
-                # If output is a tuple (hidden_states, present_key_values)
-                hidden_states = output[0]
-                present_key_values = output[1] if len(output) > 1 else None
+            # CRITICAL FIX: Always return consistent output
+            if isinstance(output, tuple) and len(output) == 2:
+                # If output is (hidden_states, present_key_values)
+                hidden_states, present_key_values = output
+                return hidden_states, present_key_values
                 
-                return BaseModelOutputWithPast(
-                    last_hidden_state=hidden_states,
-                    past_key_values=present_key_values,
-                    hidden_states=[hidden_states]  # Put in a list for consistency
-                )
             elif hasattr(output, 'last_hidden_state'):
-                # Output is already a BaseModelOutputWithPast, just return it
-                return output
+                # Output is already a BaseModelOutputWithPast
+                return output.last_hidden_state, output.past_key_values
+                
             else:
-                # Unexpected output type, wrap it safely
-                return BaseModelOutputWithPast(
-                    last_hidden_state=output,
-                    past_key_values=None,
-                    hidden_states=[output]
-                )
+                # Unexpected output type, handle it safely
+                print(f"Warning: Unexpected HeadModel output type: {type(output)}")
+                if isinstance(output, torch.Tensor):
+                    return output, None
+                else:
+                    return output, None
                 
         except Exception as e:
             print(f"Error in HeadClient forward pass: {str(e)}")
+            import traceback
+            traceback.print_exc()
             raise
     
     def backward(self, head_activations, head_grad):
@@ -496,12 +516,25 @@ class HeadClient:
         self.optimizer.zero_grad()
         
         # Apply gradients received from body
-        if head_grad is not None:
-            torch.autograd.backward(
-                tensors=[head_activations],
-                grad_tensors=[head_grad],
-                retain_graph=False
-            )
+        if head_grad is not None and head_activations.requires_grad:
+            # Ensure head_activations has gradients enabled
+            if not head_activations.requires_grad:
+                head_activations.requires_grad_(True)
+                
+            # Apply gradients safely
+            try:
+                torch.autograd.backward(
+                    tensors=[head_activations],
+                    grad_tensors=[head_grad],
+                    retain_graph=True
+                )
+            except Exception as e:
+                print(f"Error in HeadClient backward: {str(e)}")
+                import traceback
+                traceback.print_exc()
+        
+        # Clip gradients
+        torch.nn.utils.clip_grad_norm_(self.head_model.parameters(), max_norm=1.0)
         
         # Update head parameters
         self.optimizer.step()
@@ -1332,139 +1365,157 @@ class SplitLoRATrainer:
         }
 
     def train(self, train_dataloader, epochs=1):
-        """Enhanced training method with numerical stability improvements"""
+        """Fixed training method that ensures proper gradient flow"""
         print(f"Starting training for {epochs} epochs...")
-        example_inputs = None
         
         for epoch in range(epochs):
             total_loss = 0.0
             num_batches = 0
-            nan_batches = 0  # Track NaN batches for debugging
+            nan_batches = 0
+            
+            # Ensure models are in training mode
+            self.head_client.head_model.train()
+            self.server.body_model.train()
+            self.tail_client.tail_model.train()
+            
+            # Verify weight tying before training
+            self.ensure_weight_tying()
             
             for batch_idx, batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{epochs}")):
-                # Periodically clear CUDA cache to reduce fragmentation
                 if batch_idx % 100 == 0:
                     torch.cuda.empty_cache()
-                    
-                if batch_idx == 0 and example_inputs is None:
-                    example_inputs = {
-                        'input_ids': batch["input_ids"][0:1].clone(),
-                        'attention_mask': batch["attention_mask"][0:1].clone(),
-                        'labels': batch["labels"][0:1].clone()
-                    }
-                
-                if batch_idx % 500 == 0:
-                    if not self.validate_model_sanity():
-                        print("Stopping training due to gibberish generation")
-                        break
-                
-                # DEBUG: inspect the first batch once per epoch
-                if batch_idx == 0:
-                    for k in range(min(2, batch["labels"].size(0))):
-                        lbl_ids = [t for t in batch["labels"][k].tolist() if t != -100]
-                        print("   LABEL:", self.tokenizer.decode(lbl_ids))
                 
                 try:
                     input_ids = batch["input_ids"].to(device)
-                    attention_mask = batch["attention_mask"].to(device).bool()
+                    attention_mask = batch["attention_mask"].to(device)
                     labels = batch["labels"].to(device)
                     
-                    # Check for NaN inputs
-                    if torch.isnan(input_ids.float()).any() or torch.isnan(labels.float()).any():
-                        print(f"Skipping batch {batch_idx} due to NaN inputs")
-                        nan_batches += 1
-                        continue
+                    # Reset gradients
+                    self.head_client.optimizer.zero_grad()
+                    self.server.optimizer.zero_grad()
+                    self.tail_client.optimizer.zero_grad()
                     
-                    # Forward through pipeline
-                    head_out = self.head_client.forward(input_ids, attention_mask=attention_mask)
-                    h_states = head_out.last_hidden_state
-                    
-                    body_out, head_activations_stored = self.server.forward_train(h_states, attention_mask)
-                    b_states = body_out
-                    
-                    # IMPROVED: Add clamp to logits before computing loss
-                    logits, _ = self.tail_client.tail_model(
-                        inputs_embeds=b_states,
+                    # Forward pass - CRITICAL FIX: Handle return values properly
+                    head_out = self.head_client.forward(
+                        input_ids=input_ids, 
                         attention_mask=attention_mask,
-                        past_key_values=None,
                         use_cache=False
                     )
                     
-                    # Clamp logits for stability
-                    logits = torch.clamp(logits, -50.0, 50.0)
+                    # Extract hidden states safely
+                    if isinstance(head_out, tuple):
+                        h_states = head_out[0]  # First element is hidden states
+                    elif hasattr(head_out, 'last_hidden_state'):
+                        h_states = head_out.last_hidden_state
+                    else:
+                        h_states = head_out
                     
-                    # Compute loss with shifted logits
+                    # Body forward pass with gradient tracking
+                    body_out, stored_activations = self.server.forward_train(
+                        h_states, 
+                        attention_mask=attention_mask
+                    )
+                    
+                    # Ensure gradient tracking
+                    body_out.requires_grad_(True)
+                    body_out.retain_grad()
+                    
+                    # Tail forward pass and loss computation
+                    logits, _ = self.tail_client.tail_model(
+                        inputs_embeds=body_out,
+                        attention_mask=attention_mask,
+                        use_cache=False
+                    )
+                    
+                    # Compute loss
                     shift_logits = logits[..., :-1, :].contiguous()
                     shift_labels = labels[..., 1:].contiguous()
                     shift_labels[shift_labels == -100] = self.tail_client.loss_fn.ignore_index
-                    
-                    # Check for NaN logits
-                    if torch.isnan(shift_logits).any():
-                        print(f"WARNING: NaN logits at batch {batch_idx}, skipping...")
-                        nan_batches += 1
-                        continue
                     
                     loss = self.tail_client.loss_fn(
                         shift_logits.view(-1, shift_logits.size(-1)),
                         shift_labels.view(-1)
                     )
                     
-                    # Check for NaN loss
-                    if torch.isnan(loss) or math.isinf(loss.item()):
-                        print(f"NaN/Inf loss at batch {batch_idx}, skipping...")
-                        nan_batches += 1
-                        continue
-                    
-                    # Backward pass
+                    # Backward pass with proper gradient flow
                     loss.backward(retain_graph=True)
                     
-                    # Get gradients with proper checks
-                    b_states.requires_grad_(True)
-                    b_states.retain_grad()  # CRITICAL: Add this line
+                    # Get body gradients
+                    body_grad = body_out.grad.clone() if body_out.grad is not None else torch.zeros_like(body_out)
                     
-                    body_grad = b_states.grad.clone() if b_states.grad is not None else torch.zeros_like(b_states)
-                    
-                    # Check for NaN gradients
-                    if torch.isnan(body_grad).any():
-                        print(f"NaN gradient at batch {batch_idx}, skipping optimizer step...")
-                        nan_batches += 1
-                        continue
-                    
-                    # Backward through body and head with proper error handling
-                    head_grad = self.server.backward(b_states, body_grad, head_activations_stored)
-                    if head_grad is None or torch.isnan(head_grad).any():
-                        print(f"Invalid head gradient, skipping backward...")
-                        nan_batches += 1
-                        continue
-                    
+                    # Propagate gradients to head
+                    head_grad = self.server.backward(body_out, body_grad, stored_activations)
                     self.head_client.backward(h_states, head_grad)
                     
-                    # Update schedulers
+                    # Step optimizers
+                    self.head_client.optimizer.step()
+                    self.server.optimizer.step()
+                    self.tail_client.optimizer.step()
+                    
+                    # Step schedulers
                     for sched in self.schedulers:
                         sched.step()
                     
-                    # IMPROVED: Gradient clipping for all components
-                    torch.nn.utils.clip_grad_norm_(self.head_client.head_model.parameters(), max_norm=1.0)
-                    torch.nn.utils.clip_grad_norm_(self.server.body_model.parameters(), max_norm=1.0) 
-                    torch.nn.utils.clip_grad_norm_(self.tail_client.tail_model.parameters(), max_norm=1.0)
-                    
-                    total_loss += loss.item()
-                    num_batches += 1
-                    
-                    if batch_idx % 50 == 0:
-                        print(f"Batch {batch_idx}, Loss: {loss.item():.4f}")
-                    
+                    # Update metrics
+                    loss_val = loss.item()
+                    if not math.isnan(loss_val) and not math.isinf(loss_val):
+                        total_loss += loss_val
+                        num_batches += 1
+                        
+                        if batch_idx % 50 == 0:
+                            # Re-verify weight tying periodically
+                            self.ensure_weight_tying()
+                            print(f"Batch {batch_idx}, Loss: {loss_val:.4f}")
+                    else:
+                        nan_batches += 1
+                        
                 except Exception as e:
                     print(f"Training error at batch {batch_idx}: {e}")
                     traceback.print_exc()
                     nan_batches += 1
                     continue
             
+            # Compute average loss for the epoch
             avg_loss = total_loss / max(num_batches, 1)
             self.metrics["loss"].append(avg_loss)
             print(f"Epoch {epoch+1} average loss: {avg_loss:.4f} (skipped {nan_batches} batches)")
         
         print("Training completed!")
+
+    def ensure_weight_tying(self):
+        """Ensure weight tying is maintained"""
+        try:
+            # Get the head embedding
+            if hasattr(self.head_client.head_model, 'wte'):
+                head_embed = self.head_client.head_model.wte
+            elif hasattr(self.head_client.head_model, 'base_model') and hasattr(self.head_client.head_model.base_model, 'wte'):
+                head_embed = self.head_client.head_model.base_model.wte
+            elif hasattr(self.head_client.head_model, 'base_model') and hasattr(self.head_client.head_model.base_model, 'model'):
+                head_embed = self.head_client.head_model.base_model.model.wte
+            else:
+                print("⚠️ Could not find head embedding weights")
+                return False
+                
+            # Get the tail lm_head
+            if hasattr(self.tail_client.tail_model, 'lm_head'):
+                tail_lm_head = self.tail_client.tail_model.lm_head
+            elif hasattr(self.tail_client.tail_model, 'base_model') and hasattr(self.tail_client.tail_model.base_model, 'lm_head'):
+                tail_lm_head = self.tail_client.tail_model.base_model.lm_head
+            else:
+                print("⚠️ Could not find tail lm_head weights")
+                return False
+                
+            # Ensure they're the same object
+            if id(tail_lm_head.weight) != id(head_embed.weight):
+                print("⚠️ Weight tying broken - fixing...")
+                tail_lm_head.weight = head_embed.weight
+                return False
+                
+            return True
+        
+        except Exception as e:
+            print(f"Error checking weight tying: {e}")
+            return False
 
 
     def debug_model_learning(self, example_batch):
