@@ -454,7 +454,8 @@ class HeadClient:
         
     def forward(self, input_ids, attention_mask=None, position_ids=None, past_key_values=None, use_cache=True):
         """Forward pass through head layers with proper caching"""
-        if use_cache:
+        try:
+            # Get output from the head model
             output = self.head_model(
                 input_ids=input_ids, 
                 attention_mask=attention_mask,
@@ -463,23 +464,32 @@ class HeadClient:
                 use_cache=use_cache,
                 output_hidden_states=True
             )
-            last_hidden = output.last_hidden_state
-            past = output.past_key_values
-            return last_hidden, past
-        else:
-            output = self.head_model(
-                input_ids=input_ids, 
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                use_cache=False,
-                output_hidden_states=True
-            )
-            # Instead of returning just the tensor, return a BaseModelOutputWithPast object
-            return BaseModelOutputWithPast(
-                last_hidden_state=output.hidden_states[-1],
-                past_key_values=None,
-                hidden_states=output.hidden_states
-            )
+            
+            # CRITICAL FIX: Always return consistent output type (BaseModelOutputWithPast)
+            if isinstance(output, tuple):
+                # If output is a tuple (hidden_states, present_key_values)
+                hidden_states = output[0]
+                present_key_values = output[1] if len(output) > 1 else None
+                
+                return BaseModelOutputWithPast(
+                    last_hidden_state=hidden_states,
+                    past_key_values=present_key_values,
+                    hidden_states=[hidden_states]  # Put in a list for consistency
+                )
+            elif hasattr(output, 'last_hidden_state'):
+                # Output is already a BaseModelOutputWithPast, just return it
+                return output
+            else:
+                # Unexpected output type, wrap it safely
+                return BaseModelOutputWithPast(
+                    last_hidden_state=output,
+                    past_key_values=None,
+                    hidden_states=[output]
+                )
+                
+        except Exception as e:
+            print(f"Error in HeadClient forward pass: {str(e)}")
+            raise
     
     def backward(self, head_activations, head_grad):
         """ESSENTIAL: Backward pass for split learning"""
