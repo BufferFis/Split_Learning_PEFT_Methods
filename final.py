@@ -1026,17 +1026,15 @@ class SplitLoRATrainer:
         total_steps = self._sched_steps          # local alias, always defined
 
         # 2. Create one cosine scheduler per optimiser
-        from transformers import get_cosine_schedule_with_warmup
-        from transformers import get_constant_schedule_with_warmup
         from transformers import get_linear_schedule_with_warmup
-        scheduler_epochs = 6
+        scheduler_epochs = 3
         total_steps = len(train_dataloader) * scheduler_epochs
         for opt in (self.head_client.optimizer,
                     self.server.optimizer,
                     self.tail_client.optimizer):
             sched = get_linear_schedule_with_warmup(
                 opt,
-                num_warmup_steps=1000,      # ~3% of total steps
+                num_warmup_steps=500,      # ~3% of total steps
                 num_training_steps=total_steps,
                 last_epoch=-1
             )
