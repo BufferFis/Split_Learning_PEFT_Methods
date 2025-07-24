@@ -1043,12 +1043,12 @@ class SplitLoRATrainer:
                     b_states = body_out
 
                     # 3) Tail forward & compute loss
-                    logits = self.tail_client.tail_model(
-                        inputs_embeds=b_states,
-                        attention_mask=attention_mask,
-                        past_key_values=None,
-                        use_cache = False
-                    ).logits
+                    logits, _ = self.tail_client.tail_model(
+                    inputs_embeds=b_states,
+                    attention_mask=attention_mask,
+                    past_key_values=None,
+                    use_cache=False
+                )
 
                     # shift for CE
                     shift_logits = logits[..., :-1, :].contiguous()
