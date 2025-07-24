@@ -203,10 +203,7 @@ class SplitGPT2ForGeneration(PreTrainedModel, GenerationMixin):
                 tail_past = None
             
             # Combine all past key values
-            if use_cache:
-                present = (head_past, body_past, tail_past)
-            else:
-                present = None
+            present = (head_past, body_past, tail_past) if use_cache else None
             
             # Calculate loss if labels are provided
             loss = None
@@ -224,12 +221,21 @@ class SplitGPT2ForGeneration(PreTrainedModel, GenerationMixin):
                 loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), 
                                 shift_labels.view(-1))
             
-            # Return proper CausalLMOutput
-            return CausalLMOutput(
-                loss=loss,
-                logits=logits,
-                past_key_values=present
-            )
+            # Return proper CausalLMOutput - FIXED FOR COMPATIBILITY
+            # Check which parameters are accepted by CausalLMOutput in your version
+            try:
+                return CausalLMOutput(
+                    loss=loss,
+                    logits=logits,
+                    past_key_values=present
+                )
+            except TypeError:
+                # Fall back to a version without past_key_values
+                self.cached_past_key_values = present  # Store manually if not supported
+                return CausalLMOutput(
+                    loss=loss,
+                    logits=logits
+                )
             
         except Exception as e:
             print(f"Error in split model forward pass: {str(e)}")
