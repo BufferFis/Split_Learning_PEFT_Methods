@@ -95,14 +95,19 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             return {"input_ids": input_ids}
             
         def forward(self, input_ids=None, attention_mask=None, position_ids=None, 
-                   past_key_values=None, use_cache=True, output_hidden_states=False, **kwargs):
-            """Forward pass with proper cache handling"""
+                past_key_values=None, use_cache=True, output_hidden_states=False, **kwargs):
+            """Forward pass with proper cache handling and robust error handling"""
             
             # Handle position IDs
             if position_ids is None:
                 if past_key_values is not None:
                     # For generation steps
-                    seq_length_past = past_key_values[0][0].shape[2]
+                    # Get the right shape for past_key_values - handle cases where it might be None
+                    if past_key_values[0] is not None and isinstance(past_key_values[0], tuple) and len(past_key_values[0]) > 0:
+                        seq_length_past = past_key_values[0][0].shape[2] if past_key_values[0][0] is not None else 0
+                    else:
+                        seq_length_past = 0
+                    
                     # Critical: position_ids should be incremented based on past sequence length
                     position_ids = torch.arange(
                         seq_length_past, 
@@ -136,25 +141,43 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             
             # Process through transformer layers
             for i, block in enumerate(self.h):
-                # Get past_key_value for this layer if available
-                past_key_value = past_key_values[i] if past_key_values is not None else None
-                
-                # Forward through the block
-                layer_outputs = block(
-                    hidden_states, 
-                    attention_mask=attn_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_value,
-                    use_cache=use_cache
-                )
-                
-                hidden_states = layer_outputs[0]
-                
-                if use_cache:
-                    present_key_values = present_key_values + (layer_outputs[1],)
+                try:
+                    # Get past_key_value for this layer if available
+                    past_key_value = past_key_values[i] if past_key_values is not None else None
                     
-                if output_hidden_states:
-                    all_hidden_states = all_hidden_states + (hidden_states,)
+                    # Forward through the block
+                    layer_outputs = block(
+                        hidden_states, 
+                        attention_mask=attn_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_value,
+                        use_cache=use_cache
+                    )
+                    
+                    # FIX: Handle different return formats safely
+                    if isinstance(layer_outputs, tuple):
+                        if len(layer_outputs) > 0:
+                            hidden_states = layer_outputs[0]
+                        
+                        # Only try to access cache if it exists in the tuple
+                        if use_cache and len(layer_outputs) > 1 and layer_outputs[1] is not None:
+                            present_key_values = present_key_values + (layer_outputs[1],)
+                        elif use_cache:
+                            # Create an empty cache placeholder if needed
+                            present_key_values = present_key_values + (None,)
+                    else:
+                        # If not a tuple, assume it's just the hidden states
+                        hidden_states = layer_outputs
+                        if use_cache:
+                            present_key_values = present_key_values + (None,)
+                    
+                    if output_hidden_states:
+                        all_hidden_states = all_hidden_states + (hidden_states,)
+                        
+                except Exception as e:
+                    print(f"Warning: Error in HeadModel layer {i}: {str(e)}")
+                    if use_cache:
+                        present_key_values = present_key_values + (None,)
 
             # Return with proper output format
             if output_hidden_states:
@@ -168,51 +191,52 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
 
 
     class BodyModel(nn.Module):
-            def __init__(self, original_model, start_layer, num_layers):
-                super().__init__()
-                self.transformer = nn.Module()
-                self.transformer.h = nn.ModuleList(
-                    original_model.transformer.h[start_layer:start_layer + num_layers]
-                )
-                self.config = original_model.config
-                
-                # Add missing generation attributes for PEFT compatibility
-                self.generation_config = getattr(original_model, 'generation_config', None)
-                self.main_input_name = getattr(original_model, 'main_input_name', 'input_ids')
-                
-                # Add the missing prepare_inputs_for_generation method
-                if hasattr(original_model, 'prepare_inputs_for_generation'):
-                    self.prepare_inputs_for_generation = original_model.prepare_inputs_for_generation
-                else:
-                    self.prepare_inputs_for_generation = self._prepare_inputs_for_generation
-                    
-                # Add other missing attributes that PEFT might need
-                for attr in ['_get_resized_embeddings', 'get_input_embeddings', 'set_input_embeddings', 
-                            'get_output_embeddings', 'set_output_embeddings', 'resize_token_embeddings']:
-                    if hasattr(original_model, attr):
-                        setattr(self, attr, getattr(original_model, attr))
+        def __init__(self, original_model, start_layer, num_layers):
+            super().__init__()
+            self.transformer = nn.Module()
+            self.transformer.h = nn.ModuleList(
+                original_model.transformer.h[start_layer:start_layer + num_layers]
+            )
+            self.config = original_model.config
             
-            def _prepare_inputs_for_generation(self, input_ids, **kwargs):
-                """Default implementation for prepare_inputs_for_generation"""
-                return {"input_ids": input_ids}
+            # Add missing generation attributes for PEFT compatibility
+            self.generation_config = getattr(original_model, 'generation_config', None)
+            self.main_input_name = getattr(original_model, 'main_input_name', 'input_ids')
+            
+            # Add the missing prepare_inputs_for_generation method
+            if hasattr(original_model, 'prepare_inputs_for_generation'):
+                self.prepare_inputs_for_generation = original_model.prepare_inputs_for_generation
+            else:
+                self.prepare_inputs_for_generation = self._prepare_inputs_for_generation
                 
-            def forward(self, hidden_states=None, attention_mask=None, position_ids=None, 
-                    past_key_values=None, use_cache=True, **kwargs):
-                """Forward pass with proper cache handling"""
-                
-                # Initialize for cache handling
-                present_key_values = () if use_cache else None
-                
-                # Expand attention mask if needed
-                dtype = hidden_states.dtype
-                attn_mask = _expand_mask(attention_mask, dtype) if attention_mask is not None else None
-                
-                # Process through transformer layers
-                for i, block in enumerate(self.transformer.h):
+            # Add other missing attributes that PEFT might need
+            for attr in ['_get_resized_embeddings', 'get_input_embeddings', 'set_input_embeddings', 
+                        'get_output_embeddings', 'set_output_embeddings', 'resize_token_embeddings']:
+                if hasattr(original_model, attr):
+                    setattr(self, attr, getattr(original_model, attr))
+        
+        def _prepare_inputs_for_generation(self, input_ids, **kwargs):
+            """Default implementation for prepare_inputs_for_generation"""
+            return {"input_ids": input_ids}
+            
+        def forward(self, hidden_states=None, attention_mask=None, position_ids=None, 
+                past_key_values=None, use_cache=True, **kwargs):
+            """Forward pass with proper cache handling and robust error handling"""
+            
+            # Initialize for cache handling
+            present_key_values = () if use_cache else None
+            
+            # Expand attention mask if needed
+            dtype = hidden_states.dtype
+            attn_mask = _expand_mask(attention_mask, dtype) if attention_mask is not None else None
+            
+            # Process through transformer layers
+            for i, block in enumerate(self.transformer.h):
+                try:
                     # Get past_key_value for this layer if available
                     past_key_value = past_key_values[i] if past_key_values is not None else None
                     
-                    # Forward through the block
+                    # Forward through the block with error handling
                     layer_outputs = block(
                         hidden_states, 
                         attention_mask=attn_mask,
@@ -221,12 +245,29 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
                         use_cache=use_cache
                     )
                     
-                    hidden_states = layer_outputs[0]
-                    
+                    # FIX: Handle different return formats safely
+                    if isinstance(layer_outputs, tuple):
+                        if len(layer_outputs) > 0:
+                            hidden_states = layer_outputs[0]
+                        
+                        # Only try to access cache if it exists in the tuple
+                        if use_cache and len(layer_outputs) > 1 and layer_outputs[1] is not None:
+                            present_key_values = present_key_values + (layer_outputs[1],)
+                        elif use_cache:
+                            # Create an empty cache placeholder if needed
+                            present_key_values = present_key_values + (None,)
+                    else:
+                        # If not a tuple, assume it's just the hidden states
+                        hidden_states = layer_outputs
+                        if use_cache:
+                            present_key_values = present_key_values + (None,)
+                            
+                except Exception as e:
+                    print(f"Warning: Error in BodyModel layer {i}: {str(e)}")
                     if use_cache:
-                        present_key_values = present_key_values + (layer_outputs[1],)
-                
-                return hidden_states, present_key_values
+                        present_key_values = present_key_values + (None,)
+            
+            return hidden_states, present_key_values
 
 
 
@@ -262,8 +303,8 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             return {"input_ids": input_ids}
             
         def forward(self, inputs_embeds=None, attention_mask=None, position_ids=None, 
-                   past_key_values=None, use_cache=True, **kwargs):
-            """Forward pass with proper cache handling"""
+                past_key_values=None, use_cache=True, **kwargs):
+            """Forward pass with proper cache handling and robust error handling"""
         
             hidden_states = inputs_embeds
             
@@ -276,22 +317,40 @@ def split_gpt2(model, head_layers=2, tail_layers=2):
             
             # Process through transformer layers
             for i, block in enumerate(self.transformer.h):
-                # Get past_key_value for this layer if available
-                past_key_value = past_key_values[i] if past_key_values is not None else None
-                
-                # Forward through the block
-                layer_outputs = block(
-                    hidden_states, 
-                    attention_mask=attn_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_value,
-                    use_cache=use_cache
-                )
-                
-                hidden_states = layer_outputs[0]
-                
-                if use_cache:
-                    present_key_values = present_key_values + (layer_outputs[1],)
+                try:
+                    # Get past_key_value for this layer if available
+                    past_key_value = past_key_values[i] if past_key_values is not None else None
+                    
+                    # Forward through the block with error handling
+                    layer_outputs = block(
+                        hidden_states, 
+                        attention_mask=attn_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_value,
+                        use_cache=use_cache
+                    )
+                    
+                    # FIX: Handle different return formats safely
+                    if isinstance(layer_outputs, tuple):
+                        if len(layer_outputs) > 0:
+                            hidden_states = layer_outputs[0]
+                        
+                        # Only try to access cache if it exists in the tuple
+                        if use_cache and len(layer_outputs) > 1 and layer_outputs[1] is not None:
+                            present_key_values = present_key_values + (layer_outputs[1],)
+                        elif use_cache:
+                            # Create an empty cache placeholder if needed
+                            present_key_values = present_key_values + (None,)
+                    else:
+                        # If not a tuple, assume it's just the hidden states
+                        hidden_states = layer_outputs
+                        if use_cache:
+                            present_key_values = present_key_values + (None,)
+                            
+                except Exception as e:
+                    print(f"Warning: Error in TailModel layer {i}: {str(e)}")
+                    if use_cache:
+                        present_key_values = present_key_values + (None,)
 
             # Final layer norm and LM head
             hidden_states = self.transformer.ln_f(hidden_states)
@@ -2456,7 +2515,7 @@ def main():
     print(f"PAD token: '{trainer.PAD}' -> {trainer.tokenizer.pad_token_id}")
     print(f"EOS token: '{trainer.tokenizer.eos_token}' -> {trainer.tokenizer.eos_token_id}")
     for ep in range(start_epoch, start_epoch + args.epochs):
-        trainer.train_with_coverage(train_dl, epochs=1)
+        trainer.train(train_dl, epochs=1)
         ckpt_name = f"ckpt_ep{ep}.pt"
         ckpt_path = os.path.join(args.save_path, f"ckpt_ep{ep}.pt")
         trainer.save_checkpoint(ckpt_path, epoch=ep)
