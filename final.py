@@ -1040,11 +1040,66 @@ class SplitLoRATrainer:
             )
             self.schedulers.append(sched)
 
+    def check_labels_before_training(self, train_dataloader):
+        """Verify that labels are correctly set up before training"""
+        print("Checking label quality in the first batch...")
+        
+        # Get first batch
+        batch = next(iter(train_dataloader))
+        input_ids = batch["input_ids"]
+        labels = batch["labels"]
+        
+        # Check how many labels are not masked
+        total_labels = labels.numel()
+        masked_labels = (labels == -100).sum().item()
+        non_masked = total_labels - masked_labels
+        
+        print(f"Total labels: {total_labels}")
+        print(f"Non-masked labels: {non_masked} ({non_masked/total_labels*100:.2f}%)")
+        
+        if non_masked == 0:
+            print("❌ CRITICAL ERROR: All labels are masked! Training will not work.")
+            return False
+        
+        # Calculate ratio of labels to tokens (helps identify if masking is working)
+        ratio = non_masked / total_labels
+        print(f"Label-to-token ratio: {ratio:.3f} (typically 0.4-0.7 for E2E data)")
+        
+        return non_masked > 0
 
+    def generate_during_training(self, wrapper, epoch, batch_idx, n_samples=3):
+        """Generate a few samples during training to observe progress"""
+        if not hasattr(self, 'evaluation_examples'):
+            # Create a few standard examples for consistent tracking
+            self.evaluation_examples = [
+                "name[The Eagle], eatType[pub], food[Japanese], area[riverside]",
+                "name[Blue Spice], eatType[coffee shop], area[city centre]",
+                "name[Giraffe], eatType[restaurant], food[French], priceRange[moderate]"
+            ]
+        
+        print(f"\n=== GENERATION SAMPLES (Epoch {epoch}, Batch {batch_idx}) ===")
+        
+        for i, mr in enumerate(self.evaluation_examples[:n_samples]):
+            prompt = mr + " " + self.DELIM + " "
+            enc = self.tokenizer(prompt, return_tensors="pt")
+            ids = enc["input_ids"].to(device)
+            
+            with torch.no_grad():
+                output = wrapper.generate(
+                    ids,
+                    max_new_tokens=30,
+                    do_sample=False,  # Deterministic for comparison
+                    num_beams=1,
+                    temperature=1.0
+                )
+            
+            result = self.tokenizer.decode(output[0][ids.size(1):], skip_special_tokens=True).strip()
+            print(f"Example {i+1}: '{mr}'")
+            print(f"Generated: '{result}'\n")
 
 
     def validate_model_sanity(self):
-        """Check if model can generate basic English using the wrapper"""
+        """Enhanced sanity check using E2E format inputs"""
         try:
             from split_beam_wrapper import SplitGPT2ForGeneration
             
@@ -1060,52 +1115,87 @@ class SplitLoRATrainer:
             # Make sure weight tying is intact before generation
             self.ensure_weight_tying()
             
-            test_prompt = "The restaurant is"
-            enc = self.tokenizer(test_prompt, return_tensors="pt")
-            ids = enc["input_ids"].to(device)
+            # Test both simple prompt and E2E format
+            test_prompts = [
+                "The restaurant is",  # Simple sanity check
+                "name[The Eagle], eatType[pub], food[Japanese], area[riverside]"  # E2E format
+            ]
             
-            with torch.no_grad():
-                # Use simpler generation parameters
-                try:
-                    output = temp_wrapper.generate(
-                        ids,
-                        max_new_tokens=20,        
-                        do_sample=False,           # Pure greedy
-                        num_beams=1,              # No beam search
-                        use_cache=True,           # Enable caching
-                        eos_token_id=self.tokenizer.eos_token_id,
-                        pad_token_id=self.tokenizer.pad_token_id
-                    )
+            results = []
+            for prompt in test_prompts:
+                # Prepare prompt (add delimiter for E2E format)
+                if "[" in prompt:
+                    # This is an E2E format prompt, add delimiter
+                    full_prompt = prompt + " " + self.DELIM + " "
+                else:
+                    # Simple text prompt
+                    full_prompt = prompt
                     
-                    result = self.tokenizer.decode(output[0], skip_special_tokens=True)
-                    print(f"Sanity check: '{result}'")
-                    
-                    # Check if output contains mostly punctuation/symbols
-                    text_part = result[len(test_prompt):].strip()
-                    
-                    if not text_part:
-                        print("❌ MODEL GENERATING NOTHING - TRAINING FAILING")
-                        return False
+                enc = self.tokenizer(full_prompt, return_tensors="pt")
+                ids = enc["input_ids"].to(device)
+                
+                with torch.no_grad():
+                    try:
+                        output = temp_wrapper.generate(
+                            ids,
+                            max_new_tokens=40,        
+                            do_sample=False,           # Pure greedy for deterministic testing
+                            num_beams=1,              # No beam search
+                            use_cache=True,           # Enable caching
+                            eos_token_id=self.tokenizer.eos_token_id,
+                            pad_token_id=self.tokenizer.pad_token_id
+                        )
                         
-                    symbol_ratio = sum(1 for c in text_part if c in '|[](){}') / max(len(text_part), 1)
-                    
-                    if symbol_ratio > 0.3:
-                        print(f"❌ MODEL GENERATING GIBBERISH ({symbol_ratio:.2f} symbol ratio) - TRAINING FAILING")
+                        result = self.tokenizer.decode(output[0], skip_special_tokens=True)
+                        results.append((prompt, result))
+                    except Exception as inner_e:
+                        print(f"⚠️ Generation failed for prompt '{prompt}': {str(inner_e)}")
+                        import traceback
+                        traceback.print_exc()
                         return False
+            
+            # Analyze and display results
+            for prompt, result in results:
+                print(f"\nSanity check for: '{prompt}'")
+                print(f"Generated: '{result}'")
+                
+                # Check if output contains mostly punctuation/symbols
+                if "[" in prompt:  # E2E format
+                    # Get the part after delimiter
+                    delim_pos = result.find(self.DELIM)
+                    if delim_pos >= 0:
+                        text_part = result[delim_pos + len(self.DELIM):].strip()
                     else:
-                        print(f"✅ Model generating reasonable text ({len(text_part)} chars)")
-                        return True
-                except Exception as inner_e:
-                    print(f"⚠️ Generation failed in sanity check: {str(inner_e)}")
-                    import traceback
-                    traceback.print_exc()
+                        text_part = result[len(prompt):].strip()
+                else:
+                    text_part = result[len(prompt):].strip()
+                
+                if not text_part:
+                    print("❌ MODEL GENERATING NOTHING - TRAINING FAILING")
                     return False
+                    
+                symbol_ratio = sum(1 for c in text_part if c in '|[](){}') / max(len(text_part), 1)
+                
+                if symbol_ratio > 0.3:
+                    print(f"❌ MODEL GENERATING GIBBERISH ({symbol_ratio:.2f} symbol ratio) - TRAINING FAILING")
+                    return False
+                
+                # For E2E format, check if any attributes are mentioned
+                if "[" in prompt:
+                    attributes = re.findall(r'(\w+)\[([^\]]+)\]', prompt)
+                    mentions = sum(1 for attr_name, attr_value in attributes 
+                                if attr_value.lower() in text_part.lower())
+                    coverage = mentions / max(len(attributes), 1)
+                    print(f"✅ E2E attribute coverage: {coverage:.2f} ({mentions}/{len(attributes)})")
+            
+            print(f"✅ Model generating reasonable text for all prompts")
+            return True
                     
         except Exception as e:
             print(f"⚠️ Sanity check failed: {str(e)}")
             import traceback
             traceback.print_exc()
-            return False  # Changed to return False to indicate failure
+            return False
 
     def check_wrapper_functionality(self):
         """Diagnostic function to check if the wrapper is working correctly"""
@@ -1312,10 +1402,26 @@ class SplitLoRATrainer:
 
                     if batch_idx % 50 == 0:
                         print(f"Batch {batch_idx}, Loss: {loss.item():.4f}")
+                    # In train() method, add this alongside your periodic sanity checks
+                    if batch_idx > 0 and batch_idx % 500 == 0:
+                        # Create a temporary wrapper for evaluation
+                        eval_wrapper = SplitGPT2ForGeneration(
+                            tokenizer=self.tokenizer,
+                            head_client=self.head_client,
+                            server=self.server,
+                            tail_client=self.tail_client,
+                            base_config=self.head_client.head_model.base_model.config
+                        ).to(device).eval()
+                        
+                        # Generate some samples
+                        self.generate_during_training(eval_wrapper, epoch+1, batch_idx)
+    
+    # Continue with other sanity checks...
                 except Exception as e:
                     print(f"Error in backward pass: {e}. Skipping batch.")
                     nan_batches += 1
                     continue
+
 
             avg = total_loss / max(num_batches, 1)
             self.metrics["loss"].append(avg)
