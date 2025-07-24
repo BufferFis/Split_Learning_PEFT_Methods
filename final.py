@@ -562,7 +562,7 @@ class TailClient:
         )
         return output if not use_cache else (output, present)
     
-    def compute_loss_and_backward(self, body_activations, labels, attention_mask=None):
+    def compute_loss_and_backward(self, body_activations, labels, attention_mask=None, position_ids=None):
         """FIXED: Add retain_grad() for non-leaf tensors"""
         self.optimizer.zero_grad()
         
@@ -574,6 +574,7 @@ class TailClient:
         logits, _ = self.tail_model(
             inputs_embeds=body_activations,
             attention_mask=attention_mask,
+            position_ids=position_ids,  # Pass position_ids
             use_cache=False
         )
         logits = torch.clamp(logits, -50.0, 50.0)
@@ -1086,12 +1087,16 @@ class SplitLoRATrainer:
             
             with torch.no_grad():
                 output = wrapper.generate(
-                    ids,
-                    max_new_tokens=30,
-                    do_sample=False,  # Deterministic for comparison
-                    num_beams=1,
-                    temperature=1.0
-                )
+                ids,
+                max_new_tokens=30,
+                do_sample=True,
+                temperature=0.8,  # Slightly lower temperature for more focused outputs
+                top_p=0.92,
+                repetition_penalty=1.5,  # Stronger repetition penalty
+                no_repeat_ngram_size=3,  # Don't allow 3-grams to repeat
+                eos_token_id=self.trainer.tokenizer.eos_token_id,
+                pad_token_id=self.trainer.tokenizer.pad_token_id
+            )
             
             result = self.tokenizer.decode(output[0][ids.size(1):], skip_special_tokens=True).strip()
             print(f"Example {i+1}: '{mr}'")
@@ -1594,6 +1599,10 @@ class SplitLoRATrainer:
                     attention_mask = batch["attention_mask"].to(device)
                     labels = batch["labels"].to(device)
                     
+                    # Create position IDs for the input sequence - CRITICAL FIX
+                    position_ids = torch.arange(0, input_ids.shape[1], dtype=torch.long, device=input_ids.device)
+                    position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
+
                     # Debug on first few batches
                     if batch_idx < 3:
                         non_mask_labels = (labels != -100).sum().item()
@@ -1610,6 +1619,7 @@ class SplitLoRATrainer:
                     head_out = self.head_client.forward(
                         input_ids=input_ids, 
                         attention_mask=attention_mask,
+                        position_ids=position_ids,
                         use_cache=False
                     )
                     
@@ -1624,7 +1634,8 @@ class SplitLoRATrainer:
                     # Body forward pass with gradient tracking
                     body_out, stored_activations = self.server.forward_train(
                         h_states, 
-                        attention_mask=attention_mask
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
                     )
                     
                     # Ensure gradient tracking
@@ -1635,6 +1646,7 @@ class SplitLoRATrainer:
                     logits, _ = self.tail_client.tail_model(
                         inputs_embeds=body_out,
                         attention_mask=attention_mask,
+                        position_ids=position_ids,
                         use_cache=False
                     )
                     

@@ -52,68 +52,77 @@ class SplitGPT2ForGeneration(PreTrainedModel, GenerationMixin):
         self.tail_past_key_values = None
 
     # GenerationMixin hook with proper growing attention mask
+    # Replace the prepare_inputs_for_generation method in SplitGPT2ForGeneration
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, **kwargs):
-        # Only the last token for inputs_ids if past is defined
-        if past_key_values is not None:
-            # Extract the head component's past from the tuple structure
-            if isinstance(past_key_values, tuple) and len(past_key_values) > 0:
-                head_past = past_key_values[0]
-                # Get sequence length from first layer's key tensor
-                if isinstance(head_past, tuple) and len(head_past) > 0 and isinstance(head_past[0], tuple):
-                    seq_length_past = head_past[0][0].shape[2]
-                else:
-                    # Fallback if structure is different
-                    seq_length_past = 1
-            else:
-                seq_length_past = 1
-                
-            input_ids = input_ids[:, -1:]
-            
-            # CRITICAL FIX: Grow attention mask to match the full sequence length
-            if attention_mask is not None:
-                batch_size = input_ids.shape[0]
-                
-                # Create a new attention mask of the correct total length
-                total_length = seq_length_past + input_ids.shape[1]
-                
-                # Create new attention mask of the right size
-                new_attention_mask = torch.ones(
-                    (batch_size, total_length), 
-                    dtype=attention_mask.dtype, 
-                    device=attention_mask.device
-                )
-                
-                # Copy over the old values and set new position to 1
-                if attention_mask.size(1) >= seq_length_past:
-                    new_attention_mask[:, :seq_length_past] = attention_mask[:, :seq_length_past]
-                else:
-                    # Handle case where attention mask is smaller than past sequence
-                    new_attention_mask[:, :attention_mask.size(1)] = attention_mask
-                
-                attention_mask = new_attention_mask
+        """Properly prepare inputs with consistent attention masks and position IDs"""
         
-        # Prepare position IDs (critical for generation)
-        position_ids = None
+        # 1. Handle past key values and determine sequence length
         if past_key_values is not None:
-            # For generation steps after the first, set position IDs to the last position + 1
-            position_ids = torch.full(
-                (input_ids.shape[0], input_ids.shape[1]),
-                seq_length_past,  # Position = length of past sequence
-                dtype=torch.long,
-                device=input_ids.device
-            )
+            # Get sequence length from past cache - properly handle nested tuple structure
+            if isinstance(past_key_values, tuple) and len(past_key_values) >= 1:
+                # Extract head component's past
+                head_past = past_key_values[0]
+                if isinstance(head_past, tuple) and len(head_past) > 0 and head_past[0] is not None:
+                    # Access first layer's key cache size (batch, head, seq, dim)
+                    if isinstance(head_past[0], tuple) and len(head_past[0]) >= 2:
+                        seq_length_past = head_past[0][0].shape[2]  # [batch, head, seq, dim]
+                    else:
+                        seq_length_past = 1
+                else:
+                    seq_length_past = 0
+                
+                # Only use the last token from input_ids for incremental generation
+                input_ids = input_ids[:, -1:]
+            else:
+                # No valid cache found
+                seq_length_past = 0
         else:
-            # First generation step, create position IDs for the full sequence
-            position_ids = torch.arange(
-                0, input_ids.shape[1], dtype=torch.long, device=input_ids.device
-            ).unsqueeze(0).expand(input_ids.shape[0], -1)
+            # No past provided
+            seq_length_past = 0
+        
+        # 2. Fix attention mask - CRITICAL for preventing repetition
+        if attention_mask is not None and past_key_values is not None and seq_length_past > 0:
+            # We need to grow the attention mask to include both past and current tokens
+            batch_size = input_ids.shape[0]
+            new_seq_length = seq_length_past + input_ids.shape[1]
             
+            # Create new attention mask with right dimensions
+            new_attention_mask = torch.ones(
+                (batch_size, new_seq_length), 
+                dtype=attention_mask.dtype, 
+                device=attention_mask.device
+            )
+            
+            # Copy old attention values for past positions
+            if attention_mask.size(1) >= seq_length_past:
+                new_attention_mask[:, :seq_length_past] = attention_mask[:, :seq_length_past]
+            
+            attention_mask = new_attention_mask
+        
+        # 3. Fix position IDs - CRITICAL for preventing repetition
+        if kwargs.get("use_cache", True) and past_key_values is not None:
+            # Create position IDs that point to the positions after past sequence
+            position_ids = torch.arange(
+                seq_length_past,
+                seq_length_past + input_ids.shape[1], 
+                dtype=torch.long, 
+                device=input_ids.device
+            ).unsqueeze(0).expand(input_ids.shape[0], -1)
+        else:
+            # For first generation step or when not using cache
+            position_ids = torch.arange(
+                0, 
+                input_ids.shape[1], 
+                dtype=torch.long, 
+                device=input_ids.device
+            ).unsqueeze(0).expand(input_ids.shape[0], -1)
+        
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "past_key_values": past_key_values,
             "position_ids": position_ids,
-            "use_cache": True,  # Always enable caching during generation
+            "use_cache": kwargs.get("use_cache", True)
         }
 
     def can_generate(self):  # required by ≥4.39
