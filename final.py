@@ -1003,6 +1003,7 @@ class SplitLoRATrainer:
         for epoch in range(epochs):
             total_loss = 0.0
             num_batches = 0
+            nan_batches = 0  # Track NaN batches for debugging
 
             for batch_idx, batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{epochs}")):
                 # Periodically clear CUDA cache to reduce fragmentation
@@ -1044,64 +1045,106 @@ class SplitLoRATrainer:
 
                     # 3) Tail forward & compute loss
                     logits, _ = self.tail_client.tail_model(
-                    inputs_embeds=b_states,
-                    attention_mask=attention_mask,
-                    past_key_values=None,
-                    use_cache=False
-                )
+                        inputs_embeds=b_states,
+                        attention_mask=attention_mask,
+                        past_key_values=None,
+                        use_cache=False
+                    )
+                    
+                    # ADDED: Clamp logits to prevent extreme values (critical for stability)
+                    logits = torch.clamp(logits, -50.0, 50.0)
 
                     # shift for CE
                     shift_logits = logits[..., :-1, :].contiguous()
                     shift_labels = labels[..., 1:].contiguous()
                     shift_labels[shift_labels == -100] = self.tail_client.loss_fn.ignore_index
+                    
+                    # ADDED: Check for NaN in logits
+                    if torch.isnan(shift_logits).any():
+                        print(f"WARNING: NaN detected in logits at batch {batch_idx}. Skipping batch.")
+                        nan_batches += 1
+                        continue
+                    
                     base_loss = self.tail_client.loss_fn(
                         shift_logits.view(-1, shift_logits.size(-1)),
                         shift_labels.view(-1),
                     )
 
-                    # coverage penalty
+                    # MODIFIED: Safer coverage penalty calculation with try-except
                     penalty = 0.0
-                    for i, mr in enumerate(mr_texts):
-                        pred_ids = torch.argmax(shift_logits[i], dim=-1)
-                        pred_txt = self.tokenizer.decode(pred_ids, skip_special_tokens=True)
-                        cov = self.tail_client.validate_coverage(mr, pred_txt)
-                        penalty += (1.0 - cov["coverage_ratio"]) * 0.2
-                    loss = base_loss + penalty / max(len(mr_texts), 1)
+                    try:
+                        for i, mr in enumerate(mr_texts):
+                            # Only process if we have valid logits for this sequence
+                            if i < shift_logits.size(0):
+                                pred_ids = torch.argmax(shift_logits[i], dim=-1)
+                                pred_txt = self.tokenizer.decode(pred_ids, skip_special_tokens=True)
+                                cov = self.tail_client.validate_coverage(mr, pred_txt)
+                                penalty += (1.0 - cov["coverage_ratio"]) * 0.2
+                        
+                        # Add small epsilon to prevent division by zero
+                        loss = base_loss + penalty / (len(mr_texts) + 1e-8)
+                    except Exception as e:
+                        print(f"Coverage penalty calculation failed: {e}. Using base loss.")
+                        loss = base_loss
+                    
+                    # ADDED: Check for NaN or Inf loss
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        print(f"WARNING: NaN/Inf loss at batch {batch_idx}. Using base loss only.")
+                        loss = base_loss
+                        # If base loss is also NaN, skip this batch
+                        if torch.isnan(loss) or torch.isinf(loss):
+                            print("Base loss is also NaN/Inf. Skipping batch.")
+                            nan_batches += 1
+                            continue
 
-                # 4) backward with scaler
-                scaler.scale(loss).backward(retain_graph=True)
+                # 4) backward with scaler (only if loss is valid)
+                try:
+                    scaler.scale(loss).backward(retain_graph=True)
+                    
+                    # 5) retrieve body grads and propagate
+                    body_grad = b_states.grad.clone() if b_states.grad is not None else torch.zeros_like(b_states)
+                    
+                    # ADDED: Check for NaN in gradients
+                    if torch.isnan(body_grad).any():
+                        print(f"WARNING: NaN gradient at batch {batch_idx}. Skipping optimizer step.")
+                        nan_batches += 1
+                        continue
+                        
+                    head_grad = self.server.backward(b_states, body_grad, h_states)
+                    self.head_client.backward(h_states, head_grad)
 
-                # 5) retrieve body grads and propagate
-                body_grad = b_states.grad.clone() if b_states.grad is not None else torch.zeros_like(b_states)
-                head_grad = self.server.backward(b_states, body_grad, h_states)
-                self.head_client.backward(h_states, head_grad)
+                    # 6) unscale & clip (more aggressive clipping)
+                    for opt in (self.head_client.optimizer, self.server.optimizer, self.tail_client.optimizer):
+                        scaler.unscale_(opt)
+                        
+                    # More aggressive clipping
+                    torch.nn.utils.clip_grad_norm_(self.head_client.head_model.parameters(), 0.5)  # Reduced from 1.0
+                    torch.nn.utils.clip_grad_norm_(self.server.body_model.parameters(), 0.5)
+                    torch.nn.utils.clip_grad_norm_(self.tail_client.tail_model.parameters(), 0.5)
 
-                # 6) unscale & clip
-                for opt in (self.head_client.optimizer, self.server.optimizer, self.tail_client.optimizer):
-                    scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(self.head_client.head_model.parameters(), 1.0)
-                torch.nn.utils.clip_grad_norm_(self.server.body_model.parameters(), 1.0)
-                torch.nn.utils.clip_grad_norm_(self.tail_client.tail_model.parameters(), 1.0)
+                    # 7) optimizer steps & scaler update
+                    scaler.step(self.head_client.optimizer)
+                    scaler.step(self.server.optimizer)
+                    scaler.step(self.tail_client.optimizer)
+                    scaler.update()
 
-                # 7) optimizer steps & scaler update
-                scaler.step(self.head_client.optimizer)
-                scaler.step(self.server.optimizer)
-                scaler.step(self.tail_client.optimizer)
-                scaler.update()
+                    # 8) scheduler step
+                    for sched in self.schedulers:
+                        sched.step()
 
-                # 8) scheduler step
-                for sched in self.schedulers:
-                    sched.step()
+                    total_loss += loss.item()
+                    num_batches += 1
 
-                total_loss += loss.item()
-                num_batches += 1
-
-                if batch_idx % 50 == 0:
-                    print(f"Batch {batch_idx}, Loss: {loss.item():.4f}")
+                    if batch_idx % 50 == 0:
+                        print(f"Batch {batch_idx}, Loss: {loss.item():.4f}")
+                except Exception as e:
+                    print(f"Error in backward pass: {e}. Skipping batch.")
+                    nan_batches += 1
+                    continue
 
             avg = total_loss / max(num_batches, 1)
             self.metrics["loss"].append(avg)
-            print(f"Epoch {epoch+1} average loss: {avg:.4f}")
+            print(f"Epoch {epoch+1} average loss: {avg:.4f} (skipped {nan_batches} batches with NaN)")
 
 
 
@@ -2413,7 +2456,7 @@ def main():
     print(f"PAD token: '{trainer.PAD}' -> {trainer.tokenizer.pad_token_id}")
     print(f"EOS token: '{trainer.tokenizer.eos_token}' -> {trainer.tokenizer.eos_token_id}")
     for ep in range(start_epoch, start_epoch + args.epochs):
-        trainer.train(train_dl, epochs=1)
+        trainer.train_with_coverage(train_dl, epochs=1)
         ckpt_name = f"ckpt_ep{ep}.pt"
         ckpt_path = os.path.join(args.save_path, f"ckpt_ep{ep}.pt")
         trainer.save_checkpoint(ckpt_path, epoch=ep)
