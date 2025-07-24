@@ -1438,8 +1438,14 @@ class SplitLoRATrainer:
         }
 
     def train(self, train_dataloader, epochs=1):
-        """Fixed training method that ensures proper gradient flow"""
+        """Fixed training method with proper indentation for batch processing"""
         print(f"Starting training for {epochs} epochs...")
+        
+        # Initial sanity check before training
+        print("Performing initial sanity check...")
+        initial_check = self.validate_model_sanity()
+        if not initial_check:
+            print("⚠️ Initial sanity check failed - model may not generate properly")
         
         for epoch in range(epochs):
             total_loss = 0.0
@@ -1458,29 +1464,36 @@ class SplitLoRATrainer:
                 if batch_idx % 100 == 0:
                     torch.cuda.empty_cache()
                 
-                 # Periodic sanity check (every 500 batches)
-            if batch_idx > 0 and batch_idx % 500 == 0:
-                print(f"\nPerforming sanity check at batch {batch_idx}...")
-                # Switch to eval mode temporarily
-                self.head_client.head_model.eval()
-                self.server.body_model.eval()
-                self.tail_client.tail_model.eval()
-                
-                sanity_result = self.validate_model_sanity()
-                
-                # Switch back to training mode
-                self.head_client.head_model.train()
-                self.server.body_model.train()
-                self.tail_client.tail_model.train()
-                
-                if not sanity_result:
-                    print(f"❌ Sanity check failed at batch {batch_idx} - model is not generating properly")
-                    print("Continuing training but results may be poor")
+                # Periodic sanity check (every 500 batches)
+                if batch_idx > 0 and batch_idx % 500 == 0:
+                    print(f"\nPerforming sanity check at batch {batch_idx}...")
+                    # Switch to eval mode temporarily
+                    self.head_client.head_model.eval()
+                    self.server.body_model.eval()
+                    self.tail_client.tail_model.eval()
+                    
+                    sanity_result = self.validate_model_sanity()
+                    
+                    # Switch back to training mode
+                    self.head_client.head_model.train()
+                    self.server.body_model.train()
+                    self.tail_client.tail_model.train()
+                    
+                    if not sanity_result:
+                        print(f"❌ Sanity check failed at batch {batch_idx} - model is not generating properly")
+                        print("Continuing training but results may be poor")
 
                 try:
                     input_ids = batch["input_ids"].to(device)
                     attention_mask = batch["attention_mask"].to(device)
                     labels = batch["labels"].to(device)
+                    
+                    # Debug on first few batches
+                    if batch_idx < 3:
+                        non_mask_labels = (labels != -100).sum().item()
+                        print(f"Batch {batch_idx}: {non_mask_labels} non-masked labels out of {labels.numel()}")
+                        if non_mask_labels == 0:
+                            print("⚠️ WARNING: All labels are masked! Preprocessing issue detected.")
                     
                     # Reset gradients
                     self.head_client.optimizer.zero_grad()
