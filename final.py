@@ -2829,7 +2829,7 @@ def main():
             print("✅ Generating normal text - period prediction might be normal")
 
         # Run evaluation
-        results = trainer.evaluate_with_coverage(wrapper, test_ds, n_samples=len(test_ds))
+        results = trainer.evaluate_with_beam_search(wrapper, test_ds, n_samples=len(test_ds))
         results_file = os.path.join(args.save_path, "evaluation_results.json")
         with open(results_file, "w") as f:
             json.dump(results, f, indent=2)
