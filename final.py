@@ -1954,19 +1954,24 @@ class SplitLoRATrainer:
                 print("✅ Scheduler states loaded")
             
             # Restore random states for reproducibility
-            if "rng_state" in checkpoint:
-                torch.random.set_rng_state(checkpoint["rng_state"])
-                state = checkpoint.get("rng_state", None)
-                if state is not None:
-                    # ensure ByteTensor on CPU
-                    state = state.to(device='cpu', dtype=torch.uint8)
-                    try:
+            try:
+                if "rng_state" in checkpoint and checkpoint["rng_state"] is not None:
+                    state = checkpoint["rng_state"]
+                    if isinstance(state, torch.Tensor):
+                        state = state.to(device='cpu', dtype=torch.uint8)
                         torch.random.set_rng_state(state)
                         print("✅ RNG state restored")
-                    except TypeError:
-                        print("⚠️ Failed to restore RNG state; skipping")
+                    else:
+                        print(f"⚠️ RNG state has incorrect type: {type(state)}")
+            except Exception as e:
+                print(f"⚠️ RNG state restoration skipped: {str(e)}")
+                
             if "cuda_rng_states" in checkpoint and checkpoint["cuda_rng_states"]:
-                torch.cuda.set_rng_state_all(checkpoint["cuda_rng_states"])
+                try:
+                    torch.cuda.set_rng_state_all(checkpoint["cuda_rng_states"])
+                    print("✅ CUDA RNG states restored")
+                except Exception as e:
+                    print(f"⚠️ CUDA RNG state restoration skipped: {str(e)}")
             
             # Set models to training mode
             self.head_client.head_model.train()
