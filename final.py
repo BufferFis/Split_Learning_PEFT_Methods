@@ -1090,7 +1090,7 @@ class SplitLoRATrainer:
                 ids,
                 max_new_tokens=30,
                 do_sample=True,
-                temperature=0.8,  # Slightly lower temperature for more focused outputs
+                temperature=0.7,  # Slightly lower temperature for more focused outputs
                 top_p=0.92,
                 repetition_penalty=1.5,  # Stronger repetition penalty
                 no_repeat_ngram_size=3,  # Don't allow 3-grams to repeat
@@ -1123,7 +1123,7 @@ class SplitLoRATrainer:
             # Test both simple prompt and E2E format
             test_prompts = [
                 "The restaurant is",  # Simple sanity check
-                "name[The Eagle], eatType[pub], food[Japanese], area[riverside]"  # E2E format
+                "name[Eagle], eatType[pub], food[Japanese], area[riverside]"  # E2E format
             ]
             
             results = []

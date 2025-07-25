@@ -56,31 +56,38 @@ class SplitGPT2ForGeneration(PreTrainedModel, GenerationMixin):
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, **kwargs):
         """Properly prepare inputs with consistent attention masks and position IDs"""
         
-        # 1. Handle past key values and determine sequence length
+        # Extract the head component's past for determining sequence length
+        head_past = None
         if past_key_values is not None:
-            # Get sequence length from past cache - properly handle nested tuple structure
+            # Try different ways of accessing the head past
             if isinstance(past_key_values, tuple) and len(past_key_values) >= 1:
-                # Extract head component's past
                 head_past = past_key_values[0]
+            elif hasattr(past_key_values, 'head_past'):
+                head_past = past_key_values.head_past
+            elif hasattr(self, 'head_past_key_values') and self.head_past_key_values is not None:
+                head_past = self.head_past_key_values
+        
+        # Determine sequence length from past
+        seq_length_past = 0
+        if head_past is not None:
+            try:
+                # Try to extract sequence length from the head's past
                 if isinstance(head_past, tuple) and len(head_past) > 0 and head_past[0] is not None:
-                    # Access first layer's key cache size (batch, head, seq, dim)
                     if isinstance(head_past[0], tuple) and len(head_past[0]) >= 2:
                         seq_length_past = head_past[0][0].shape[2]  # [batch, head, seq, dim]
                     else:
                         seq_length_past = 1
                 else:
                     seq_length_past = 0
-                
-                # Only use the last token from input_ids for incremental generation
-                input_ids = input_ids[:, -1:]
-            else:
-                # No valid cache found
+            except Exception as e:
+                print(f"Warning: Could not determine seq_length_past: {str(e)}")
                 seq_length_past = 0
-        else:
-            # No past provided
-            seq_length_past = 0
         
-        # 2. Fix attention mask - CRITICAL for preventing repetition
+        # Only use the last token for incremental generation when using past
+        if seq_length_past > 0:
+            input_ids = input_ids[:, -1:]
+            
+        # Fix attention mask - CRITICAL for preventing repetition
         if attention_mask is not None and past_key_values is not None and seq_length_past > 0:
             # We need to grow the attention mask to include both past and current tokens
             batch_size = input_ids.shape[0]
@@ -99,8 +106,8 @@ class SplitGPT2ForGeneration(PreTrainedModel, GenerationMixin):
             
             attention_mask = new_attention_mask
         
-        # 3. Fix position IDs - CRITICAL for preventing repetition
-        if kwargs.get("use_cache", True) and past_key_values is not None:
+        # Fix position IDs - CRITICAL for preventing repetition
+        if kwargs.get("use_cache", True) and seq_length_past > 0:
             # Create position IDs that point to the positions after past sequence
             position_ids = torch.arange(
                 seq_length_past,
@@ -154,7 +161,33 @@ class SplitGPT2ForGeneration(PreTrainedModel, GenerationMixin):
             if isinstance(past_key_values, tuple) and len(past_key_values) == 3:
                 head_past, body_past, tail_past = past_key_values
             else:
-                print(f"Warning: Invalid past_key_values format. Got {type(past_key_values)} with length {len(past_key_values) if hasattr(past_key_values, '__len__') else 'unknown'}")
+                try:
+                    # If the structure might have changed, try a different approach
+                    # This is critical for compatibility with HF GenerationMixin
+                    if hasattr(past_key_values, '__getitem__'):
+                        # Try to handle a flattened structure
+                        head_layers = len(self.head_client.head_model.h)
+                        body_layers = len(self.server.body_model.transformer.h)
+                        
+                        # Extract head component's past
+                        head_past = past_key_values[:head_layers] if len(past_key_values) > head_layers else None
+                        
+                        # Extract body component's past
+                        if len(past_key_values) > head_layers + body_layers:
+                            body_past = past_key_values[head_layers:head_layers+body_layers]
+                        else:
+                            body_past = None
+                        
+                        # Extract tail component's past
+                        if len(past_key_values) > head_layers + body_layers:
+                            tail_past = past_key_values[head_layers+body_layers:]
+                        else:
+                            tail_past = None
+                except Exception as e:
+                    print(f"Warning: Could not unpack past_key_values: {str(e)}")
+                    head_past = None
+                    body_past = None
+                    tail_past = None
         
         try:
             # Forward through head
@@ -230,6 +263,26 @@ class SplitGPT2ForGeneration(PreTrainedModel, GenerationMixin):
                 loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), 
                                 shift_labels.view(-1))
             
+            if use_cache:
+                # Create an explicit, labeled structure for the past key values
+                present = {
+                    "head_past": head_past,
+                    "body_past": body_past,
+                    "tail_past": tail_past
+                }
+                
+                # Also store the combined form for compatibility
+                self.head_past_key_values = head_past
+                self.body_past_key_values = body_past
+                self.tail_past_key_values = tail_past
+                
+                # Combine in the standard tuple form
+                present_combined = (head_past, body_past, tail_past)
+            else:
+                present = None
+                present_combined = None
+        
+        # Return proper CausalLMOutput with our structured past
             # Return proper CausalLMOutput - FIXED FOR COMPATIBILITY
             # Check which parameters are accepted by CausalLMOutput in your version
             try:
