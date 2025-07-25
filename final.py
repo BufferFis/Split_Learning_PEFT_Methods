@@ -1497,38 +1497,57 @@ class SplitLoRATrainer:
                     print(f"Batch {batch_idx}, Loss: {loss.item():.4f}")
 
 
-    def evaluate_with_coverage(self, wrapper, dataset, n_samples=100):
-        """Enhanced evaluation with coverage tracking"""
-        eval_split = dataset.select(range(min(n_samples, len(dataset))))
+    def evaluate_with_beam_search(self, wrapper, dataset, n_samples=None, beam_size=10):
+        """Enhanced evaluation with high-quality beam search generation"""
+        # Select appropriate number of samples
+        if n_samples is None:
+            eval_split = dataset
+        else:
+            eval_split = dataset.select(range(min(n_samples, len(dataset))))
         
         total_coverage = 0.0
         complete_outputs = 0
         predictions = []
         references = []
+        mr_to_pred = {}  # Track predictions by MR for deduplication
         
-        for sample in tqdm(eval_split, desc="Evaluating with coverage"):
+        for sample in tqdm(eval_split, desc="Generating with beam search"):
             mr = sample["meaning_representation"]
             ref = sample["human_reference"]
             
-            # Generate prediction
-            pred = generate_with_beam(self, wrapper, mr, max_new_tokens=64)
+            # Generate only once per unique MR
+            if mr not in mr_to_pred:
+                # Generate with enhanced beam search
+                try:
+                    pred = self.generate_optimal_beam(wrapper, mr, beam_size=beam_size)
+                    mr_to_pred[mr] = pred
+                except Exception as e:
+                    print(f"Generation failed for MR: {mr}\nError: {e}")
+                    mr_to_pred[mr] = "Error during generation"
             
+            # Track reference for this MR
+            if mr not in mr_to_pred:
+                continue
+                
             # Check coverage
-            coverage = self.validate_coverage(mr, pred)
+            coverage = self.tail_client.validate_coverage(mr, mr_to_pred[mr])
             total_coverage += coverage['coverage_ratio']
             
             if coverage['complete']:
                 complete_outputs += 1
             
-            # Print examples of incomplete coverage
-            if not coverage['complete'] and len(predictions) < 5:
-                print(f"Incomplete coverage example:")
-                print(f"  MR: {mr}")
-                print(f"  Pred: {pred}")
-                print(f"  Missing: {coverage['missing']}")
-            
-            predictions.append(pred)
-            references.append(ref)
+            # Only add to predictions/references once per MR (for proper metrics)
+            if mr_to_pred[mr] not in predictions:
+                predictions.append(mr_to_pred[mr])
+                references.append(ref)
+        
+        # Display some examples
+        print("\n=== GENERATION EXAMPLES ===")
+        for i, mr in enumerate(list(mr_to_pred.keys())[:5]):
+            pred = mr_to_pred[mr]
+            print(f"MR: {mr}")
+            print(f"Generated: {pred}")
+            print()
         
         # Compute metrics
         avg_coverage = total_coverage / len(eval_split)
@@ -1547,6 +1566,40 @@ class SplitLoRATrainer:
             "coverage": avg_coverage,
             "completeness": complete_ratio
         }
+        
+    def generate_optimal_beam(self, wrapper, mr_text, beam_size=10, max_new_tokens=64):
+        """Generate with optimized beam search parameters"""
+        prompt = mr_text + " " + self.DELIM + " "
+        enc = self.tokenizer(prompt, return_tensors="pt")
+        ids = enc["input_ids"].to(device)
+        
+        # Ensure model is in eval mode
+        wrapper.eval()
+        
+        with torch.no_grad():
+            output = wrapper.generate(
+                ids,
+                num_beams=beam_size,             # Use 10 beams
+                do_sample=False,                 # Pure beam search for deterministic outputs
+                early_stopping=True,
+                
+                # Output length control
+                max_new_tokens=max_new_tokens,
+                min_length=ids.size(1) + 10,     # Ensure minimum length
+                
+                # Quality parameters
+                length_penalty=0.6,              # Prefer concise outputs
+                no_repeat_ngram_size=3,          # Prevent 3-gram repetition
+                repetition_penalty=1.3,          # Stronger repetition penalty
+                
+                # Use proper token IDs
+                eos_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=self.tokenizer.pad_token_id
+            )
+        
+        # Extract only the generated portion (after the prompt)
+        result = self.tokenizer.decode(output[0][ids.size(1):], skip_special_tokens=True).strip()
+        return result
 
     def train(self, train_dataloader, epochs=1):
         """Fixed training method with proper indentation for batch processing"""
@@ -2776,7 +2829,7 @@ def main():
             print("✅ Generating normal text - period prediction might be normal")
 
         # Run evaluation
-        results = trainer.evaluate_with_coverage(trainer, wrapper, test_ds, n_samples=len(test_ds))
+        results = trainer.evaluate_with_coverage(wrapper, test_ds, n_samples=len(test_ds))
         results_file = os.path.join(args.save_path, "evaluation_results.json")
         with open(results_file, "w") as f:
             json.dump(results, f, indent=2)
