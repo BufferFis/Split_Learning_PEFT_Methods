@@ -9,6 +9,7 @@ import math
 import random
 import numpy as np
 import torch
+from torch.cuda.amp import autocast, GradScaler  # Added for mixed precision
 from torch.utils.data import Dataset, DataLoader
 from collections import defaultdict
 from tqdm.auto import tqdm
@@ -184,6 +185,12 @@ def parse_args():
         default=1,
         help="Number of updates steps to accumulate before performing a backward/update pass"
     )
+    parser.add_argument(
+        "--fp16",
+        action="store_true",
+        help="Whether to use 16-bit (mixed) precision training",
+        default=True  # Enable by default since user has 30GB VRAM
+    )
     return parser.parse_args()
 
 def set_random_seeds(seed):
@@ -285,8 +292,12 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
         num_training_steps=total_steps
     )
     
+    # Set up mixed precision training
+    scaler = GradScaler() if args.fp16 else None
+    
     # Training loop
     logger.info("***** Running training *****")
+    logger.info(f"Using FP16: {args.fp16}")
     
     global_step = 0
     tr_loss = 0.0
@@ -306,29 +317,59 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
             
-            # Forward pass
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                return_dict=True,
-            )
-            
-            loss = outputs.loss
-            
-            # Scale loss if gradient accumulation is used
-            if args.gradient_accumulation_steps > 1:
-                loss = loss / args.gradient_accumulation_steps
+            # Forward pass with mixed precision if enabled
+            if args.fp16:
+                with autocast():
+                    outputs = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                        return_dict=True,
+                    )
+                    loss = outputs.loss
+                    
+                    # Scale loss if gradient accumulation is used
+                    if args.gradient_accumulation_steps > 1:
+                        loss = loss / args.gradient_accumulation_steps
                 
-            # Backward pass
-            loss.backward()
+                # Backward pass with scaled gradients
+                scaler.scale(loss).backward()
+            else:
+                # Standard forward pass
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    return_dict=True,
+                )
+                loss = outputs.loss
+                
+                # Scale loss if gradient accumulation is used
+                if args.gradient_accumulation_steps > 1:
+                    loss = loss / args.gradient_accumulation_steps
+                
+                # Standard backward pass
+                loss.backward()
             
-            tr_loss += loss.item() * args.gradient_accumulation_steps  # Adjust for logging
+            tr_loss += loss.item() * args.gradient_accumulation_steps
             epoch_loss += loss.item() * args.gradient_accumulation_steps
             
             # Only update parameters after accumulating enough gradients
             if (step + 1) % args.gradient_accumulation_steps == 0:
-                optimizer.step()
+                if args.fp16:
+                    # Unscale gradients for clipping
+                    scaler.unscale_(optimizer)
+                    
+                    # Gradient clipping (optional but recommended with fp16)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    
+                    # Update with scaler
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    # Standard optimizer step
+                    optimizer.step()
+                
                 scheduler.step()
                 model.zero_grad()
                 global_step += 1
@@ -547,6 +588,15 @@ def main():
     # Set random seeds
     set_random_seeds(args.seed)
     
+    # Optimize CUDA operations for faster training
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        logger.info(f"CUDA available: {torch.cuda.device_count()} devices")
+        logger.info(f"CUDA current device: {torch.cuda.current_device()}")
+        logger.info(f"CUDA device name: {torch.cuda.get_device_name(0)}")
+        logger.info(f"CUDA memory allocated: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB")
+        logger.info(f"CUDA memory reserved: {torch.cuda.memory_reserved(0) / 1e9:.2f} GB")
+    
     # Load dataset directly using Hugging Face datasets
     logger.info("Loading E2E NLG dataset...")
     try:
@@ -575,10 +625,11 @@ def main():
     valid_dataset = E2EDataset(dataset, 'validation', tokenizer, max_length=args.max_length)
     test_dataset = E2EDataset(dataset, 'test', tokenizer, max_length=args.max_length)
     
-    # Create data loaders
-    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    valid_dataloader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False)  # Fixed typo
-    test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+    # Create data loaders with multiple workers for faster data loading
+    num_workers = 4 if torch.cuda.is_available() else 0
+    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+    valid_dataloader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers=num_workers)
+    test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=num_workers)
     
     logger.info(f"Number of training examples: {len(train_dataset)}")
     logger.info(f"Number of validation examples: {len(valid_dataset)}")
