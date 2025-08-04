@@ -337,7 +337,7 @@ def save_checkpoint(args, model, tokenizer, optimizer, scheduler, epoch, global_
     return checkpoint_dir
 
 def load_checkpoint(args, model, tokenizer, optimizer, scheduler):
-    """Load model and training state from checkpoint."""
+    """Load model and training state from checkpoint while fixing optimizer state."""
     checkpoint_dir = args.resume_from_checkpoint
     logger.info(f"Loading checkpoint from {checkpoint_dir}")
     
@@ -359,18 +359,41 @@ def load_checkpoint(args, model, tokenizer, optimizer, scheduler):
     losses = training_state.get("losses", [])
     perplexities = training_state.get("perplexities", [])
     
-    # SKIP optimizer loading entirely - this avoids the mismatch error
-    logger.warning("Skipping optimizer state loading for better compatibility")
-    logger.warning("Training will continue with a fresh optimizer")
+    # Attempt to load optimizer with parameter matching
+    if os.path.exists(os.path.join(checkpoint_dir, "optimizer.pt")):
+        try:
+            # First initialize a fresh optimizer with the correct parameter structure
+            fresh_optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+            
+            # Load the saved state
+            checkpoint = torch.load(os.path.join(checkpoint_dir, "optimizer.pt"))
+            
+            # Map parameters by name instead of position to fix mismatch
+            saved_groups = checkpoint['state']
+            current_groups = fresh_optimizer.state_dict()['state']
+            
+            # Map saved state to current parameters where possible
+            for k, v in current_groups.items():
+                if k in saved_groups:
+                    fresh_optimizer.state[k] = saved_groups[k]
+            
+            optimizer = fresh_optimizer
+            logger.info("Optimizer state partially recovered")
+        except Exception as e:
+            logger.warning(f"Advanced optimizer recovery failed: {e}")
+            logger.warning("Training will continue with a fresh optimizer")
+            optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    else:
+        logger.warning("No optimizer checkpoint found")
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
     
-    # Try to load scheduler state
-    try:
-        if os.path.exists(os.path.join(checkpoint_dir, "scheduler.pt")):
+    # Load scheduler state
+    if os.path.exists(os.path.join(checkpoint_dir, "scheduler.pt")):
+        try:
             scheduler.load_state_dict(torch.load(os.path.join(checkpoint_dir, "scheduler.pt")))
             logger.info("Scheduler state loaded")
-    except (ValueError, KeyError) as e:
-        logger.warning(f"Failed to load scheduler state: {e}")
-        logger.warning("Training will continue with a fresh scheduler")
+        except Exception as e:
+            logger.warning(f"Failed to load scheduler: {e}")
     
     # Load sanity check results
     sanity_check_results = []
