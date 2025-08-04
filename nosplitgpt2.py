@@ -405,8 +405,12 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
         num_training_steps=total_steps
     )
     
-    # Set up mixed precision training
-    scaler = GradScaler() if args.fp16 else None
+    # Set up mixed precision training - FIX: Use new API
+    if args.fp16:
+        from torch.amp import GradScaler, autocast
+        scaler = GradScaler(enabled=True)
+    else:
+        scaler = None
     
     # Training loop variables
     global_step = 0
@@ -439,7 +443,8 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
             
             # Forward pass with mixed precision if enabled
             if args.fp16:
-                with autocast():
+                # FIX: Use new API format for autocast
+                with autocast(device_type='cuda'):
                     outputs = model(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
@@ -477,20 +482,26 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
             # Only update parameters after accumulating enough gradients
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 if args.fp16:
-                    # Unscale gradients for clipping
+                    # FIX: Correct order for gradient unscaling and stepping
                     scaler.unscale_(optimizer)
                     
-                    # Gradient clipping (optional but recommended with fp16)
+                    # Gradient clipping
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     
-                    # Update with scaler
+                    # FIX: Update with proper error handling
                     scaler.step(optimizer)
+                    scale = scaler.get_scale()
                     scaler.update()
+                    
+                    # Check if optimizer step was skipped due to inf/nan gradients
+                    skip_scheduler = scale != scaler.get_scale()
+                    if not skip_scheduler:
+                        scheduler.step()
                 else:
                     # Standard optimizer step
                     optimizer.step()
+                    scheduler.step()
                 
-                scheduler.step()
                 model.zero_grad()
                 global_step += 1
                 
@@ -528,7 +539,7 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
         avg_epoch_loss = epoch_loss / len(train_dataloader)
         logger.info(f"Epoch {epoch+1} - Average Loss: {avg_epoch_loss:.4f}, Perplexity: {math.exp(avg_epoch_loss):.4f}")
         
-        # IMPORTANT CHANGE: Save checkpoint BEFORE evaluation to avoid losing progress
+        # IMPORTANT: Save checkpoint BEFORE evaluation to avoid losing progress
         logger.info(f"Saving checkpoint after epoch {epoch+1} (before evaluation)...")
         save_checkpoint(
             args, model, tokenizer, optimizer, scheduler, epoch+1, 
