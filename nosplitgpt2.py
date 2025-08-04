@@ -51,7 +51,7 @@ meteor = evaluate.load("meteor")
 class E2EDataset(Dataset):
     """E2E NLG Challenge dataset."""
     
-    def __init__(self, hf_dataset, split, tokenizer, max_length=512):
+    def __init__(self, hf_dataset, split, tokenizer, max_length=256):
         """
         Args:
             hf_dataset: Hugging Face dataset object
