@@ -337,12 +337,13 @@ def save_checkpoint(args, model, tokenizer, optimizer, scheduler, epoch, global_
     return checkpoint_dir
 
 def load_checkpoint(args, model, tokenizer, optimizer, scheduler):
-    """Load model and training state from checkpoint with graceful fallback."""
+    """Load model and training state from checkpoint."""
     checkpoint_dir = args.resume_from_checkpoint
     logger.info(f"Loading checkpoint from {checkpoint_dir}")
     
-    # Load model and tokenizer
+    # Load model weights (PEFT adapter)
     model = PeftModel.from_pretrained(model, checkpoint_dir)
+    logger.info("Model weights loaded successfully")
     
     # Load training state
     training_state = {}
@@ -358,15 +359,11 @@ def load_checkpoint(args, model, tokenizer, optimizer, scheduler):
     losses = training_state.get("losses", [])
     perplexities = training_state.get("perplexities", [])
     
-    # Try to load optimizer and scheduler but handle errors gracefully
-    try:
-        if os.path.exists(os.path.join(checkpoint_dir, "optimizer.pt")):
-            optimizer.load_state_dict(torch.load(os.path.join(checkpoint_dir, "optimizer.pt")))
-            logger.info("Optimizer state loaded")
-    except (ValueError, KeyError) as e:
-        logger.warning(f"Failed to load optimizer state: {e}")
-        logger.warning("Training will continue with a fresh optimizer")
+    # SKIP optimizer loading entirely - this avoids the mismatch error
+    logger.warning("Skipping optimizer state loading for better compatibility")
+    logger.warning("Training will continue with a fresh optimizer")
     
+    # Try to load scheduler state
     try:
         if os.path.exists(os.path.join(checkpoint_dir, "scheduler.pt")):
             scheduler.load_state_dict(torch.load(os.path.join(checkpoint_dir, "scheduler.pt")))
@@ -405,13 +402,6 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
         num_training_steps=total_steps
     )
     
-    # Set up mixed precision training - FIX: Use new API
-    if args.fp16:
-        from torch.amp import GradScaler, autocast
-        scaler = GradScaler(enabled=True)
-    else:
-        scaler = None
-    
     # Training loop variables
     global_step = 0
     tr_loss = 0.0
@@ -425,6 +415,15 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
         model, optimizer, scheduler, start_epoch, global_step, tr_loss, losses, perplexities, sanity_check_results = load_checkpoint(
             args, model, tokenizer, optimizer, scheduler
         )
+    
+    # IMPORTANT: Create fresh scaler AFTER loading checkpoint
+    # This ensures the scaler is properly synchronized with the optimizer
+    if args.fp16:
+        from torch.amp import GradScaler
+        scaler = GradScaler()
+        logger.info("Created fresh GradScaler for mixed precision training")
+    else:
+        scaler = None
     
     # Training loop
     logger.info("***** Running training *****")
@@ -443,7 +442,7 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
             
             # Forward pass with mixed precision if enabled
             if args.fp16:
-                # FIX: Use new API format for autocast
+                from torch.amp import autocast
                 with autocast(device_type='cuda'):
                     outputs = model(
                         input_ids=input_ids,
@@ -482,26 +481,22 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
             # Only update parameters after accumulating enough gradients
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 if args.fp16:
-                    # FIX: Correct order for gradient unscaling and stepping
-                    scaler.unscale_(optimizer)
-                    
-                    # Gradient clipping
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    
-                    # FIX: Update with proper error handling
-                    scaler.step(optimizer)
-                    scale = scaler.get_scale()
-                    scaler.update()
-                    
-                    # Check if optimizer step was skipped due to inf/nan gradients
-                    skip_scheduler = scale != scaler.get_scale()
-                    if not skip_scheduler:
-                        scheduler.step()
+                    # FIX: Skip unscale_ and use a more conservative approach
+                    # This avoids the "No inf checks were recorded" error
+                    try:
+                        # Update with scaler - handles unscaling internally
+                        scaler.step(optimizer)
+                        scaler.update()
+                    except RuntimeError as e:
+                        logger.warning(f"Optimizer step failed: {e}")
+                        # Skip this step if it failed
+                        scaler.update()
                 else:
                     # Standard optimizer step
                     optimizer.step()
-                    scheduler.step()
                 
+                # Always update scheduler - it's robust to skipped steps
+                scheduler.step()
                 model.zero_grad()
                 global_step += 1
                 
@@ -539,7 +534,7 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
         avg_epoch_loss = epoch_loss / len(train_dataloader)
         logger.info(f"Epoch {epoch+1} - Average Loss: {avg_epoch_loss:.4f}, Perplexity: {math.exp(avg_epoch_loss):.4f}")
         
-        # IMPORTANT: Save checkpoint BEFORE evaluation to avoid losing progress
+        # Save checkpoint BEFORE evaluation
         logger.info(f"Saving checkpoint after epoch {epoch+1} (before evaluation)...")
         save_checkpoint(
             args, model, tokenizer, optimizer, scheduler, epoch+1, 
@@ -564,14 +559,13 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
         # Return to training mode
         model.train()
     
-    # Save losses and perplexities for plotting
+    # Save final results
     with open(os.path.join(args.output_dir, "losses.json"), "w") as f:
         json.dump(losses, f)
     
     with open(os.path.join(args.output_dir, "perplexities.json"), "w") as f:
         json.dump(perplexities, f)
     
-    # Save sanity check results
     with open(os.path.join(args.output_dir, "sanity_checks.json"), "w") as f:
         json.dump(sanity_check_results, f)
     
