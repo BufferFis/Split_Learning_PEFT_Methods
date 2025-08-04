@@ -55,12 +55,14 @@ class E2EDataset(Dataset):
             tokenizer: Tokenizer for the model
             max_length (int): Maximum sequence length
         """
+        logger.info(f"Loading dataset from {file_path}")
         self.df = pd.read_csv(file_path, delimiter=",")
         self.tokenizer = tokenizer
         self.max_length = max_length
         
         # Process the data
         self.examples = self._process_data()
+        logger.info(f"Loaded {len(self.examples)} examples")
         
     def _process_data(self):
         examples = []
@@ -91,23 +93,12 @@ class E2EDataset(Dataset):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune GPT-2 with DoRA on E2E dataset")
+    # Dataset paths now default to the expected repository structure
     parser.add_argument(
-        "--train_file", 
+        "--data_dir", 
         type=str, 
-        default="trainset.csv", 
-        help="Path to training file"
-    )
-    parser.add_argument(
-        "--valid_file", 
-        type=str, 
-        default="devset.csv", 
-        help="Path to validation file"
-    )
-    parser.add_argument(
-        "--test_file", 
-        type=str, 
-        default="testset_w_refs.csv", 
-        help="Path to test file"
+        default=".", 
+        help="Path to the E2E dataset directory"
     )
     parser.add_argument(
         "--output_dir", 
@@ -205,6 +196,7 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader):
     """Train the model and evaluate on validation set."""
     # Set up device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Using device: {device}")
     model.to(device)
     
     # Set up optimizer and scheduler
@@ -382,6 +374,46 @@ def test_model(args, model, tokenizer, test_dataloader):
     
     return results
 
+def find_dataset_files(data_dir):
+    """Find the E2E dataset files in the repository."""
+    logger.info(f"Looking for dataset files in {data_dir}")
+    
+    # First, look for the exact standard filenames
+    train_path = os.path.join(data_dir, "trainset.csv")
+    valid_path = os.path.join(data_dir, "devset.csv")
+    test_path = os.path.join(data_dir, "testset_w_refs.csv")
+    
+    # If not found, look for the files in the data directory
+    if not os.path.exists(train_path):
+        for subdir in ["data", "e2e-dataset"]:
+            potential_path = os.path.join(data_dir, subdir, "trainset.csv")
+            if os.path.exists(potential_path):
+                train_path = potential_path
+                valid_path = os.path.join(os.path.dirname(potential_path), "devset.csv")
+                test_path = os.path.join(os.path.dirname(potential_path), "testset_w_refs.csv")
+                break
+    
+    # If testset_w_refs.csv doesn't exist, try testset.csv
+    if not os.path.exists(test_path):
+        alternative_test = test_path.replace("testset_w_refs.csv", "testset.csv")
+        if os.path.exists(alternative_test):
+            test_path = alternative_test
+    
+    # Verify files exist
+    if not os.path.exists(train_path):
+        raise FileNotFoundError(f"Cannot find training set file at {train_path}")
+    if not os.path.exists(valid_path):
+        raise FileNotFoundError(f"Cannot find validation set file at {valid_path}")
+    if not os.path.exists(test_path):
+        raise FileNotFoundError(f"Cannot find test set file at {test_path}")
+    
+    logger.info(f"Found dataset files:")
+    logger.info(f"Train: {train_path}")
+    logger.info(f"Valid: {valid_path}")
+    logger.info(f"Test: {test_path}")
+    
+    return train_path, valid_path, test_path
+
 def main():
     global args
     args = parse_args()
@@ -393,7 +425,11 @@ def main():
     # Set random seeds
     set_random_seeds(args.seed)
     
+    # Find dataset files
+    train_file, valid_file, test_file = find_dataset_files(args.data_dir)
+    
     # Load tokenizer and model
+    logger.info(f"Loading model: {args.model_name_or_path}")
     tokenizer = GPT2Tokenizer.from_pretrained(args.model_name_or_path)
     tokenizer.pad_token = tokenizer.eos_token
     model = GPT2LMHeadModel.from_pretrained(args.model_name_or_path)
@@ -401,9 +437,9 @@ def main():
     
     # Load datasets
     logger.info("Loading datasets...")
-    train_dataset = E2EDataset(args.train_file, tokenizer, max_length=args.max_length)
-    valid_dataset = E2EDataset(args.valid_file, tokenizer, max_length=args.max_length)
-    test_dataset = E2EDataset(args.test_file, tokenizer, max_length=args.max_length)
+    train_dataset = E2EDataset(train_file, tokenizer, max_length=args.max_length)
+    valid_dataset = E2EDataset(valid_file, tokenizer, max_length=args.max_length)
+    test_dataset = E2EDataset(test_file, tokenizer, max_length=args.max_length)
     
     # Create data loaders
     train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
