@@ -12,6 +12,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from tqdm.auto import tqdm
 import pandas as pd
+from datasets import load_dataset
 import evaluate
 import nltk
 from nltk.tokenize import word_tokenize
@@ -48,27 +49,28 @@ meteor = evaluate.load("meteor")
 class E2EDataset(Dataset):
     """E2E NLG Challenge dataset."""
     
-    def __init__(self, file_path, tokenizer, max_length=512):
+    def __init__(self, hf_dataset, split, tokenizer, max_length=512):
         """
         Args:
-            file_path (str): Path to the E2E dataset file (CSV format)
+            hf_dataset: Hugging Face dataset object
+            split: Dataset split to use ('train', 'validation', 'test')
             tokenizer: Tokenizer for the model
             max_length (int): Maximum sequence length
         """
-        logger.info(f"Loading dataset from {file_path}")
-        self.df = pd.read_csv(file_path, delimiter=",")
+        logger.info(f"Preparing {split} dataset")
+        self.data = hf_dataset[split]
         self.tokenizer = tokenizer
         self.max_length = max_length
         
         # Process the data
         self.examples = self._process_data()
-        logger.info(f"Loaded {len(self.examples)} examples")
+        logger.info(f"Loaded {len(self.examples)} examples from {split} split")
         
     def _process_data(self):
         examples = []
-        for _, row in self.df.iterrows():
-            mr = row['mr']
-            ref = row['ref']
+        for item in self.data:
+            mr = item['meaning_representation']
+            ref = item['human_reference']
             # Format: "MR: [mr] REF: [ref]"
             text = f"MR: {mr} REF: {ref}"
             encodings = self.tokenizer(
@@ -93,13 +95,6 @@ class E2EDataset(Dataset):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune GPT-2 with DoRA on E2E dataset")
-    # Dataset paths now default to the expected repository structure
-    parser.add_argument(
-        "--data_dir", 
-        type=str, 
-        default=".", 
-        help="Path to the E2E dataset directory"
-    )
     parser.add_argument(
         "--output_dir", 
         type=str, 
@@ -374,46 +369,6 @@ def test_model(args, model, tokenizer, test_dataloader):
     
     return results
 
-def find_dataset_files(data_dir):
-    """Find the E2E dataset files in the repository."""
-    logger.info(f"Looking for dataset files in {data_dir}")
-    
-    # First, look for the exact standard filenames
-    train_path = os.path.join(data_dir, "trainset.csv")
-    valid_path = os.path.join(data_dir, "devset.csv")
-    test_path = os.path.join(data_dir, "testset_w_refs.csv")
-    
-    # If not found, look for the files in the data directory
-    if not os.path.exists(train_path):
-        for subdir in ["data", "e2e-dataset"]:
-            potential_path = os.path.join(data_dir, subdir, "trainset.csv")
-            if os.path.exists(potential_path):
-                train_path = potential_path
-                valid_path = os.path.join(os.path.dirname(potential_path), "devset.csv")
-                test_path = os.path.join(os.path.dirname(potential_path), "testset_w_refs.csv")
-                break
-    
-    # If testset_w_refs.csv doesn't exist, try testset.csv
-    if not os.path.exists(test_path):
-        alternative_test = test_path.replace("testset_w_refs.csv", "testset.csv")
-        if os.path.exists(alternative_test):
-            test_path = alternative_test
-    
-    # Verify files exist
-    if not os.path.exists(train_path):
-        raise FileNotFoundError(f"Cannot find training set file at {train_path}")
-    if not os.path.exists(valid_path):
-        raise FileNotFoundError(f"Cannot find validation set file at {valid_path}")
-    if not os.path.exists(test_path):
-        raise FileNotFoundError(f"Cannot find test set file at {test_path}")
-    
-    logger.info(f"Found dataset files:")
-    logger.info(f"Train: {train_path}")
-    logger.info(f"Valid: {valid_path}")
-    logger.info(f"Test: {test_path}")
-    
-    return train_path, valid_path, test_path
-
 def main():
     global args
     args = parse_args()
@@ -425,8 +380,16 @@ def main():
     # Set random seeds
     set_random_seeds(args.seed)
     
-    # Find dataset files
-    train_file, valid_file, test_file = find_dataset_files(args.data_dir)
+    # Load dataset directly using Hugging Face datasets
+    logger.info("Loading E2E NLG dataset...")
+    try:
+        dataset = load_dataset("e2e_nlg")
+        logger.info("Dataset loaded successfully")
+    except Exception as e:
+        # Try with trust_remote_code flag if regular loading fails
+        logger.info(f"Standard loading failed: {e}. Trying with trust_remote_code=True")
+        dataset = load_dataset("e2e_nlg", trust_remote_code=True)
+        logger.info("Dataset loaded successfully with trust_remote_code=True")
     
     # Load tokenizer and model
     logger.info(f"Loading model: {args.model_name_or_path}")
@@ -435,11 +398,11 @@ def main():
     model = GPT2LMHeadModel.from_pretrained(args.model_name_or_path)
     model = setup_peft_model(model)
     
-    # Load datasets
-    logger.info("Loading datasets...")
-    train_dataset = E2EDataset(train_file, tokenizer, max_length=args.max_length)
-    valid_dataset = E2EDataset(valid_file, tokenizer, max_length=args.max_length)
-    test_dataset = E2EDataset(test_file, tokenizer, max_length=args.max_length)
+    # Create datasets
+    logger.info("Preparing datasets...")
+    train_dataset = E2EDataset(dataset, 'train', tokenizer, max_length=args.max_length)
+    valid_dataset = E2EDataset(dataset, 'validation', tokenizer, max_length=args.max_length)
+    test_dataset = E2EDataset(dataset, 'test', tokenizer, max_length=args.max_length)
     
     # Create data loaders
     train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
