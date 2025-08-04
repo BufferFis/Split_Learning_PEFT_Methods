@@ -10,6 +10,7 @@ import random
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
+from collections import defaultdict
 from tqdm.auto import tqdm
 import pandas as pd
 from datasets import load_dataset
@@ -62,9 +63,17 @@ class E2EDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         
+        # Store MR to references mapping for evaluation
+        self.mr_to_refs = defaultdict(list)
+        for item in self.data:
+            mr = item['meaning_representation']
+            ref = item['human_reference']
+            self.mr_to_refs[mr].append(ref)
+        
         # Process the data
         self.examples = self._process_data()
         logger.info(f"Loaded {len(self.examples)} examples from {split} split")
+        logger.info(f"Found {len(self.mr_to_refs)} unique MRs with an average of {sum(len(refs) for refs in self.mr_to_refs.values())/len(self.mr_to_refs):.1f} references each")
         
     def _process_data(self):
         examples = []
@@ -84,6 +93,7 @@ class E2EDataset(Dataset):
                 "input_ids": encodings["input_ids"][0],
                 "attention_mask": encodings["attention_mask"][0],
                 "labels": encodings["input_ids"][0].clone(),
+                "mr": mr,  # Store MR for reference
             })
         return examples
     
@@ -92,6 +102,13 @@ class E2EDataset(Dataset):
     
     def __getitem__(self, idx):
         return self.examples[idx]
+    
+    def get_unique_mrs(self, num_samples=5):
+        """Get a sample of unique MRs for sanity checks"""
+        unique_mrs = list(self.mr_to_refs.keys())
+        if num_samples > 0 and num_samples < len(unique_mrs):
+            return random.sample(unique_mrs, num_samples)
+        return unique_mrs[:5]  # Default to first 5 if no sampling needed
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune GPT-2 with DoRA on E2E dataset")
@@ -155,6 +172,12 @@ def parse_args():
         default=0.1,
         help="Dropout probability for LoRA layers"
     )
+    parser.add_argument(
+        "--sanity_check_steps", 
+        type=int, 
+        default=200, 
+        help="Number of steps between sanity checks"
+    )
     return parser.parse_args()
 
 def set_random_seeds(seed):
@@ -187,12 +210,60 @@ def setup_peft_model(model):
     
     return model
 
-def train(args, model, tokenizer, train_dataloader, valid_dataloader):
+def sanity_check(model, tokenizer, mrs, device, max_length=256):
+    """Generate text from the model for a few MRs to see if it's learning."""
+    logger.info("===== SANITY CHECK: GENERATING TEXT FOR SAMPLE MRs =====")
+    
+    # Save original model state
+    training = model.training
+    
+    # Set model to eval mode for generation
+    model.eval()
+    
+    generations = []
+    
+    with torch.no_grad():
+        for i, mr in enumerate(mrs[:5]):  # Generate for up to 5 MRs
+            prompt = f"MR: {mr} REF:"
+            prompt_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+            
+            # Generate text
+            generated_ids = model.generate(
+                prompt_ids,
+                max_length=max_length,
+                num_beams=5,
+                no_repeat_ngram_size=2,
+                early_stopping=True,
+            )
+            
+            # Decode the generated text
+            generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+            
+            # Extract only the generated part after "REF:"
+            if "REF:" in generated_text:
+                generated_text = generated_text.split("REF:")[1].strip()
+            
+            logger.info(f"MR: {mr}")
+            logger.info(f"Generated: {generated_text}")
+            logger.info("-" * 40)
+            
+            generations.append({"mr": mr, "generated": generated_text})
+    
+    # Restore original model state
+    if training:
+        model.train()
+    
+    return generations
+
+def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_dataset):
     """Train the model and evaluate on validation set."""
     # Set up device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
     model.to(device)
+    
+    # Get sample MRs for sanity checks
+    sample_mrs = train_dataset.get_unique_mrs(5)
     
     # Set up optimizer and scheduler
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
@@ -213,6 +284,7 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader):
     # Store losses for plotting
     losses = []
     perplexities = []
+    sanity_check_results = []
     
     for epoch in range(args.epochs):
         epoch_iterator = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{args.epochs}")
@@ -252,6 +324,19 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader):
                 perplexity = math.exp(avg_loss)
                 losses.append({"step": global_step, "loss": avg_loss})
                 perplexities.append({"step": global_step, "perplexity": perplexity})
+            
+            # Run sanity check at regular intervals
+            if global_step % args.sanity_check_steps == 0:
+                logger.info(f"\nRunning sanity check at step {global_step}...")
+                generations = sanity_check(model, tokenizer, sample_mrs, device, args.max_length)
+                
+                # Store results with step number
+                for gen in generations:
+                    gen["step"] = global_step
+                sanity_check_results.extend(generations)
+                
+                # Return to training mode (sanity_check already does this, but just to be explicit)
+                model.train()
                 
         # Evaluate after each epoch
         eval_results = evaluate_model(args, model, tokenizer, valid_dataloader)
@@ -260,6 +345,19 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader):
         avg_epoch_loss = epoch_loss / len(train_dataloader)
         logger.info(f"Epoch {epoch+1} - Average Loss: {avg_epoch_loss:.4f}, Perplexity: {math.exp(avg_epoch_loss):.4f}")
         logger.info(f"Evaluation results: {eval_results}")
+        
+        # Run sanity check after each epoch
+        logger.info(f"\nRunning sanity check after epoch {epoch+1}...")
+        generations = sanity_check(model, tokenizer, sample_mrs, device, args.max_length)
+        
+        # Store results with epoch number
+        for gen in generations:
+            gen["epoch"] = epoch + 1
+            gen["step"] = global_step
+        sanity_check_results.extend(generations)
+        
+        # Return to training mode
+        model.train()
     
     # Save losses and perplexities for plotting
     with open(os.path.join(args.output_dir, "losses.json"), "w") as f:
@@ -268,10 +366,14 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader):
     with open(os.path.join(args.output_dir, "perplexities.json"), "w") as f:
         json.dump(perplexities, f)
     
+    # Save sanity check results
+    with open(os.path.join(args.output_dir, "sanity_checks.json"), "w") as f:
+        json.dump(sanity_check_results, f)
+    
     return global_step, tr_loss / global_step
 
 def evaluate_model(args, model, tokenizer, eval_dataloader):
-    """Evaluate the model on the evaluation dataloader."""
+    """Evaluate the model on the evaluation dataloader using multiple references."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()
@@ -279,14 +381,17 @@ def evaluate_model(args, model, tokenizer, eval_dataloader):
     eval_loss = 0.0
     nb_eval_steps = 0
     
-    all_predictions = []
-    all_references = []
+    # Group predictions by MR
+    mr_to_predictions = {}
+    mr_to_references = defaultdict(list)
     
+    # First pass: calculate loss and collect references
     for batch in tqdm(eval_dataloader, desc="Evaluating"):
         with torch.no_grad():
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
+            mrs = batch.get("mr", None)
             
             # Forward pass for evaluation
             outputs = model(
@@ -300,59 +405,99 @@ def evaluate_model(args, model, tokenizer, eval_dataloader):
             eval_loss += loss.item()
             nb_eval_steps += 1
             
-            # Generate predictions
+            # Extract references for each MR
             for i in range(len(input_ids)):
-                # Extract the MR part to use as prompt
                 text = tokenizer.decode(input_ids[i], skip_special_tokens=True)
-                mr_part = text.split("REF:")[0].strip()
+                mr = mrs[i] if mrs is not None else text.split("REF:")[0].strip().replace("MR: ", "")
                 
-                # Generate completion based on MR
-                prompt = f"{mr_part} REF:"
-                prompt_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
-                
-                generated_ids = model.generate(
-                    prompt_ids,
-                    max_length=args.max_length,
-                    num_beams=5,
-                    no_repeat_ngram_size=2,
-                    early_stopping=True,
-                )
-                
-                generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
                 reference_text = tokenizer.decode(labels[i], skip_special_tokens=True)
-                
-                # Extract only the generated reference part
-                if "REF:" in generated_text:
-                    generated_text = generated_text.split("REF:")[1].strip()
-                
-                # Extract only the reference part from the reference text
                 if "REF:" in reference_text:
                     reference_text = reference_text.split("REF:")[1].strip()
                 
-                all_predictions.append(generated_text)
-                all_references.append([reference_text])
+                mr_to_references[mr].append(reference_text)
     
+    # Second pass: generate predictions for unique MRs
+    unique_mrs = list(mr_to_references.keys())
+    logger.info(f"Generating predictions for {len(unique_mrs)} unique MRs...")
+    
+    for mr in tqdm(unique_mrs, desc="Generating"):
+        # Generate completion based on MR
+        prompt = f"MR: {mr} REF:"
+        prompt_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+        
+        generated_ids = model.generate(
+            prompt_ids,
+            max_length=args.max_length,
+            num_beams=5,
+            no_repeat_ngram_size=2,
+            early_stopping=True,
+        )
+        
+        generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        
+        # Extract only the generated reference part
+        if "REF:" in generated_text:
+            generated_text = generated_text.split("REF:")[1].strip()
+        
+        mr_to_predictions[mr] = generated_text
+    
+    # Calculate perplexity
     perplexity = math.exp(eval_loss / nb_eval_steps) if eval_loss > 0 else float("inf")
     
-    # Calculate metrics
-    # BLEU
+    # Prepare data for metrics calculation
+    all_predictions = []
+    all_references = []
+    
+    for mr in unique_mrs:
+        if mr in mr_to_predictions:
+            all_predictions.append(mr_to_predictions[mr])
+            all_references.append(mr_to_references[mr])
+    
+    # Calculate metrics with multiple references
+    # BLEU (handles multiple references correctly)
     tokenized_predictions = [word_tokenize(pred.lower()) for pred in all_predictions]
     tokenized_references = [[word_tokenize(ref.lower()) for ref in refs] for refs in all_references]
     bleu_score = corpus_bleu(tokenized_references, tokenized_predictions)
     
-    # ROUGE
-    rouge_result = rouge.compute(predictions=all_predictions, references=[r[0] for r in all_references])
+    # ROUGE - take maximum score across references for each prediction
+    rouge_scores = {"rouge1": 0, "rouge2": 0, "rougeL": 0}
+    for i, pred in enumerate(all_predictions):
+        refs = all_references[i]
+        best_rouge = {"rouge1": 0, "rouge2": 0, "rougeL": 0}
+        
+        for ref in refs:
+            score = rouge.compute(predictions=[pred], references=[ref])
+            for key in best_rouge:
+                best_rouge[key] = max(best_rouge[key], score[key])
+        
+        for key in rouge_scores:
+            rouge_scores[key] += best_rouge[key]
     
-    # METEOR
-    meteor_result = meteor.compute(predictions=all_predictions, references=[r[0] for r in all_references])
+    # Average ROUGE scores
+    for key in rouge_scores:
+        rouge_scores[key] /= len(all_predictions) if all_predictions else 1
+    
+    # METEOR - similar approach (best match)
+    meteor_score = 0
+    for i, pred in enumerate(all_predictions):
+        refs = all_references[i]
+        best_meteor = 0
+        
+        for ref in refs:
+            score = meteor.compute(predictions=[pred], references=[ref])
+            best_meteor = max(best_meteor, score["meteor"])
+        
+        meteor_score += best_meteor
+    
+    meteor_score /= len(all_predictions) if all_predictions else 1
     
     results = {
         "perplexity": perplexity,
         "bleu": bleu_score,
-        "rouge1": rouge_result["rouge1"],
-        "rouge2": rouge_result["rouge2"],
-        "rougeL": rouge_result["rougeL"],
-        "meteor": meteor_result["meteor"],
+        "rouge1": rouge_scores["rouge1"],
+        "rouge2": rouge_scores["rouge2"],
+        "rougeL": rouge_scores["rougeL"],
+        "meteor": meteor_score,
     }
     
     return results
@@ -415,7 +560,7 @@ def main():
     
     # Train model
     logger.info("Starting training...")
-    global_step, train_loss = train(args, model, tokenizer, train_dataloader, valid_dataloader)
+    global_step, train_loss = train(args, model, tokenizer, train_dataloader, valid_dataloader, train_dataset)
     logger.info(f"Training complete. Global step: {global_step}, Average loss: {train_loss}")
     
     # Save trained model
