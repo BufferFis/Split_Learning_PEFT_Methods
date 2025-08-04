@@ -337,21 +337,12 @@ def save_checkpoint(args, model, tokenizer, optimizer, scheduler, epoch, global_
     return checkpoint_dir
 
 def load_checkpoint(args, model, tokenizer, optimizer, scheduler):
-    """Load model and training state from checkpoint."""
+    """Load model and training state from checkpoint with graceful fallback."""
     checkpoint_dir = args.resume_from_checkpoint
     logger.info(f"Loading checkpoint from {checkpoint_dir}")
     
     # Load model and tokenizer
     model = PeftModel.from_pretrained(model, checkpoint_dir)
-    
-    # Load optimizer and scheduler if available
-    if os.path.exists(os.path.join(checkpoint_dir, "optimizer.pt")):
-        optimizer.load_state_dict(torch.load(os.path.join(checkpoint_dir, "optimizer.pt")))
-        logger.info("Optimizer state loaded")
-    
-    if os.path.exists(os.path.join(checkpoint_dir, "scheduler.pt")):
-        scheduler.load_state_dict(torch.load(os.path.join(checkpoint_dir, "scheduler.pt")))
-        logger.info("Scheduler state loaded")
     
     # Load training state
     training_state = {}
@@ -360,19 +351,36 @@ def load_checkpoint(args, model, tokenizer, optimizer, scheduler):
             training_state = json.load(f)
         logger.info("Training state loaded")
     
-    # Load sanity check results
-    sanity_check_results = []
-    if os.path.exists(os.path.join(checkpoint_dir, "sanity_checks.json")):
-        with open(os.path.join(checkpoint_dir, "sanity_checks.json"), "r") as f:
-            sanity_check_results = json.load(f)
-        logger.info("Sanity check results loaded")
-    
     # Get training progress
     epoch = training_state.get("epoch", 0)
     global_step = training_state.get("global_step", 0)
     tr_loss = training_state.get("tr_loss", 0.0)
     losses = training_state.get("losses", [])
     perplexities = training_state.get("perplexities", [])
+    
+    # Try to load optimizer and scheduler but handle errors gracefully
+    try:
+        if os.path.exists(os.path.join(checkpoint_dir, "optimizer.pt")):
+            optimizer.load_state_dict(torch.load(os.path.join(checkpoint_dir, "optimizer.pt")))
+            logger.info("Optimizer state loaded")
+    except (ValueError, KeyError) as e:
+        logger.warning(f"Failed to load optimizer state: {e}")
+        logger.warning("Training will continue with a fresh optimizer")
+    
+    try:
+        if os.path.exists(os.path.join(checkpoint_dir, "scheduler.pt")):
+            scheduler.load_state_dict(torch.load(os.path.join(checkpoint_dir, "scheduler.pt")))
+            logger.info("Scheduler state loaded")
+    except (ValueError, KeyError) as e:
+        logger.warning(f"Failed to load scheduler state: {e}")
+        logger.warning("Training will continue with a fresh scheduler")
+    
+    # Load sanity check results
+    sanity_check_results = []
+    if os.path.exists(os.path.join(checkpoint_dir, "sanity_checks.json")):
+        with open(os.path.join(checkpoint_dir, "sanity_checks.json"), "r") as f:
+            sanity_check_results = json.load(f)
+        logger.info("Sanity check results loaded")
     
     logger.info(f"Resumed from epoch {epoch}, global step {global_step}")
     
