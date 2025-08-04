@@ -37,11 +37,23 @@ from peft import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Download necessary NLTK packages
+# Download necessary NLTK packages with SSL workaround
+import ssl
+
+try:
+    _create_unverified_https_context = ssl._create_unverified_context
+except AttributeError:
+    pass
+else:
+    ssl._create_default_https_context = _create_unverified_https_context
+
 try:
     nltk.data.find('tokenizers/punkt')
 except LookupError:
-    nltk.download('punkt')
+    try:
+        nltk.download('punkt', quiet=True)
+    except:
+        logger.warning("Could not download punkt, but will try to continue anyway")
 
 # Set up metrics
 bleu = evaluate.load("bleu")
@@ -191,6 +203,19 @@ def parse_args():
         help="Whether to use 16-bit (mixed) precision training",
         default=True  # Enable by default since user has 30GB VRAM
     )
+    # New arguments for checkpoint saving/loading
+    parser.add_argument(
+        "--save_steps",
+        type=int,
+        default=1000,
+        help="Save checkpoint every X steps"
+    )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Path to a checkpoint to resume training from"
+    )
     return parser.parse_args()
 
 def set_random_seeds(seed):
@@ -273,6 +298,86 @@ def sanity_check(model, tokenizer, mrs, device, max_length=256):
     
     return generations
 
+def save_checkpoint(args, model, tokenizer, optimizer, scheduler, epoch, global_step, tr_loss, 
+                    losses, perplexities, sanity_check_results):
+    """Save model checkpoint and training state."""
+    checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+    if not os.path.exists(checkpoint_dir):
+        os.makedirs(checkpoint_dir)
+    
+    logger.info(f"Saving checkpoint to {checkpoint_dir}")
+    
+    # Save model
+    model.save_pretrained(checkpoint_dir)
+    tokenizer.save_pretrained(checkpoint_dir)
+    
+    # Save optimizer and scheduler states
+    torch.save(optimizer.state_dict(), os.path.join(checkpoint_dir, "optimizer.pt"))
+    torch.save(scheduler.state_dict(), os.path.join(checkpoint_dir, "scheduler.pt"))
+    
+    # Save training state
+    training_state = {
+        "epoch": epoch,
+        "global_step": global_step,
+        "tr_loss": tr_loss,
+        "losses": losses,
+        "perplexities": perplexities,
+        "args": vars(args)  # Convert args to dict for JSON serialization
+    }
+    
+    with open(os.path.join(checkpoint_dir, "training_state.json"), "w") as f:
+        json.dump(training_state, f)
+    
+    # Save sanity check results
+    with open(os.path.join(checkpoint_dir, "sanity_checks.json"), "w") as f:
+        json.dump(sanity_check_results, f)
+        
+    logger.info(f"Checkpoint saved at step {global_step}")
+    
+    return checkpoint_dir
+
+def load_checkpoint(args, model, tokenizer, optimizer, scheduler):
+    """Load model and training state from checkpoint."""
+    checkpoint_dir = args.resume_from_checkpoint
+    logger.info(f"Loading checkpoint from {checkpoint_dir}")
+    
+    # Load model and tokenizer
+    model = PeftModel.from_pretrained(model, checkpoint_dir)
+    
+    # Load optimizer and scheduler if available
+    if os.path.exists(os.path.join(checkpoint_dir, "optimizer.pt")):
+        optimizer.load_state_dict(torch.load(os.path.join(checkpoint_dir, "optimizer.pt")))
+        logger.info("Optimizer state loaded")
+    
+    if os.path.exists(os.path.join(checkpoint_dir, "scheduler.pt")):
+        scheduler.load_state_dict(torch.load(os.path.join(checkpoint_dir, "scheduler.pt")))
+        logger.info("Scheduler state loaded")
+    
+    # Load training state
+    training_state = {}
+    if os.path.exists(os.path.join(checkpoint_dir, "training_state.json")):
+        with open(os.path.join(checkpoint_dir, "training_state.json"), "r") as f:
+            training_state = json.load(f)
+        logger.info("Training state loaded")
+    
+    # Load sanity check results
+    sanity_check_results = []
+    if os.path.exists(os.path.join(checkpoint_dir, "sanity_checks.json")):
+        with open(os.path.join(checkpoint_dir, "sanity_checks.json"), "r") as f:
+            sanity_check_results = json.load(f)
+        logger.info("Sanity check results loaded")
+    
+    # Get training progress
+    epoch = training_state.get("epoch", 0)
+    global_step = training_state.get("global_step", 0)
+    tr_loss = training_state.get("tr_loss", 0.0)
+    losses = training_state.get("losses", [])
+    perplexities = training_state.get("perplexities", [])
+    
+    logger.info(f"Resumed from epoch {epoch}, global step {global_step}")
+    
+    return model, optimizer, scheduler, epoch, global_step, tr_loss, losses, perplexities, sanity_check_results
+
 def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_dataset):
     """Train the model and evaluate on validation set."""
     # Set up device
@@ -295,20 +400,27 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
     # Set up mixed precision training
     scaler = GradScaler() if args.fp16 else None
     
-    # Training loop
-    logger.info("***** Running training *****")
-    logger.info(f"Using FP16: {args.fp16}")
-    
+    # Training loop variables
     global_step = 0
     tr_loss = 0.0
-    model.train()
-    
-    # Store losses for plotting
+    start_epoch = 0
     losses = []
     perplexities = []
     sanity_check_results = []
     
-    for epoch in range(args.epochs):
+    # Resume from checkpoint if specified
+    if args.resume_from_checkpoint:
+        model, optimizer, scheduler, start_epoch, global_step, tr_loss, losses, perplexities, sanity_check_results = load_checkpoint(
+            args, model, tokenizer, optimizer, scheduler
+        )
+    
+    # Training loop
+    logger.info("***** Running training *****")
+    logger.info(f"Using FP16: {args.fp16}")
+    
+    model.train()
+    
+    for epoch in range(start_epoch, args.epochs):
         epoch_iterator = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{args.epochs}")
         epoch_loss = 0.0
         
@@ -384,6 +496,13 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
                     losses.append({"step": global_step, "loss": avg_loss})
                     perplexities.append({"step": global_step, "perplexity": perplexity})
                 
+                # Save checkpoint at specified intervals
+                if args.save_steps > 0 and global_step % args.save_steps == 0:
+                    save_checkpoint(
+                        args, model, tokenizer, optimizer, scheduler, epoch, 
+                        global_step, tr_loss, losses, perplexities, sanity_check_results
+                    )
+                
                 # Run sanity check at regular intervals
                 if global_step % args.sanity_check_steps == 0:
                     logger.info(f"\nRunning sanity check at step {global_step}...")
@@ -397,12 +516,20 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
                     # Return to training mode
                     model.train()
         
-        # Evaluate after each epoch
-        eval_results = evaluate_model(args, model, tokenizer, valid_dataloader)
-        
         # Log epoch results
         avg_epoch_loss = epoch_loss / len(train_dataloader)
         logger.info(f"Epoch {epoch+1} - Average Loss: {avg_epoch_loss:.4f}, Perplexity: {math.exp(avg_epoch_loss):.4f}")
+        
+        # IMPORTANT CHANGE: Save checkpoint BEFORE evaluation to avoid losing progress
+        logger.info(f"Saving checkpoint after epoch {epoch+1} (before evaluation)...")
+        save_checkpoint(
+            args, model, tokenizer, optimizer, scheduler, epoch+1, 
+            global_step, tr_loss, losses, perplexities, sanity_check_results
+        )
+        
+        # Evaluate after saving checkpoint
+        logger.info(f"Running evaluation for epoch {epoch+1}...")
+        eval_results = evaluate_model(args, model, tokenizer, valid_dataloader)
         logger.info(f"Evaluation results: {eval_results}")
         
         # Run sanity check after each epoch
@@ -616,8 +743,14 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
     
-    model = GPT2LMHeadModel.from_pretrained(args.model_name_or_path)
-    model = setup_peft_model(model)
+    # Check if we're resuming from checkpoint
+    if args.resume_from_checkpoint:
+        logger.info(f"Loading base model for fine-tuning from: {args.model_name_or_path}")
+        model = GPT2LMHeadModel.from_pretrained(args.model_name_or_path)
+        # We'll set up PEFT and load weights in the load_checkpoint function
+    else:
+        model = GPT2LMHeadModel.from_pretrained(args.model_name_or_path)
+        model = setup_peft_model(model)
     
     # Create datasets
     logger.info("Preparing datasets...")
