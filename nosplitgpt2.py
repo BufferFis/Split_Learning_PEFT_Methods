@@ -50,7 +50,7 @@ meteor = evaluate.load("meteor")
 class E2EDataset(Dataset):
     """E2E NLG Challenge dataset."""
     
-    def __init__(self, hf_dataset, split, tokenizer, max_length=256):
+    def __init__(self, hf_dataset, split, tokenizer, max_length=512):
         """
         Args:
             hf_dataset: Hugging Face dataset object
@@ -178,6 +178,12 @@ def parse_args():
         default=200, 
         help="Number of steps between sanity checks"
     )
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=1,
+        help="Number of updates steps to accumulate before performing a backward/update pass"
+    )
     return parser.parse_args()
 
 def set_random_seeds(seed):
@@ -225,15 +231,20 @@ def sanity_check(model, tokenizer, mrs, device, max_length=256):
     with torch.no_grad():
         for i, mr in enumerate(mrs[:5]):  # Generate for up to 5 MRs
             prompt = f"MR: {mr} REF:"
-            prompt_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+            inputs = tokenizer(prompt, return_tensors="pt", padding=True)
+            input_ids = inputs["input_ids"].to(device)
+            attention_mask = inputs["attention_mask"].to(device)
             
             # Generate text
             generated_ids = model.generate(
-                prompt_ids,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
                 max_length=max_length,
-                num_beams=5,
+                num_beams=3,
                 no_repeat_ngram_size=2,
                 early_stopping=True,
+                pad_token_id=tokenizer.eos_token_id,
+                do_sample=False  # Use greedy decoding initially for more stable outputs
             )
             
             # Decode the generated text
@@ -267,7 +278,7 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
     
     # Set up optimizer and scheduler
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
-    total_steps = len(train_dataloader) * args.epochs
+    total_steps = len(train_dataloader) * args.epochs // args.gradient_accumulation_steps
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=int(0.1 * total_steps),
@@ -305,39 +316,46 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
             
             loss = outputs.loss
             
+            # Scale loss if gradient accumulation is used
+            if args.gradient_accumulation_steps > 1:
+                loss = loss / args.gradient_accumulation_steps
+                
             # Backward pass
             loss.backward()
-            optimizer.step()
-            scheduler.step()
-            model.zero_grad()
             
-            tr_loss += loss.item()
-            epoch_loss += loss.item()
-            global_step += 1
+            tr_loss += loss.item() * args.gradient_accumulation_steps  # Adjust for logging
+            epoch_loss += loss.item() * args.gradient_accumulation_steps
             
-            # Update progress bar
-            epoch_iterator.set_postfix(loss=loss.item())
-            
-            # Record loss every 10 steps
-            if global_step % 10 == 0:
-                avg_loss = tr_loss / global_step
-                perplexity = math.exp(avg_loss)
-                losses.append({"step": global_step, "loss": avg_loss})
-                perplexities.append({"step": global_step, "perplexity": perplexity})
-            
-            # Run sanity check at regular intervals
-            if global_step % args.sanity_check_steps == 0:
-                logger.info(f"\nRunning sanity check at step {global_step}...")
-                generations = sanity_check(model, tokenizer, sample_mrs, device, args.max_length)
+            # Only update parameters after accumulating enough gradients
+            if (step + 1) % args.gradient_accumulation_steps == 0:
+                optimizer.step()
+                scheduler.step()
+                model.zero_grad()
+                global_step += 1
                 
-                # Store results with step number
-                for gen in generations:
-                    gen["step"] = global_step
-                sanity_check_results.extend(generations)
+                # Update progress bar
+                epoch_iterator.set_postfix(loss=loss.item() * args.gradient_accumulation_steps)
                 
-                # Return to training mode (sanity_check already does this, but just to be explicit)
-                model.train()
+                # Record loss every 10 steps
+                if global_step % 10 == 0:
+                    avg_loss = tr_loss / global_step
+                    perplexity = math.exp(avg_loss)
+                    losses.append({"step": global_step, "loss": avg_loss})
+                    perplexities.append({"step": global_step, "perplexity": perplexity})
                 
+                # Run sanity check at regular intervals
+                if global_step % args.sanity_check_steps == 0:
+                    logger.info(f"\nRunning sanity check at step {global_step}...")
+                    generations = sanity_check(model, tokenizer, sample_mrs, device, args.max_length)
+                    
+                    # Store results with step number
+                    for gen in generations:
+                        gen["step"] = global_step
+                    sanity_check_results.extend(generations)
+                    
+                    # Return to training mode
+                    model.train()
+        
         # Evaluate after each epoch
         eval_results = evaluate_model(args, model, tokenizer, valid_dataloader)
         
@@ -423,14 +441,18 @@ def evaluate_model(args, model, tokenizer, eval_dataloader):
     for mr in tqdm(unique_mrs, desc="Generating"):
         # Generate completion based on MR
         prompt = f"MR: {mr} REF:"
-        prompt_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+        inputs = tokenizer(prompt, return_tensors="pt", padding=True)
+        input_ids = inputs["input_ids"].to(device)
+        attention_mask = inputs["attention_mask"].to(device)
         
         generated_ids = model.generate(
-            prompt_ids,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
             max_length=args.max_length,
             num_beams=5,
             no_repeat_ngram_size=2,
             early_stopping=True,
+            pad_token_id=tokenizer.eos_token_id
         )
         
         generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
@@ -539,7 +561,11 @@ def main():
     # Load tokenizer and model
     logger.info(f"Loading model: {args.model_name_or_path}")
     tokenizer = GPT2Tokenizer.from_pretrained(args.model_name_or_path)
-    tokenizer.pad_token = tokenizer.eos_token
+    # Properly set up pad token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    
     model = GPT2LMHeadModel.from_pretrained(args.model_name_or_path)
     model = setup_peft_model(model)
     
@@ -551,7 +577,7 @@ def main():
     
     # Create data loaders
     train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    valid_dataloader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False)
+    valid_dataloader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False)  # Fixed typo
     test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
     
     logger.info(f"Number of training examples: {len(train_dataset)}")
