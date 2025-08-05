@@ -201,7 +201,7 @@ def parse_args():
         "--fp16",
         action="store_true",
         help="Whether to use 16-bit (mixed) precision training",
-        default=True  # Enable by default since user has 30GB VRAM
+        default=False  # Enable by default since user has 30GB VRAM
     )
     # New arguments for checkpoint saving/loading
     parser.add_argument(
