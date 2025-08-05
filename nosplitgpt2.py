@@ -406,7 +406,9 @@ def load_checkpoint(args, model, tokenizer, optimizer, scheduler):
     
     return model, optimizer, scheduler, epoch, global_step, tr_loss, losses, perplexities, sanity_check_results
 
-def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_dataset):
+def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_dataset, valid_dataset):
+
+
     """Train the model and evaluate on validation set."""
     # Set up device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -566,7 +568,8 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
         
         # Evaluate after saving checkpoint
         logger.info(f"Running evaluation for epoch {epoch+1}...")
-        eval_results = evaluate_model(args, model, tokenizer, valid_dataloader)
+        eval_results = evaluate_model(args, model, tokenizer, valid_dataloader, valid_dataset)
+
         logger.info(f"Evaluation results: {eval_results}")
         
         # Run sanity check after each epoch
@@ -594,7 +597,7 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
     
     return global_step, tr_loss / global_step
 
-def evaluate_model(args, model, tokenizer, eval_dataloader):
+def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
     """Evaluate the model on the evaluation dataloader using multiple references."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -603,17 +606,18 @@ def evaluate_model(args, model, tokenizer, eval_dataloader):
     eval_loss = 0.0
     nb_eval_steps = 0
     
+    # Use the dataset's mr_to_refs mapping for true references
+    mr_to_references = eval_dataset.mr_to_refs
+    
     # Group predictions by MR
     mr_to_predictions = {}
-    mr_to_references = defaultdict(list)
     
-    # First pass: calculate loss and collect references
-    for batch in tqdm(eval_dataloader, desc="Evaluating"):
+    # First pass: calculate loss only
+    for batch in tqdm(eval_dataloader, desc="Calculating loss"):
         with torch.no_grad():
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
-            mrs = batch.get("mr", None)
             
             # Forward pass for evaluation
             outputs = model(
@@ -626,17 +630,6 @@ def evaluate_model(args, model, tokenizer, eval_dataloader):
             loss = outputs.loss
             eval_loss += loss.item()
             nb_eval_steps += 1
-            
-            # Extract references for each MR
-            for i in range(len(input_ids)):
-                text = tokenizer.decode(input_ids[i], skip_special_tokens=True)
-                mr = mrs[i] if mrs is not None else text.split("REF:")[0].strip().replace("MR: ", "")
-                
-                reference_text = tokenizer.decode(labels[i], skip_special_tokens=True)
-                if "REF:" in reference_text:
-                    reference_text = reference_text.split("REF:")[1].strip()
-                
-                mr_to_references[mr].append(reference_text)
     
     # Second pass: generate predictions for unique MRs
     unique_mrs = list(mr_to_references.keys())
@@ -653,7 +646,7 @@ def evaluate_model(args, model, tokenizer, eval_dataloader):
             input_ids=input_ids,
             attention_mask=attention_mask,
             max_length=args.max_length,
-            num_beams=5,
+            num_beams=10,
             no_repeat_ngram_size=2,
             early_stopping=True,
             pad_token_id=tokenizer.eos_token_id
@@ -670,14 +663,22 @@ def evaluate_model(args, model, tokenizer, eval_dataloader):
     # Calculate perplexity
     perplexity = math.exp(eval_loss / nb_eval_steps) if eval_loss > 0 else float("inf")
     
-    # Prepare data for metrics calculation
+    # Prepare data for metrics calculation using TRUE references from dataset
     all_predictions = []
     all_references = []
     
     for mr in unique_mrs:
-        if mr in mr_to_predictions:
+        if mr in mr_to_predictions and mr in mr_to_references:
             all_predictions.append(mr_to_predictions[mr])
-            all_references.append(mr_to_references[mr])
+            all_references.append(mr_to_references[mr])  # True references from dataset
+    
+    # Debug: Print a few examples to verify correctness
+    logger.info("=== EVALUATION DEBUG: First 3 examples ===")
+    for i in range(min(3, len(all_predictions))):
+        logger.info(f"MR: {list(mr_to_references.keys())[i]}")
+        logger.info(f"Prediction: {all_predictions[i]}")
+        logger.info(f"References: {all_references[i]}")
+        logger.info("-" * 40)
     
     # Calculate metrics with multiple references
     # BLEU (handles multiple references correctly)
@@ -690,12 +691,10 @@ def evaluate_model(args, model, tokenizer, eval_dataloader):
     for i, pred in enumerate(all_predictions):
         refs = all_references[i]
         best_rouge = {"rouge1": 0, "rouge2": 0, "rougeL": 0}
-        
         for ref in refs:
             score = rouge.compute(predictions=[pred], references=[ref])
             for key in best_rouge:
                 best_rouge[key] = max(best_rouge[key], score[key])
-        
         for key in rouge_scores:
             rouge_scores[key] += best_rouge[key]
     
@@ -708,11 +707,9 @@ def evaluate_model(args, model, tokenizer, eval_dataloader):
     for i, pred in enumerate(all_predictions):
         refs = all_references[i]
         best_meteor = 0
-        
         for ref in refs:
             score = meteor.compute(predictions=[pred], references=[ref])
             best_meteor = max(best_meteor, score["meteor"])
-        
         meteor_score += best_meteor
     
     meteor_score /= len(all_predictions) if all_predictions else 1
@@ -728,10 +725,12 @@ def evaluate_model(args, model, tokenizer, eval_dataloader):
     
     return results
 
-def test_model(args, model, tokenizer, test_dataloader):
+
+def test_model(args, model, tokenizer, test_dataloader, test_dataset):
+
     """Test the model on the test set."""
     logger.info("***** Running testing *****")
-    results = evaluate_model(args, model, tokenizer, test_dataloader)
+    results = evaluate_model(args, model, tokenizer, test_dataloader, test_dataset)
     logger.info(f"Test results: {results}")
     
     # Save results to file
@@ -806,7 +805,8 @@ def main():
     
     # Train model
     logger.info("Starting training...")
-    global_step, train_loss = train(args, model, tokenizer, train_dataloader, valid_dataloader, train_dataset)
+    global_step, train_loss = train(args, model, tokenizer, train_dataloader, valid_dataloader, train_dataset, valid_dataset)
+
     logger.info(f"Training complete. Global step: {global_step}, Average loss: {train_loss}")
     
     # Save trained model
@@ -814,7 +814,7 @@ def main():
     tokenizer.save_pretrained(os.path.join(args.output_dir, "tokenizer"))
     
     # Test model
-    test_results = test_model(args, model, tokenizer, test_dataloader)
+    test_results = test_model(args, model, tokenizer, test_dataloader, test_dataset)
     
     return test_results
 
