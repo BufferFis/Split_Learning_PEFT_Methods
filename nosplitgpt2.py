@@ -298,8 +298,8 @@ def sanity_check(model, tokenizer, mrs, device, max_length=256):
     
     return generations
 
-def save_checkpoint(args, model, tokenizer, optimizer, scheduler, epoch, global_step, tr_loss, 
-                    losses, perplexities, sanity_check_results):
+def save_checkpoint(args, model, tokenizer, optimizer, scheduler, epoch, global_step, tr_loss,
+                   losses, perplexities, sanity_check_results, scaler=None):
     """Save model checkpoint and training state."""
     checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-{global_step}")
     if not os.path.exists(checkpoint_dir):
@@ -315,6 +315,10 @@ def save_checkpoint(args, model, tokenizer, optimizer, scheduler, epoch, global_
     torch.save(optimizer.state_dict(), os.path.join(checkpoint_dir, "optimizer.pt"))
     torch.save(scheduler.state_dict(), os.path.join(checkpoint_dir, "scheduler.pt"))
     
+    # Save scaler state if using FP16
+    if scaler is not None:
+        torch.save(scaler.state_dict(), os.path.join(checkpoint_dir, "scaler.pt"))
+    
     # Save training state
     training_state = {
         "epoch": epoch,
@@ -322,7 +326,7 @@ def save_checkpoint(args, model, tokenizer, optimizer, scheduler, epoch, global_
         "tr_loss": tr_loss,
         "losses": losses,
         "perplexities": perplexities,
-        "args": vars(args)  # Convert args to dict for JSON serialization
+        "args": vars(args) # Convert args to dict for JSON serialization
     }
     
     with open(os.path.join(checkpoint_dir, "training_state.json"), "w") as f:
@@ -331,12 +335,12 @@ def save_checkpoint(args, model, tokenizer, optimizer, scheduler, epoch, global_
     # Save sanity check results
     with open(os.path.join(checkpoint_dir, "sanity_checks.json"), "w") as f:
         json.dump(sanity_check_results, f)
-        
-    logger.info(f"Checkpoint saved at step {global_step}")
     
+    logger.info(f"Checkpoint saved at step {global_step}")
     return checkpoint_dir
 
-def load_checkpoint(args, model, tokenizer, optimizer, scheduler):
+
+def load_checkpoint(args, model, tokenizer, optimizer, scheduler, scaler=None):
     """Load model and training state from checkpoint while fixing optimizer state."""
     checkpoint_dir = args.resume_from_checkpoint
     logger.info(f"Loading checkpoint from {checkpoint_dir}")
@@ -364,19 +368,15 @@ def load_checkpoint(args, model, tokenizer, optimizer, scheduler):
         try:
             # First initialize a fresh optimizer with the correct parameter structure
             fresh_optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
-            
             # Load the saved state
             checkpoint = torch.load(os.path.join(checkpoint_dir, "optimizer.pt"))
-            
             # Map parameters by name instead of position to fix mismatch
             saved_groups = checkpoint['state']
             current_groups = fresh_optimizer.state_dict()['state']
-            
             # Map saved state to current parameters where possible
             for k, v in current_groups.items():
                 if k in saved_groups:
                     fresh_optimizer.state[k] = saved_groups[k]
-            
             optimizer = fresh_optimizer
             logger.info("Optimizer state partially recovered")
         except Exception as e:
@@ -395,6 +395,15 @@ def load_checkpoint(args, model, tokenizer, optimizer, scheduler):
         except Exception as e:
             logger.warning(f"Failed to load scheduler: {e}")
     
+    # Load scaler state if it exists
+    if scaler is not None and os.path.exists(os.path.join(checkpoint_dir, "scaler.pt")):
+        try:
+            scaler.load_state_dict(torch.load(os.path.join(checkpoint_dir, "scaler.pt")))
+            logger.info("Scaler state loaded")
+        except Exception as e:
+            logger.warning(f"Failed to load scaler: {e}")
+            logger.warning("Training will continue with fresh scaler")
+    
     # Load sanity check results
     sanity_check_results = []
     if os.path.exists(os.path.join(checkpoint_dir, "sanity_checks.json")):
@@ -403,12 +412,10 @@ def load_checkpoint(args, model, tokenizer, optimizer, scheduler):
         logger.info("Sanity check results loaded")
     
     logger.info(f"Resumed from epoch {epoch}, global step {global_step}")
-    
     return model, optimizer, scheduler, epoch, global_step, tr_loss, losses, perplexities, sanity_check_results
 
+
 def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_dataset, valid_dataset):
-
-
     """Train the model and evaluate on validation set."""
     # Set up device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -427,6 +434,14 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
         num_training_steps=total_steps
     )
     
+    # Create scaler BEFORE loading checkpoint
+    if args.fp16:
+        from torch.amp import GradScaler
+        scaler = GradScaler()
+        logger.info("Created GradScaler for mixed precision training")
+    else:
+        scaler = None
+    
     # Training loop variables
     global_step = 0
     tr_loss = 0.0
@@ -438,22 +453,12 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
     # Resume from checkpoint if specified
     if args.resume_from_checkpoint:
         model, optimizer, scheduler, start_epoch, global_step, tr_loss, losses, perplexities, sanity_check_results = load_checkpoint(
-            args, model, tokenizer, optimizer, scheduler
+            args, model, tokenizer, optimizer, scheduler, scaler
         )
-    
-    # IMPORTANT: Create fresh scaler AFTER loading checkpoint
-    # This ensures the scaler is properly synchronized with the optimizer
-    if args.fp16:
-        from torch.amp import GradScaler
-        scaler = GradScaler()
-        logger.info("Created fresh GradScaler for mixed precision training")
-    else:
-        scaler = None
     
     # Training loop
     logger.info("***** Running training *****")
     logger.info(f"Using FP16: {args.fp16}")
-    
     model.train()
     
     for epoch in range(start_epoch, args.epochs):
@@ -477,9 +482,9 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
                     )
                     loss = outputs.loss
                     
-                    # Scale loss if gradient accumulation is used
-                    if args.gradient_accumulation_steps > 1:
-                        loss = loss / args.gradient_accumulation_steps
+                # Scale loss if gradient accumulation is used
+                if args.gradient_accumulation_steps > 1:
+                    loss = loss / args.gradient_accumulation_steps
                 
                 # Backward pass with scaled gradients
                 scaler.scale(loss).backward()
@@ -506,16 +511,15 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
             # Only update parameters after accumulating enough gradients
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 if args.fp16:
-                    # FIX: Skip unscale_ and use a more conservative approach
-                    # This avoids the "No inf checks were recorded" error
-                    try:
-                        # Update with scaler - handles unscaling internally
-                        scaler.step(optimizer)
-                        scaler.update()
-                    except RuntimeError as e:
-                        logger.warning(f"Optimizer step failed: {e}")
-                        # Skip this step if it failed
-                        scaler.update()
+                    # Check if gradients are finite before stepping
+                    scaler.unscale_(optimizer)
+                    
+                    # Clip gradients if needed
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    
+                    # Step with scaler
+                    scaler.step(optimizer)
+                    scaler.update()
                 else:
                     # Standard optimizer step
                     optimizer.step()
@@ -538,20 +542,18 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
                 # Save checkpoint at specified intervals
                 if args.save_steps > 0 and global_step % args.save_steps == 0:
                     save_checkpoint(
-                        args, model, tokenizer, optimizer, scheduler, epoch, 
-                        global_step, tr_loss, losses, perplexities, sanity_check_results
+                        args, model, tokenizer, optimizer, scheduler, epoch,
+                        global_step, tr_loss, losses, perplexities, sanity_check_results, scaler
                     )
                 
                 # Run sanity check at regular intervals
                 if global_step % args.sanity_check_steps == 0:
                     logger.info(f"\nRunning sanity check at step {global_step}...")
                     generations = sanity_check(model, tokenizer, sample_mrs, device, args.max_length)
-                    
                     # Store results with step number
                     for gen in generations:
                         gen["step"] = global_step
                     sanity_check_results.extend(generations)
-                    
                     # Return to training mode
                     model.train()
         
@@ -562,40 +564,36 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
         # Save checkpoint BEFORE evaluation
         logger.info(f"Saving checkpoint after epoch {epoch+1} (before evaluation)...")
         save_checkpoint(
-            args, model, tokenizer, optimizer, scheduler, epoch+1, 
-            global_step, tr_loss, losses, perplexities, sanity_check_results
+            args, model, tokenizer, optimizer, scheduler, epoch+1,
+            global_step, tr_loss, losses, perplexities, sanity_check_results, scaler
         )
         
         # Evaluate after saving checkpoint
         logger.info(f"Running evaluation for epoch {epoch+1}...")
         eval_results = evaluate_model(args, model, tokenizer, valid_dataloader, valid_dataset)
-
         logger.info(f"Evaluation results: {eval_results}")
         
         # Run sanity check after each epoch
         logger.info(f"\nRunning sanity check after epoch {epoch+1}...")
         generations = sanity_check(model, tokenizer, sample_mrs, device, args.max_length)
-        
         # Store results with epoch number
         for gen in generations:
             gen["epoch"] = epoch + 1
             gen["step"] = global_step
         sanity_check_results.extend(generations)
-        
         # Return to training mode
         model.train()
     
     # Save final results
     with open(os.path.join(args.output_dir, "losses.json"), "w") as f:
         json.dump(losses, f)
-    
     with open(os.path.join(args.output_dir, "perplexities.json"), "w") as f:
         json.dump(perplexities, f)
-    
     with open(os.path.join(args.output_dir, "sanity_checks.json"), "w") as f:
         json.dump(sanity_check_results, f)
     
     return global_step, tr_loss / global_step
+
 
 def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
     """Evaluate the model on the evaluation dataloader using multiple references."""
