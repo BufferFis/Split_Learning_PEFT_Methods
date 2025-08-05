@@ -435,12 +435,12 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
     )
     
     # Create scaler BEFORE loading checkpoint
-    if args.fp16:
-        from torch.amp import GradScaler
-        scaler = GradScaler()
-        logger.info("Created GradScaler for mixed precision training")
-    else:
-        scaler = None
+    # if args.fp16:
+    #     from torch.amp import GradScaler
+    #     scaler = GradScaler()
+    #     logger.info("Created GradScaler for mixed precision training")
+    # else:
+    scaler = None
     
     # Training loop variables
     global_step = 0
@@ -458,7 +458,7 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
     
     # Training loop
     logger.info("***** Running training *****")
-    logger.info(f"Using FP16: {args.fp16}")
+    #logger.info(f"Using FP16: {args.fp16}")
     model.train()
     
     for epoch in range(start_epoch, args.epochs):
@@ -471,58 +471,58 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
             labels = batch["labels"].to(device)
             
             # Forward pass with mixed precision if enabled
-            if args.fp16:
-                from torch.amp import autocast
-                with autocast(device_type='cuda'):
-                    outputs = model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        labels=labels,
-                        return_dict=True,
-                    )
-                    loss = outputs.loss
+            # if args.fp16:
+            #     from torch.amp import autocast
+            #     with autocast(device_type='cuda'):
+            #         outputs = model(
+            #             input_ids=input_ids,
+            #             attention_mask=attention_mask,
+            #             labels=labels,
+            #             return_dict=True,
+            #         )
+            #         loss = outputs.loss
                     
-                # Scale loss if gradient accumulation is used
-                if args.gradient_accumulation_steps > 1:
-                    loss = loss / args.gradient_accumulation_steps
+            #     # Scale loss if gradient accumulation is used
+            #     if args.gradient_accumulation_steps > 1:
+            #         loss = loss / args.gradient_accumulation_steps
                 
-                # Backward pass with scaled gradients
-                scaler.scale(loss).backward()
-            else:
-                # Standard forward pass
-                outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels,
-                    return_dict=True,
-                )
-                loss = outputs.loss
-                
-                # Scale loss if gradient accumulation is used
-                if args.gradient_accumulation_steps > 1:
-                    loss = loss / args.gradient_accumulation_steps
-                
-                # Standard backward pass
-                loss.backward()
+            #     # Backward pass with scaled gradients
+            #     scaler.scale(loss).backward()
+            # else:
+            # Standard forward pass
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                return_dict=True,
+            )
+            loss = outputs.loss
+            
+            # Scale loss if gradient accumulation is used
+            if args.gradient_accumulation_steps > 1:
+                loss = loss / args.gradient_accumulation_steps
+            
+            # Standard backward pass
+            loss.backward()
             
             tr_loss += loss.item() * args.gradient_accumulation_steps
             epoch_loss += loss.item() * args.gradient_accumulation_steps
             
             # Only update parameters after accumulating enough gradients
             if (step + 1) % args.gradient_accumulation_steps == 0:
-                if args.fp16:
-                    # Check if gradients are finite before stepping
-                    scaler.unscale_(optimizer)
+                # if args.fp16:
+                #     # Check if gradients are finite before stepping
+                #     scaler.unscale_(optimizer)
                     
-                    # Clip gradients if needed
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                #     # Clip gradients if needed
+                #     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     
-                    # Step with scaler
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    # Standard optimizer step
-                    optimizer.step()
+                #     # Step with scaler
+                #     scaler.step(optimizer)
+                #     scaler.update()
+                # else:
+                # Standard optimizer step
+                optimizer.step()
                 
                 # Always update scheduler - it's robust to skipped steps
                 scheduler.step()
