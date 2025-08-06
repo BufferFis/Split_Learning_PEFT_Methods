@@ -19,6 +19,8 @@ import evaluate
 import nltk
 from nltk.tokenize import word_tokenize
 from nltk.translate.bleu_score import corpus_bleu
+import sacrebleu
+from sacremoses import MosesDetokenizer
 from transformers import (
     GPT2LMHeadModel,
     GPT2Tokenizer,
@@ -32,6 +34,32 @@ from peft import (
     PeftModel,
     prepare_model_for_kbit_training,
 )
+def calculate_e2e_bleu(predictions, references_list):
+    """Calculate BLEU using sacreBLEU (E2E standard)"""
+    try:
+        import sacrebleu
+        from sacremoses import MosesDetokenizer
+        
+        # Detokenize predictions and references
+        md = MosesDetokenizer(lang='en')
+        
+        # Detokenize predictions
+        detok_preds = []
+        for pred in predictions:
+            detok_preds.append(md.detokenize(pred.split()))
+        
+        # Detokenize references (take first reference for each)
+        detok_refs = []
+        for refs in references_list:
+            detok_refs.append([md.detokenize(refs[0].split())])
+        
+        # Calculate corpus BLEU using sacreBLEU
+        bleu = sacrebleu.corpus_bleu(detok_preds, list(zip(*detok_refs)))
+        return bleu.score / 100.0  # Convert to 0-1 scale
+        
+    except ImportError:
+        logger.warning("sacreBLEU not available, falling back to NLTK")
+        return corpus_bleu(references_list, predictions)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -272,10 +300,11 @@ def sanity_check(model, tokenizer, mrs, device, max_length=256):
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_length=max_length,
-                num_beams=3,
-                no_repeat_ngram_size=2,
+                num_beams=5,
+                no_repeat_ngram_size=3,
                 early_stopping=True,
                 pad_token_id=tokenizer.eos_token_id,
+                length_penalty=1.0,
                 do_sample=False  # Use greedy decoding initially for more stable outputs
             )
             
@@ -596,46 +625,19 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
 
 
 def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
-    """Evaluate using official E2E NLG Challenge methodology (Python-only implementation)."""
-    import subprocess
-    import tempfile
-    import os
-    from pathlib import Path
+    """Evaluate using SplitFM/E2E Challenge methodology"""
+    import sacrebleu
+    from sacremoses import MosesDetokenizer
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
     model.eval()
     
-    eval_loss = 0.0
-    nb_eval_steps = 0
-    
-    # Use the dataset's mr_to_refs mapping for true references
+    # Get all unique MRs and generate predictions
     mr_to_references = eval_dataset.mr_to_refs
-    mr_to_predictions = {}
+    predictions = []
+    references_list = []
     
-    # First pass: calculate loss only
-    for batch in tqdm(eval_dataloader, desc="Calculating loss"):
-        with torch.no_grad():
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
-            
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                return_dict=True,
-            )
-            
-            loss = outputs.loss
-            eval_loss += loss.item()
-            nb_eval_steps += 1
-    
-    # Second pass: generate predictions for unique MRs
-    unique_mrs = list(mr_to_references.keys())
-    logger.info(f"Generating predictions for {len(unique_mrs)} unique MRs...")
-    
-    for mr in tqdm(unique_mrs, desc="Generating"):
+    for mr in tqdm(list(mr_to_references.keys()), desc="Generating E2E predictions"):
         prompt = f"MR: {mr} REF:"
         inputs = tokenizer(prompt, return_tensors="pt", padding=True)
         input_ids = inputs["input_ids"].to(device)
@@ -645,169 +647,72 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
             input_ids=input_ids,
             attention_mask=attention_mask,
             max_length=args.max_length,
-            num_beams=5,  # Standard E2E setting
-            no_repeat_ngram_size=2,
+            num_beams=10,  # E2E standard
+            no_repeat_ngram_size=3,
             early_stopping=True,
+            length_penalty=1.0,
             pad_token_id=tokenizer.eos_token_id
         )
         
         generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-        
         if "REF:" in generated_text:
             generated_text = generated_text.split("REF:")[1].strip()
         
-        mr_to_predictions[mr] = generated_text
+        predictions.append(generated_text)
+        references_list.append(mr_to_references[mr])
     
-    # Calculate perplexity
-    perplexity = math.exp(eval_loss / nb_eval_steps) if eval_loss > 0 else float("inf")
+    # Calculate BLEU using sacreBLEU (E2E standard)
+    md = MosesDetokenizer(lang='en')
     
-    # === CREATE E2E-STYLE FILES ===
-    # Create temporary files in E2E format for evaluation
-    with tempfile.TemporaryDirectory() as temp_dir:
-        # Create predictions file (system output)
-        pred_file = os.path.join(temp_dir, "predictions.txt")
-        with open(pred_file, 'w', encoding='utf-8') as f:
-            for mr in unique_mrs:
-                if mr in mr_to_predictions:
-                    f.write(f"{mr_to_predictions[mr]}\n")
-        
-        # Create references file (multi-reference format)
-        ref_file = os.path.join(temp_dir, "references.txt")
-        with open(ref_file, 'w', encoding='utf-8') as f:
-            for mr in unique_mrs:
-                if mr in mr_to_references:
-                    # Write all references for this MR
-                    for ref in mr_to_references[mr]:
-                        f.write(f"{ref}\n")
-                    # Add empty line to separate different MRs (E2E format)
-                    if len(mr_to_references[mr]) > 1:
-                        f.write("\n")
-        
-        # === PYTHON-ONLY E2E EVALUATION ===
-        predictions = []
-        references_list = []
-        
-        # Read predictions
-        with open(pred_file, 'r', encoding='utf-8') as f:
-            predictions = [line.strip() for line in f if line.strip()]
-        
-        # Read multi-references (E2E format)
-        with open(ref_file, 'r', encoding='utf-8') as f:
-            content = f.read().strip()
-            ref_groups = content.split('\n\n')  # Split by empty lines
-            
-            for group in ref_groups:
-                refs = [line.strip() for line in group.split('\n') if line.strip()]
-                if refs:
-                    references_list.append(refs)
-        
-        # Ensure we have matching numbers
-        min_len = min(len(predictions), len(references_list))
-        predictions = predictions[:min_len]
-        references_list = references_list[:min_len]
-        
-        logger.info(f"Evaluating {len(predictions)} predictions with E2E methodology")
-        
-        # === E2E OFFICIAL BLEU (corpus-level) ===
-        tokenized_predictions = []
-        tokenized_references = []
-        
-        for i, pred in enumerate(predictions):
-            # Tokenize prediction (lowercase, as per E2E standard)
-            pred_tokens = word_tokenize(pred.lower())
-            tokenized_predictions.append(pred_tokens)
-            
-            # Tokenize all references for this prediction
-            ref_tokens_list = []
-            for ref in references_list[i]:
-                ref_tokens = word_tokenize(ref.lower())
-                ref_tokens_list.append(ref_tokens)
-            tokenized_references.append(ref_tokens_list)
-        
-        # Calculate corpus-level BLEU (official E2E method)
-        try:
-            from nltk.translate.bleu_score import corpus_bleu
-            bleu_score = corpus_bleu(tokenized_references, tokenized_predictions)
-        except Exception as e:
-            logger.warning(f"BLEU calculation failed: {e}")
-            bleu_score = 0.0
-        
-        # === E2E OFFICIAL METEOR (sentence-level then averaged) ===
-        meteor_scores = []
-        
-        for i, pred in enumerate(predictions):
-            refs = references_list[i]
-            
-            # Calculate METEOR against all references, take maximum (E2E standard)
-            best_meteor = 0.0
-            for ref in refs:
-                try:
-                    score = meteor.compute(predictions=[pred], references=[ref])
-                    meteor_score_val = score["meteor"]
-                    best_meteor = max(best_meteor, meteor_score_val)
-                except Exception as e:
-                    continue
-            
-            meteor_scores.append(best_meteor)
-        
-        # Average METEOR scores (official E2E method)
-        avg_meteor = sum(meteor_scores) / len(meteor_scores) if meteor_scores else 0.0
-        
-        # === E2E OFFICIAL ROUGE-L (sentence-level then averaged) ===
-        rouge_scores = []
-        
-        for i, pred in enumerate(predictions):
-            refs = references_list[i]
-            
-            # Calculate ROUGE-L against all references, take maximum
-            best_rouge = 0.0
-            for ref in refs:
-                try:
-                    score = rouge.compute(predictions=[pred], references=[ref])
-                    rouge_score_val = score["rougeL"]
-                    best_rouge = max(best_rouge, rouge_score_val)
-                except Exception as e:
-                    continue
-            
-            rouge_scores.append(best_rouge)
-        
-        # Average ROUGE-L scores
-        avg_rouge_l = sum(rouge_scores) / len(rouge_scores) if rouge_scores else 0.0
+    # Detokenize predictions
+    detok_preds = [md.detokenize(pred.split()) for pred in predictions]
     
-    # === RESULTS IN E2E FORMAT ===
+    # Prepare references for sacreBLEU (use all references)
+    detok_refs = []
+    for refs in references_list:
+        detok_refs.append([md.detokenize(ref.split()) for ref in refs])
+    
+    # Transpose references for sacreBLEU format
+    transposed_refs = []
+    max_refs = max(len(refs) for refs in detok_refs)
+    for i in range(max_refs):
+        ref_set = []
+        for refs in detok_refs:
+            if i < len(refs):
+                ref_set.append(refs[i])
+            else:
+                ref_set.append(refs[0])  # Repeat first reference if needed
+        transposed_refs.append(ref_set)
+    
+    # Calculate corpus BLEU
+    bleu = sacrebleu.corpus_bleu(detok_preds, transposed_refs)
+    bleu_score = bleu.score / 100.0  # Convert to 0-1 scale
+    
+    # Calculate METEOR (your existing code is fine)
+    meteor_scores = []
+    for i, pred in enumerate(predictions):
+        refs = references_list[i]
+        best_meteor = max(meteor.compute(predictions=[pred], references=[ref])["meteor"] 
+                         for ref in refs)
+        meteor_scores.append(best_meteor)
+    
+    avg_meteor = sum(meteor_scores) / len(meteor_scores)
+    
     results = {
-        "perplexity": perplexity,
         "bleu": bleu_score,
         "meteor": avg_meteor,
-        "rouge_l": avg_rouge_l,
-        "num_predictions": len(predictions),
-        "num_unique_mrs": len(unique_mrs)
+        "num_predictions": len(predictions)
     }
     
-    # === E2E-STYLE LOGGING ===
-    logger.info("=" * 50)
-    logger.info("E2E NLG CHALLENGE EVALUATION RESULTS")
-    logger.info("=" * 50)
-    logger.info(f"BLEU:      {bleu_score:.4f}")
-    logger.info(f"METEOR:    {avg_meteor:.4f}")
-    logger.info(f"ROUGE-L:   {avg_rouge_l:.4f}")
-    logger.info(f"Perplexity: {perplexity:.4f}")
-    logger.info("=" * 50)
-    logger.info("E2E Benchmark Comparison:")
-    logger.info("TGen Baseline:  BLEU=0.6925, METEOR=0.4703, ROUGE-L=0.7257")
-    logger.info("Challenge Winner: BLEU=0.7128, METEOR=0.4770, ROUGE-L=0.7378")
-    logger.info("=" * 50)
-    
-    # Debug: Show a few examples
-    logger.info("=== SAMPLE PREDICTIONS ===")
-    for i in range(min(3, len(predictions))):
-        logger.info(f"Prediction: {predictions[i]}")
-        logger.info(f"References: {references_list[i]}")
-        logger.info(f"METEOR: {meteor_scores[i]:.4f}, ROUGE-L: {rouge_scores[i]:.4f}")
-        logger.info("-" * 40)
+    logger.info(f"=== SPLITFM-STYLE RESULTS ===")
+    logger.info(f"BLEU: {bleu_score:.4f} (Target: 0.69)")
+    logger.info(f"METEOR: {avg_meteor:.4f}")
     
     return results
 
+
+    
+ 
 
 
 def test_model(args, model, tokenizer, test_dataloader, test_dataset):
