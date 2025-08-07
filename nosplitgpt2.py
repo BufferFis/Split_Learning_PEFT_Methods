@@ -625,9 +625,11 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
 
 
 def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
-    """Evaluate using SplitFM/E2E Challenge methodology"""
-    import sacrebleu
-    from sacremoses import MosesDetokenizer
+    """Evaluate using OFFICIAL E2E evaluation scripts (Python wrapper)"""
+    import subprocess
+    import tempfile
+    import os
+    from pathlib import Path
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.eval()
@@ -635,9 +637,10 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
     # Get all unique MRs and generate predictions
     mr_to_references = eval_dataset.mr_to_refs
     predictions = []
-    references_list = []
+    mrs = []
     
-    for mr in tqdm(list(mr_to_references.keys()), desc="Generating E2E predictions"):
+    logger.info("Generating predictions for E2E evaluation...")
+    for mr in tqdm(list(mr_to_references.keys()), desc="Generating"):
         prompt = f"MR: {mr} REF:"
         inputs = tokenizer(prompt, return_tensors="pt", padding=True)
         input_ids = inputs["input_ids"].to(device)
@@ -647,7 +650,7 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
             input_ids=input_ids,
             attention_mask=attention_mask,
             max_length=args.max_length,
-            num_beams=10,  # E2E standard
+            num_beams=10,
             no_repeat_ngram_size=3,
             early_stopping=True,
             length_penalty=1.0,
@@ -659,56 +662,128 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
             generated_text = generated_text.split("REF:")[1].strip()
         
         predictions.append(generated_text)
-        references_list.append(mr_to_references[mr])
+        mrs.append(mr)
     
-    # Calculate BLEU using sacreBLEU (E2E standard)
-    md = MosesDetokenizer(lang='en')
+    # === RUN OFFICIAL E2E EVALUATION ===
     
-    # Detokenize predictions
-    detok_preds = [md.detokenize(pred.split()) for pred in predictions]
+    # Create temporary files in the format expected by E2E scripts
+    with tempfile.TemporaryDirectory() as temp_dir:
+        
+        # Create system output file (one prediction per line)
+        sys_file = os.path.join(temp_dir, "system_output.txt")
+        with open(sys_file, 'w', encoding='utf-8') as f:
+            for pred in predictions:
+                f.write(f"{pred}\n")
+        
+        # Create reference file (multiple references per MR, one per line)
+        ref_file = os.path.join(temp_dir, "references.txt")
+        with open(ref_file, 'w', encoding='utf-8') as f:
+            for mr in mrs:
+                refs = mr_to_references[mr]
+                for ref in refs:
+                    f.write(f"{ref}\n")
+                # Add separator line between different MRs
+                f.write("\n")
+        
+        # Create MR file (one MR per line, matching system output)
+        mr_file = os.path.join(temp_dir, "mrs.txt")
+        with open(mr_file, 'w', encoding='utf-8') as f:
+            for mr in mrs:
+                f.write(f"{mr}\n")
+        
+        # === CALL OFFICIAL E2E EVALUATION ===
+        
+        try:
+            # Path to your cloned e2e-metrics repository
+            e2e_metrics_path = "./e2e-metrics"  # Adjust this path to your cloned repo
+            measure_scores_script = os.path.join(e2e_metrics_path, "measure_scores.py")
+            
+            if not os.path.exists(measure_scores_script):
+                raise FileNotFoundError(f"E2E metrics script not found at {measure_scores_script}")
+            
+            # Run the official evaluation script
+            cmd = [
+                "python", measure_scores_script,
+                ref_file,  # reference file
+                sys_file   # system output file
+            ]
+            
+            logger.info(f"Running official E2E evaluation: {' '.join(cmd)}")
+            result = subprocess.run(cmd, capture_output=True, text=True, cwd=e2e_metrics_path)
+            
+            if result.returncode != 0:
+                logger.error(f"E2E evaluation failed: {result.stderr}")
+                # Fallback to our implementation
+                return fallback_evaluation(predictions, [mr_to_references[mr] for mr in mrs])
+            
+            # Parse the output from official E2E script
+            scores = parse_e2e_output(result.stdout)
+            
+        except Exception as e:
+            logger.warning(f"Official E2E evaluation failed: {e}")
+            logger.info("Falling back to Python implementation")
+            return fallback_evaluation(predictions, [mr_to_references[mr] for mr in mrs])
     
-    # Prepare references for sacreBLEU (use all references)
-    detok_refs = []
-    for refs in references_list:
-        detok_refs.append([md.detokenize(ref.split()) for ref in refs])
+    logger.info("=" * 60)
+    logger.info("OFFICIAL E2E NLG CHALLENGE RESULTS")
+    logger.info("=" * 60)
+    for metric, score in scores.items():
+        logger.info(f"{metric.upper()}: {score:.4f}")
+    logger.info("=" * 60)
+    logger.info("E2E Benchmark Comparison:")
+    logger.info("TGen:    BLEU=69.25, METEOR=47.03")
+    logger.info("Winner:  BLEU=71.28, METEOR=47.70")
+    logger.info(f"SplitFM: BLEU=69.00 (target)")
+    logger.info("=" * 60)
     
-    # Transpose references for sacreBLEU format
-    transposed_refs = []
-    max_refs = max(len(refs) for refs in detok_refs)
-    for i in range(max_refs):
-        ref_set = []
-        for refs in detok_refs:
-            if i < len(refs):
-                ref_set.append(refs[i])
-            else:
-                ref_set.append(refs[0])  # Repeat first reference if needed
-        transposed_refs.append(ref_set)
+    return scores
+
+
+def parse_e2e_output(output_str):
+    """Parse the output from official E2E evaluation script"""
+    scores = {}
     
-    # Calculate corpus BLEU
-    bleu = sacrebleu.corpus_bleu(detok_preds, transposed_refs)
-    bleu_score = bleu.score / 100.0  # Convert to 0-1 scale
+    for line in output_str.strip().split('\n'):
+        line = line.strip()
+        if ':' in line:
+            metric, score_str = line.split(':', 1)
+            metric = metric.strip().lower()
+            try:
+                score = float(score_str.strip())
+                scores[metric] = score
+            except ValueError:
+                continue
     
-    # Calculate METEOR (your existing code is fine)
+    return scores
+
+
+def fallback_evaluation(predictions, references_list):
+    """Fallback evaluation using our Python implementation"""
+    logger.info("Using fallback evaluation...")
+    
+    # Calculate METEOR
     meteor_scores = []
-    for i, pred in enumerate(predictions):
-        refs = references_list[i]
+    for pred, refs in zip(predictions, references_list):
         best_meteor = max(meteor.compute(predictions=[pred], references=[ref])["meteor"] 
                          for ref in refs)
         meteor_scores.append(best_meteor)
+    meteor_score = sum(meteor_scores) / len(meteor_scores)
     
-    avg_meteor = sum(meteor_scores) / len(meteor_scores)
+    # Calculate BLEU using NLTK corpus_bleu (closest to E2E)
+    from nltk.translate.bleu_score import corpus_bleu
     
-    results = {
+    # Tokenize for BLEU
+    tokenized_preds = [pred.lower().split() for pred in predictions]
+    tokenized_refs = [[ref.lower().split() for ref in refs] for refs in references_list]
+    
+    bleu_score = corpus_bleu(tokenized_refs, tokenized_preds)
+    
+    return {
         "bleu": bleu_score,
-        "meteor": avg_meteor,
+        "meteor": meteor_score,
         "num_predictions": len(predictions)
     }
-    
-    logger.info(f"=== SPLITFM-STYLE RESULTS ===")
-    logger.info(f"BLEU: {bleu_score:.4f} (Target: 0.69)")
-    logger.info(f"METEOR: {avg_meteor:.4f}")
-    
-    return results
+
 
 
     
