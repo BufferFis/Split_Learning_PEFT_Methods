@@ -695,20 +695,18 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
         
         try:
             # Path to your cloned e2e-metrics repository
-            e2e_metrics_path = "./e2e-metrics"  # Adjust this path to your cloned repo
-            measure_scores_script = os.path.join(e2e_metrics_path, "measure_scores.py")
-            
-            if not os.path.exists(measure_scores_script):
-                raise FileNotFoundError(f"E2E metrics script not found at {measure_scores_script}")
-            
-            # Run the official evaluation script
+            e2e_metrics_path = "./e2e-metrics"  # Correct path to folder
+            measure_scores_path = os.path.join(e2e_metrics_path, "measure_scores.py")
+
+            assert os.path.exists(measure_scores_path), f"{measure_scores_path} does not exist"
+
             cmd = [
-                "python", measure_scores_script,
-                ref_file,  # reference file
-                sys_file   # system output file
+                "python",
+                "measure_scores.py",  # Just the filename here
+                ref_file,
+                sys_file
             ]
-            
-            logger.info(f"Running official E2E evaluation: {' '.join(cmd)}")
+
             result = subprocess.run(cmd, capture_output=True, text=True, cwd=e2e_metrics_path)
             
             if result.returncode != 0:
