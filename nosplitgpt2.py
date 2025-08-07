@@ -625,19 +625,23 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
 
 
 def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
-    """Evaluate using OFFICIAL E2E evaluation scripts (Python wrapper)"""
-    import subprocess
-    import tempfile
-    import os
-    from pathlib import Path
+    """Evaluate using E2E Python implementation (no Perl required)"""
+    import sys
+    sys.path.append('./e2e-metrics')
+    
+    try:
+        from metrics.pymteval import BLEUScore, NISTScore
+    except ImportError:
+        logger.error("Could not import E2E metrics. Make sure e2e-metrics repo is cloned.")
+        return fallback_evaluation(predictions, references_list)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.eval()
     
-    # Get all unique MRs and generate predictions
+    # Generate predictions
     mr_to_references = eval_dataset.mr_to_refs
     predictions = []
-    mrs = []
+    references_list = []
     
     logger.info("Generating predictions for E2E evaluation...")
     for mr in tqdm(list(mr_to_references.keys()), desc="Generating"):
@@ -662,71 +666,40 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
             generated_text = generated_text.split("REF:")[1].strip()
         
         predictions.append(generated_text)
-        mrs.append(mr)
+        references_list.append(mr_to_references[mr])
     
-    # === RUN OFFICIAL E2E EVALUATION ===
+    # Use E2E Python implementation
+    bleu_scorer = BLEUScore()
+    for pred, refs in zip(predictions, references_list):
+        bleu_scorer.append(pred, refs)
+    bleu_score = bleu_scorer.score()
     
-    # Create temporary files in the format expected by E2E scripts
-    with tempfile.TemporaryDirectory() as temp_dir:
-        
-        # Create system output file (one prediction per line)
-        sys_file = os.path.join(temp_dir, "system_output.txt")
-        with open(sys_file, 'w', encoding='utf-8') as f:
-            for pred in predictions:
-                f.write(f"{pred}\n")
-        
-        # Create reference file (multiple references per MR, one per line)
-        ref_file = os.path.join(temp_dir, "references.txt")
-        with open(ref_file, 'w', encoding='utf-8') as f:
-            for mr in mrs:
-                refs = mr_to_references[mr]
-                for ref in refs:
-                    f.write(f"{ref}\n")
-                # Add separator line between different MRs
-                f.write("\n")
-        
-        # Create MR file (one MR per line, matching system output)
-        mr_file = os.path.join(temp_dir, "mrs.txt")
-        with open(mr_file, 'w', encoding='utf-8') as f:
-            for mr in mrs:
-                f.write(f"{mr}\n")
-        
-        # === CALL OFFICIAL E2E EVALUATION ===
-        
-        try:
-            # Path to your cloned e2e-metrics repository
-            e2e_metrics_path = "./e2e-metrics"  # Correct path to folder
-            measure_scores_path = os.path.join(e2e_metrics_path, "measure_scores.py")
-
-            assert os.path.exists(measure_scores_path), f"{measure_scores_path} does not exist"
-
-            cmd = [
-                "python",
-                "measure_scores.py",  # Just the filename here
-                ref_file,
-                sys_file
-            ]
-
-            result = subprocess.run(cmd, capture_output=True, text=True, cwd=e2e_metrics_path)
-            
-            if result.returncode != 0:
-                logger.error(f"E2E evaluation failed: {result.stderr}")
-                # Fallback to our implementation
-                return fallback_evaluation(predictions, [mr_to_references[mr] for mr in mrs])
-            
-            # Parse the output from official E2E script
-            scores = parse_e2e_output(result.stdout)
-            
-        except Exception as e:
-            logger.warning(f"Official E2E evaluation failed: {e}")
-            logger.info("Falling back to Python implementation")
-            return fallback_evaluation(predictions, [mr_to_references[mr] for mr in mrs])
+    nist_scorer = NISTScore()
+    for pred, refs in zip(predictions, references_list):
+        nist_scorer.append(pred, refs)
+    nist_score = nist_scorer.score()
+    
+    # Calculate METEOR
+    meteor_scores = []
+    for pred, refs in zip(predictions, references_list):
+        best_meteor = max(meteor.compute(predictions=[pred], references=[ref])["meteor"] 
+                         for ref in refs)
+        meteor_scores.append(best_meteor)
+    meteor_score = sum(meteor_scores) / len(meteor_scores)
+    
+    results = {
+        "bleu": bleu_score,
+        "nist": nist_score,
+        "meteor": meteor_score,
+        "num_predictions": len(predictions)
+    }
     
     logger.info("=" * 60)
-    logger.info("OFFICIAL E2E NLG CHALLENGE RESULTS")
+    logger.info("E2E PYTHON EVALUATION RESULTS")
     logger.info("=" * 60)
-    for metric, score in scores.items():
-        logger.info(f"{metric.upper()}: {score:.4f}")
+    logger.info(f"BLEU:    {bleu_score:.4f}")
+    logger.info(f"NIST:    {nist_score:.4f}")
+    logger.info(f"METEOR:  {meteor_score:.4f}")
     logger.info("=" * 60)
     logger.info("E2E Benchmark Comparison:")
     logger.info("TGen:    BLEU=69.25, METEOR=47.03")
@@ -734,7 +707,7 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
     logger.info(f"SplitFM: BLEU=69.00 (target)")
     logger.info("=" * 60)
     
-    return scores
+    return results
 
 
 def parse_e2e_output(output_str):
