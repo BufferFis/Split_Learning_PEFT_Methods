@@ -703,7 +703,7 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
         prompts = [f"MR: {mr} REF:" for mr in mrs_batch]
 
         # Left padding already set earlier (tokenizer.padding_side = "left")
-        inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
+        inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
         input_ids = inputs["input_ids"].to(device)
         attention_mask = inputs["attention_mask"].to(device)
 
