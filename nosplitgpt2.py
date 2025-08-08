@@ -668,19 +668,21 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
     
     # Generate predictions
     mr_to_references = eval_dataset.mr_to_refs
+    all_mrs = list(mr_to_references.keys())
     predictions = []
     references_list = []
     
-    logger.info("Generating predictions for E2E evaluation...")
-    for mr in tqdm(list(mr_to_references.keys()), desc="Generating"):
-        prompt = f"MR: {mr} REF:"
-        inputs = tokenizer(prompt, return_tensors="pt", padding=True)
-        input_ids = inputs["input_ids"].to(device)
-        attention_mask = inputs["attention_mask"].to(device)
+    logger.info("Generating predictions for E2E evaluation (batched)...")
+    batch_size = 8  # adjust based on GPU memory
+    
+    for start in tqdm(range(0, len(all_mrs), batch_size), desc="Generating"):
+        mrs_batch = all_mrs[start:start+batch_size]
+        prompts = [f"MR: {mr} REF:" for mr in mrs_batch]
+        inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
         
         generated_ids = model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
             max_length=args.max_length,
             num_beams=10,
             no_repeat_ngram_size=3,
@@ -689,12 +691,13 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
             pad_token_id=tokenizer.eos_token_id
         )
         
-        generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-        if "REF:" in generated_text:
-            generated_text = generated_text.split("REF:")[1].strip()
+        decoded_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
         
-        predictions.append(generated_text)
-        references_list.append(mr_to_references[mr])
+        for mr, gen_text in zip(mrs_batch, decoded_texts):
+            if "REF:" in gen_text:
+                gen_text = gen_text.split("REF:")[1].strip()
+            predictions.append(gen_text)
+            references_list.append(mr_to_references[mr])
     
     # Use E2E Python implementation
     bleu_scorer = BLEUScore()
@@ -711,7 +714,7 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
     meteor_scores = []
     for pred, refs in zip(predictions, references_list):
         best_meteor = max(meteor.compute(predictions=[pred], references=[ref])["meteor"] 
-                         for ref in refs)
+                          for ref in refs)
         meteor_scores.append(best_meteor)
     meteor_score = sum(meteor_scores) / len(meteor_scores)
     
@@ -736,6 +739,7 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
     logger.info("=" * 60)
     
     return results
+
 
 
 def parse_e2e_output(output_str):
