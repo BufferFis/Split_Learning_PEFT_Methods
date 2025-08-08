@@ -39,23 +39,31 @@ def calculate_e2e_bleu(predictions, references_list):
     try:
         import sacrebleu
         from sacremoses import MosesDetokenizer
-        
-        # Detokenize predictions and references
+
+        # Detokenizer
         md = MosesDetokenizer(lang='en')
-        
+
         # Detokenize predictions
-        detok_preds = []
-        for pred in predictions:
-            detok_preds.append(md.detokenize(pred.split()))
-        
-        # Detokenize references (take first reference for each)
-        detok_refs = []
+        detok_preds = [md.detokenize(pred.split()) for pred in predictions]
+
+        # Detokenize references while keeping all refs per MR
+        detok_refs_per_mr = []
         for refs in references_list:
-            detok_refs.append([md.detokenize(refs[0].split())])
-        
-        # Calculate corpus BLEU using sacreBLEU
-        bleu = sacrebleu.corpus_bleu(detok_preds, list(zip(*detok_refs)))
-        return bleu.score / 100.0  # Convert to 0-1 scale
+            detok_refs_per_mr.append([md.detokenize(r.split()) for r in refs])
+
+        # Transpose: sacreBLEU expects list-of-lists where each inner list is
+        # all refs of the same index across all hypotheses
+        # Example: [[ref1_of_hyp1, ref1_of_hyp2, ...], [ref2_of_hyp1, ref2_of_hyp2, ...], ...]
+        refs_transposed = list(zip(*detok_refs_per_mr))
+
+        # Calculate BLEU (0–100 scale)
+        bleu = sacrebleu.corpus_bleu(detok_preds, refs_transposed)
+        print("BLEU (sacrebleu):", bleu.score)
+
+        # If you still want 0–1 scale:
+        bleu_fraction = bleu.score / 100.0
+        print("BLEU (fraction):", bleu_fraction)
+
         
     except ImportError:
         logger.warning("sacreBLEU not available, falling back to NLTK")
@@ -116,27 +124,47 @@ class E2EDataset(Dataset):
         logger.info(f"Loaded {len(self.examples)} examples from {split} split")
         logger.info(f"Found {len(self.mr_to_refs)} unique MRs with an average of {sum(len(refs) for refs in self.mr_to_refs.values())/len(self.mr_to_refs):.1f} references each")
         
+    import torch
+
     def _process_data(self):
         examples = []
         for item in self.data:
             mr = item['meaning_representation']
             ref = item['human_reference']
-            # Format: "MR: [mr] REF: [ref]"
-            text = f"MR: {mr} REF: {ref}"
-            encodings = self.tokenizer(
-                text,
-                truncation=True,
-                max_length=self.max_length,
-                padding="max_length",
-                return_tensors="pt"
-            )
+
+            prompt = f"MR: {mr} REF:"
+            # token ids for prompt and ref separately
+            prompt_ids = self.tokenizer(prompt, truncation=True, max_length=self.max_length, return_tensors="pt")["input_ids"][0]
+            ref_ids = self.tokenizer(" " + ref, truncation=True, max_length=self.max_length, return_tensors="pt")["input_ids"][0]
+
+            # Build combined input (prompt + ref), then truncate/pad to max_length
+            combined = torch.cat([prompt_ids, ref_ids])
+            if combined.size(0) > self.max_length:
+                combined = combined[: self.max_length]
+
+            # attention mask and padding
+            input_ids = torch.full((self.max_length,), self.tokenizer.pad_token_id, dtype=torch.long)
+            attention_mask = torch.zeros((self.max_length,), dtype=torch.long)
+            input_ids[: combined.size(0)] = combined
+            attention_mask[: combined.size(0)] = 1
+
+            # labels: -100 for prompt tokens, actual token ids for reference tokens
+            labels = torch.full((self.max_length,), -100, dtype=torch.long)
+            prompt_len = prompt_ids.size(0)
+            # Only set labels for the reference portion (if it fits)
+            start = prompt_len
+            end = min(prompt_len + ref_ids.size(0), self.max_length)
+            if start < end:
+                labels[start:end] = input_ids[start:end]
+
             examples.append({
-                "input_ids": encodings["input_ids"][0],
-                "attention_mask": encodings["attention_mask"][0],
-                "labels": encodings["input_ids"][0].clone(),
-                "mr": mr,  # Store MR for reference
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels,
+                "mr": mr,
             })
         return examples
+
     
     def __len__(self):
         return len(self.examples)
@@ -299,12 +327,12 @@ def sanity_check(model, tokenizer, mrs, device, max_length=256):
             generated_ids = model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                max_length=max_length,
+                max_length=60,
                 num_beams=5,
-                no_repeat_ngram_size=3,
+                no_repeat_ngram_size=2,
                 early_stopping=True,
                 pad_token_id=tokenizer.eos_token_id,
-                length_penalty=1.0,
+                length_penalty=0.9,
                 do_sample=False  # Use greedy decoding initially for more stable outputs
             )
             
