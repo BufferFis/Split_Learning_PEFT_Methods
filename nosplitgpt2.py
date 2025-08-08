@@ -653,7 +653,7 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
 
 
 def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
-    """Evaluate using E2E Python implementation (no Perl required)"""
+    """Evaluate using E2E Python implementation (no Perl required) -- batched generation."""
     import sys
     sys.path.append('./e2e-metrics')
     
@@ -661,70 +661,112 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
         from metrics.pymteval import BLEUScore, NISTScore
     except ImportError:
         logger.error("Could not import E2E metrics. Make sure e2e-metrics repo is cloned.")
-        return fallback_evaluation(predictions, references_list)
+        # fallback_evaluation expects predictions, references_list which we don't have here,
+        # so return a safe empty result in the unlikely event metrics import fails.
+        return {"bleu": 0.0, "nist": 0.0, "meteor": 0.0, "num_predictions": 0}
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.eval()
-    
-    # Generate predictions
+
+    # MR -> refs mapping (unchanged)
     mr_to_references = eval_dataset.mr_to_refs
     all_mrs = list(mr_to_references.keys())
     predictions = []
     references_list = []
-    
+
     logger.info("Generating predictions for E2E evaluation (batched)...")
-    batch_size = 8  # adjust based on GPU memory
-    
-    for start in tqdm(range(0, len(all_mrs), batch_size), desc="Generating"):
-        mrs_batch = all_mrs[start:start+batch_size]
+
+    # Heuristics tuned for A4000 (16GB) & safety:
+    if torch.cuda.is_available():
+        if getattr(args, "fp16", False):
+            eval_batch_size = 14   # A4000 + AMP can usually handle ~14 with reduced beams
+            num_beams = 5
+        else:
+            eval_batch_size = 8
+            num_beams = 4
+    else:
+        eval_batch_size = 2
+        num_beams = 1
+
+    # Make these easy to tweak in one place
+    max_new_tokens = 60
+    no_repeat_ngram_size = 2
+    length_penalty = 0.9
+    pad_token_id = tokenizer.eos_token_id
+
+    logger.info(f"Eval batch size: {eval_batch_size}, num_beams: {num_beams}, max_new_tokens: {max_new_tokens}, fp16: {getattr(args, 'fp16', False)}")
+
+    from torch.cuda.amp import autocast
+
+    for start in tqdm(range(0, len(all_mrs), eval_batch_size), desc="Generating"):
+        mrs_batch = all_mrs[start:start + eval_batch_size]
         prompts = [f"MR: {mr} REF:" for mr in mrs_batch]
-        inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
-        
-        generated_ids = model.generate(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            max_length=args.max_length,
-            num_beams=10,
-            no_repeat_ngram_size=3,
-            early_stopping=True,
-            length_penalty=1.0,
-            pad_token_id=tokenizer.eos_token_id
-        )
-        
+
+        # Left padding already set earlier (tokenizer.padding_side = "left")
+        inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
+        input_ids = inputs["input_ids"].to(device)
+        attention_mask = inputs["attention_mask"].to(device)
+
+        # Use mixed precision if requested and running on CUDA
+        use_amp = torch.cuda.is_available() and getattr(args, "fp16", False)
+        if use_amp:
+            with autocast():
+                generated_ids = model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=max_new_tokens,
+                    num_beams=num_beams,
+                    no_repeat_ngram_size=no_repeat_ngram_size,
+                    early_stopping=True,
+                    length_penalty=length_penalty,
+                    pad_token_id=pad_token_id,
+                )
+        else:
+            with torch.no_grad():
+                generated_ids = model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=max_new_tokens,
+                    num_beams=num_beams,
+                    no_repeat_ngram_size=no_repeat_ngram_size,
+                    early_stopping=True,
+                    length_penalty=length_penalty,
+                    pad_token_id=pad_token_id,
+                )
+
         decoded_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
-        
         for mr, gen_text in zip(mrs_batch, decoded_texts):
             if "REF:" in gen_text:
                 gen_text = gen_text.split("REF:")[1].strip()
             predictions.append(gen_text)
             references_list.append(mr_to_references[mr])
-    
-    # Use E2E Python implementation
+
+    # --- Metrics (exactly the same logic you had) ---
     bleu_scorer = BLEUScore()
     for pred, refs in zip(predictions, references_list):
         bleu_scorer.append(pred, refs)
     bleu_score = bleu_scorer.score()
-    
+
     nist_scorer = NISTScore()
     for pred, refs in zip(predictions, references_list):
         nist_scorer.append(pred, refs)
     nist_score = nist_scorer.score()
-    
-    # Calculate METEOR
+
+    # Calculate METEOR (best-of-refs per MR)
     meteor_scores = []
     for pred, refs in zip(predictions, references_list):
-        best_meteor = max(meteor.compute(predictions=[pred], references=[ref])["meteor"] 
-                          for ref in refs)
+        best_meteor = max(meteor.compute(predictions=[pred], references=[ref])["meteor"]
+                         for ref in refs)
         meteor_scores.append(best_meteor)
     meteor_score = sum(meteor_scores) / len(meteor_scores)
-    
+
     results = {
         "bleu": bleu_score,
         "nist": nist_score,
         "meteor": meteor_score,
         "num_predictions": len(predictions)
     }
-    
+
     logger.info("=" * 60)
     logger.info("E2E PYTHON EVALUATION RESULTS")
     logger.info("=" * 60)
@@ -732,13 +774,9 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
     logger.info(f"NIST:    {nist_score:.4f}")
     logger.info(f"METEOR:  {meteor_score:.4f}")
     logger.info("=" * 60)
-    logger.info("E2E Benchmark Comparison:")
-    logger.info("TGen:    BLEU=69.25, METEOR=47.03")
-    logger.info("Winner:  BLEU=71.28, METEOR=47.70")
-    logger.info(f"SplitFM: BLEU=69.00 (target)")
-    logger.info("=" * 60)
-    
+
     return results
+
 
 
 
