@@ -682,8 +682,6 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
         from metrics.pymteval import BLEUScore, NISTScore
     except ImportError:
         logger.error("Could not import E2E metrics. Make sure e2e-metrics repo is cloned.")
-        # fallback_evaluation expects predictions, references_list which we don't have here,
-        # so return a safe empty result in the unlikely event metrics import fails.
         return {"bleu": 0.0, "nist": 0.0, "meteor": 0.0, "num_predictions": 0}
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -697,23 +695,23 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
 
     logger.info("Generating predictions for E2E evaluation (batched)...")
 
-    # Heuristics tuned for A4000 (16GB) & safety:
-    
-    if getattr(args, "fp16", False):
-        eval_batch_size = 14   # A4000 + AMP can usually handle ~14 with reduced beams
+    # Heuristics tuned for A4000 (16GB) & safety
+    if getattr(args, "fp16", False) and torch.cuda.is_available():
+        eval_batch_size = 14   # A4000 + AMP can often handle ~14 with reduced beams
         num_beams = 5
     else:
         eval_batch_size = 8
         num_beams = 4
-    
 
-    # Make these easy to tweak in one place
-    max_new_tokens = 60
+    # global generation defaults (tweakable)
+    max_new_tokens_cap = 60            # max tokens to generate beyond the prompt
     no_repeat_ngram_size = 2
+    repetition_penalty = 1.2
     length_penalty = 0.9
+    eos_token_id = tokenizer.eos_token_id
     pad_token_id = tokenizer.eos_token_id
 
-    logger.info(f"Eval batch size: {eval_batch_size}, num_beams: {num_beams}, max_new_tokens: {max_new_tokens}, fp16: {getattr(args, 'fp16', False)}")
+    logger.info(f"Eval batch size: {eval_batch_size}, num_beams: {num_beams}, max_new_tokens_cap: {max_new_tokens_cap}, fp16: {getattr(args, 'fp16', False)}")
 
     from torch.cuda.amp import autocast
 
@@ -723,41 +721,40 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
 
         # Left padding already set earlier (tokenizer.padding_side = "left")
         inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
-        input_ids = inputs["input_ids"].to(device)
-        attention_mask = inputs["attention_mask"].to(device)
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs["attention_mask"]
 
-        # Use mixed precision if requested and running on CUDA
+        # derive per-batch safe max_new_tokens from prompt length
+        prompt_len = input_ids.shape[1]  # length of tokenized prompt (including any padding tokens in the batch)
+        # compute available space (args.max_length is the token budget we prepared for training)
+        space = max(1, args.max_length - prompt_len)
+        # final max_new for this batch is the min of cap and available space (and at least 5)
+        batch_max_new = min(max_new_tokens_cap, space)
+        batch_max_new = max(5, batch_max_new)
+
+        gen_kwargs = dict(
+            input_ids=input_ids.to(device),
+            attention_mask=attention_mask.to(device),
+            max_new_tokens=batch_max_new,
+            num_beams=num_beams,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            repetition_penalty=repetition_penalty,
+            early_stopping=True,
+            length_penalty=length_penalty,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+        )
+
         use_amp = torch.cuda.is_available() and getattr(args, "fp16", False)
-        ref_len = (labels != -100).sum().item()  # if you have labels for the example
-        max_new = max(20, ref_len + 5)          # or pick a safe upper bound, e.g. 60
-        
         if use_amp:
             with autocast():
-                generated_ids = model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=max_new,
-                    num_beams=num_beams,
-                    no_repeat_ngram_size=2,
-                    repetition_penalty=1.0,
-                    early_stopping=True,
-                    length_penalty=length_penalty,
-                    pad_token_id=pad_token_id,
-                )
+                generated_ids = model.generate(**gen_kwargs)
         else:
             with torch.no_grad():
-                generated_ids = model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=max_new_tokens,
-                    num_beams=num_beams,
-                    no_repeat_ngram_size=no_repeat_ngram_size,
-                    early_stopping=True,
-                    length_penalty=length_penalty,
-                    pad_token_id=pad_token_id,
-                )
+                generated_ids = model.generate(**gen_kwargs)
 
         decoded_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+
         for mr, gen_text in zip(mrs_batch, decoded_texts):
             if "REF:" in gen_text:
                 gen_text = gen_text.split("REF:")[1].strip()
@@ -799,6 +796,7 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
     logger.info("=" * 60)
 
     return results
+
 
 
 
