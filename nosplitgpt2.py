@@ -107,7 +107,7 @@ class E2EDataset(Dataset):
             tokenizer: Tokenizer for the model
             max_length (int): Maximum sequence length
         """
-        logger.info(f"Preparing {split} dataset")
+        #logger.info(f"Preparing {split} dataset")
         self.data = hf_dataset[split]
         self.tokenizer = tokenizer
         self.max_length = max_length
