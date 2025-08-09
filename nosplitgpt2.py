@@ -135,6 +135,10 @@ class E2EDataset(Dataset):
             prompt = f"MR: {mr} REF:"
             prompt_ids = self.tokenizer(prompt, truncation=True, max_length=self.max_length, return_tensors="pt")["input_ids"][0]
             ref_ids = self.tokenizer(" " + ref, truncation=True, max_length=self.max_length, return_tensors="pt")["input_ids"][0]
+            # after you compute ref_ids
+            eos_id = self.tokenizer.eos_token_id
+            # append eos if it won't exceed max_length (we'll also truncate later)
+            ref_ids = torch.cat([ref_ids, torch.tensor([eos_id], dtype=torch.long)])
 
             # Build combined input (prompt + ref)
             combined = torch.cat([prompt_ids, ref_ids])
@@ -589,6 +593,7 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
                 #     scaler.update()
                 # else:
                 # Standard optimizer step
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 
                 # Always update scheduler - it's robust to skipped steps
@@ -693,16 +698,14 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
     logger.info("Generating predictions for E2E evaluation (batched)...")
 
     # Heuristics tuned for A4000 (16GB) & safety:
-    if torch.cuda.is_available():
-        if getattr(args, "fp16", False):
-            eval_batch_size = 14   # A4000 + AMP can usually handle ~14 with reduced beams
-            num_beams = 5
-        else:
-            eval_batch_size = 8
-            num_beams = 4
+    
+    if getattr(args, "fp16", False):
+        eval_batch_size = 14   # A4000 + AMP can usually handle ~14 with reduced beams
+        num_beams = 5
     else:
-        eval_batch_size = 2
-        num_beams = 1
+        eval_batch_size = 8
+        num_beams = 4
+    
 
     # Make these easy to tweak in one place
     max_new_tokens = 60
@@ -725,14 +728,18 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
 
         # Use mixed precision if requested and running on CUDA
         use_amp = torch.cuda.is_available() and getattr(args, "fp16", False)
+        ref_len = (labels != -100).sum().item()  # if you have labels for the example
+        max_new = max(20, ref_len + 5)          # or pick a safe upper bound, e.g. 60
+        
         if use_amp:
             with autocast():
                 generated_ids = model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    max_new_tokens=max_new_tokens,
+                    max_new_tokens=max_new,
                     num_beams=num_beams,
-                    no_repeat_ngram_size=no_repeat_ngram_size,
+                    no_repeat_ngram_size=2,
+                    repetition_penalty=1.0,
                     early_stopping=True,
                     length_penalty=length_penalty,
                     pad_token_id=pad_token_id,
