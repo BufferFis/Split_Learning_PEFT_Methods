@@ -133,27 +133,28 @@ class E2EDataset(Dataset):
             ref = item['human_reference']
 
             prompt = f"MR: {mr} REF:"
-            # token ids for prompt and ref separately
             prompt_ids = self.tokenizer(prompt, truncation=True, max_length=self.max_length, return_tensors="pt")["input_ids"][0]
             ref_ids = self.tokenizer(" " + ref, truncation=True, max_length=self.max_length, return_tensors="pt")["input_ids"][0]
 
-            # Build combined input (prompt + ref), then truncate/pad to max_length
+            # Build combined input (prompt + ref)
             combined = torch.cat([prompt_ids, ref_ids])
-            if combined.size(0) > self.max_length:
-                combined = combined[: self.max_length]
 
-            # attention mask and padding
+            # If combined longer than max_length, keep the last max_length tokens (preserve ref)
+            if combined.size(0) > self.max_length:
+                combined = combined[-self.max_length:]
+
+            # Create pad-filled tensors and LEFT-PAD tokens (so padding is on the left)
             input_ids = torch.full((self.max_length,), self.tokenizer.pad_token_id, dtype=torch.long)
             attention_mask = torch.zeros((self.max_length,), dtype=torch.long)
-            input_ids[: combined.size(0)] = combined
-            attention_mask[: combined.size(0)] = 1
+            offset = self.max_length - combined.size(0)
+            input_ids[offset:] = combined
+            attention_mask[offset:] = 1
 
-            # labels: -100 for prompt tokens, actual token ids for reference tokens
+            # Labels: -100 for prompt tokens, actual token ids for reference tokens
             labels = torch.full((self.max_length,), -100, dtype=torch.long)
             prompt_len = prompt_ids.size(0)
-            # Only set labels for the reference portion (if it fits)
-            start = prompt_len
-            end = min(prompt_len + ref_ids.size(0), self.max_length)
+            start = offset + prompt_len
+            end = min(offset + prompt_len + ref_ids.size(0), self.max_length)
             if start < end:
                 labels[start:end] = input_ids[start:end]
 
@@ -164,6 +165,7 @@ class E2EDataset(Dataset):
                 "mr": mr,
             })
         return examples
+
 
     
     def __len__(self):
@@ -478,6 +480,14 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
     model.to(device)
+
+    # open a per-step loss log file
+    loss_log_path = os.path.join(args.output_dir, "losses_per_step.csv")
+    # If file doesn't exist, write header
+    if not os.path.exists(loss_log_path):
+        with open(loss_log_path, "w") as f:
+            f.write("global_step,epoch,step_in_epoch,loss\n")
+
     
     # Get sample MRs for sanity checks
     sample_mrs = train_dataset.get_unique_mrs(5)
@@ -585,6 +595,12 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
                 scheduler.step()
                 model.zero_grad()
                 global_step += 1
+
+                step_loss = loss.item() * args.gradient_accumulation_steps
+
+                # append to CSV
+                with open(loss_log_path, "a") as f:
+                    f.write(f"{global_step},{epoch+1},{step},{step_loss:.6f}\n")
                 
                 # Update progress bar
                 epoch_iterator.set_postfix(loss=loss.item() * args.gradient_accumulation_steps)
