@@ -706,7 +706,7 @@ def calculate_slot_coverage(generated_text, mr):
 
 
 def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
-    """Evaluate using E2E Python implementation with beam reranking."""
+    """Evaluate using E2E Python implementation with beam reranking -- preserving all debug functionality."""
     import sys
     import re
     sys.path.append('./e2e-metrics')
@@ -758,13 +758,13 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
                     outputs = model.generate(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
-                        max_length=input_ids.shape[1] + 40,
+                        max_length=input_ids.shape[1] + 25,
                         num_beams=8,
                         num_return_sequences=5,  # Generate 5 candidates
                         early_stopping=True,
-                        no_repeat_ngram_size=2,
-                        repetition_penalty=1.15,
-                        length_penalty=0.9,
+                        no_repeat_ngram_size=4,
+                        repetition_penalty=1.25,
+                        length_penalty=0.8,
                         pad_token_id=tokenizer.eos_token_id,
                         eos_token_id=tokenizer.eos_token_id,
                     )
@@ -772,13 +772,13 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
                 outputs = model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    max_length=input_ids.shape[1] + 40,
+                    max_length=input_ids.shape[1] + 25,
                     num_beams=8,
                     num_return_sequences=5,  # Generate 5 candidates
                     early_stopping=True,
-                    no_repeat_ngram_size=2,
-                    repetition_penalty=1.15,
-                    length_penalty=0.9,
+                    no_repeat_ngram_size=4,
+                    repetition_penalty=1.25,
+                    length_penalty=0.8,
                     pad_token_id=tokenizer.eos_token_id,
                     eos_token_id=tokenizer.eos_token_id,
                 )
@@ -805,7 +805,7 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
             scored_candidates.append((candidate, total_score))
         
         # Return best candidate
-        best_candidate = max(scored_candidates, key=lambda x: x[1])
+        best_candidate = max(scored_candidates, key=lambda x: x[1])[0]
         return best_candidate
 
     # MR -> refs mapping (unchanged)
@@ -816,7 +816,7 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
 
     logger.info("Generating predictions for E2E evaluation with beam reranking...")
 
-    # Heuristics tuned for A4000 (16GB) & safety
+    # Heuristics tuned for A4000 (16GB) & safety - reduced due to multiple candidates
     if getattr(args, "fp16", False) and torch.cuda.is_available():
         eval_batch_size = 6   # Reduced due to multiple candidates generation
         num_beams = 8
@@ -825,10 +825,10 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
         num_beams = 8
 
     # global generation defaults (tweakable)
-    max_new_tokens_cap = 30      # max tokens to generate beyond the prompt
-    no_repeat_ngram_size = 4
-    repetition_penalty = 1.25
-    length_penalty = 0.8
+    max_new_tokens_cap = 120      # max tokens to generate beyond the prompt
+    no_repeat_ngram_size = 0
+    repetition_penalty = 1.0
+    length_penalty = 1.0
     eos_token_id = tokenizer.eos_token_id
     pad_token_id = tokenizer.eos_token_id
 
@@ -856,9 +856,10 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
             predictions.append(best_generation)
             references_list.append(mr_to_references[mr])
 
+        # Your existing debug functionality - PRESERVED EXACTLY
         if len(predictions) >= 10:
             logger.info("=== DEBUGGING GENERATION LENGTH ===")
-            sample_lengths = [len(pred.split()) for pred in predictions[:10]]
+            sample_lengths = [len(pred[0].split()) if isinstance(pred, tuple) else len(pred.split()) for pred in predictions[:10]]
             ref_lengths = [len(refs[0].split()) for refs in references_list[:10]]
 
             logger.info(f"Generated lengths: {sample_lengths} (avg: {sum(sample_lengths)/len(sample_lengths):.1f})")
@@ -871,6 +872,7 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
                 logger.info(f"Reference ({len(references_list[i][0].split())} tokens): {references_list[i]}")
                 logger.info("-" * 50)
 
+    # Your existing metrics calculation - PRESERVED EXACTLY
     bleu_scorer = BLEUScore()
     for pred, refs in zip(predictions, references_list):
         bleu_scorer.append(pred, refs)
@@ -896,6 +898,7 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
         "num_predictions": len(predictions)
     }
 
+    # Your existing results output - PRESERVED EXACTLY
     logger.info("=" * 60)
     logger.info("E2E PYTHON EVALUATION RESULTS (WITH BEAM RERANKING)")
     logger.info("=" * 60)
@@ -905,10 +908,6 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
     logger.info("=" * 60)
 
     return results
-
-
-
-
 
 
 def parse_e2e_output(output_str):
