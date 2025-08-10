@@ -761,7 +761,8 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
         if len(predictions) >= 10:
             logger.info("=== DEBUGGING GENERATION LENGTH ===")
             sample_lengths = [len(pred.split()) for pred in predictions[:10]]
-            ref_lengths = [len(refs.split()) for refs in references_list[:10]]
+            ref_lengths = [len(refs[0].split()) for refs in references_list[:10]]
+
             logger.info(f"Generated lengths: {sample_lengths} (avg: {sum(sample_lengths)/len(sample_lengths):.1f})")
             logger.info(f"Reference lengths: {ref_lengths} (avg: {sum(ref_lengths)/len(ref_lengths):.1f})")
             
