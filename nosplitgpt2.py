@@ -735,10 +735,12 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
         gen_kwargs = dict(
         input_ids=input_ids.to(device),
         attention_mask=attention_mask.to(device),
-        max_length=input_ids.shape[1] + 150,  # Fixed generous limit
+        max_length=input_ids.shape[1] + 60,  # Fixed generous limit
+        repetition_penalty = 1.2,
+        no_repeat_ngram_size = 3,
         num_beams=10,
         do_sample=False,
-        early_stopping=False,
+        early_stopping=True,
         pad_token_id=pad_token_id,
         eos_token_id=eos_token_id,
     )
@@ -773,7 +775,6 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
                 logger.info(f"Reference ({len(references_list[i][0].split())} tokens): {references_list[i]}")
                 logger.info("-" * 50)
 
-    # --- Metrics (exactly the same logic you had) ---
     bleu_scorer = BLEUScore()
     for pred, refs in zip(predictions, references_list):
         bleu_scorer.append(pred, refs)
