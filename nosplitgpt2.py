@@ -107,7 +107,7 @@ class E2EDataset(Dataset):
             tokenizer: Tokenizer for the model
             max_length (int): Maximum sequence length
         """
-        #logger.info(f"Preparing {split} dataset")
+        logger.info(f"Preparing {split} dataset")
         self.data = hf_dataset[split]
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -333,12 +333,12 @@ def sanity_check(model, tokenizer, mrs, device, max_length=256):
             generated_ids = model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                max_length=60,
+                max_length=input_ids.shape[1] + 80,
                 num_beams=5,
                 no_repeat_ngram_size=2,
                 early_stopping=True,
                 pad_token_id=tokenizer.eos_token_id,
-                length_penalty=0.9,
+                length_penalty=1.0,
                 do_sample=False  # Use greedy decoding initially for more stable outputs
             )
             
@@ -698,16 +698,16 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
     # Heuristics tuned for A4000 (16GB) & safety
     if getattr(args, "fp16", False) and torch.cuda.is_available():
         eval_batch_size = 14   # A4000 + AMP can often handle ~14 with reduced beams
-        num_beams = 5
+        num_beams = 8
     else:
         eval_batch_size = 8
-        num_beams = 4
+        num_beams = 8
 
     # global generation defaults (tweakable)
-    max_new_tokens_cap = 60            # max tokens to generate beyond the prompt
-    no_repeat_ngram_size = 2
-    repetition_penalty = 1.2
-    length_penalty = 0.9
+    max_new_tokens_cap =  120      # max tokens to generate beyond the prompt
+    no_repeat_ngram_size = 0
+    repetition_penalty = 1.0
+    length_penalty = 1.0
     eos_token_id = tokenizer.eos_token_id
     pad_token_id = tokenizer.eos_token_id
 
@@ -739,7 +739,7 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
             num_beams=num_beams,
             no_repeat_ngram_size=no_repeat_ngram_size,
             repetition_penalty=repetition_penalty,
-            early_stopping=True,
+            early_stopping=False,
             length_penalty=length_penalty,
             eos_token_id=eos_token_id,
             pad_token_id=pad_token_id,
