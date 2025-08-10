@@ -736,8 +736,9 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
         input_ids=input_ids.to(device),
         attention_mask=attention_mask.to(device),
         max_length=input_ids.shape[1] + 60,  # Fixed generous limit
-        repetition_penalty = 1.2,
-        no_repeat_ngram_size = 3,
+        repetition_penalty = 1.0,
+        no_repeat_ngram_size = 4,
+        length_penalty = 0.8,
         num_beams=10,
         do_sample=False,
         early_stopping=True,
