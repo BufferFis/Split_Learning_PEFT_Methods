@@ -729,21 +729,19 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
         # compute available space (args.max_length is the token budget we prepared for training)
         space = max(1, args.max_length - prompt_len)
         # final max_new for this batch is the min of cap and available space (and at least 5)
-        batch_max_new = min(max_new_tokens_cap, space)
+        batch_max_new = max_new_tokens_cap
         batch_max_new = max(5, batch_max_new)
 
         gen_kwargs = dict(
-            input_ids=input_ids.to(device),
-            attention_mask=attention_mask.to(device),
-            max_new_tokens=batch_max_new,
-            num_beams=num_beams,
-            no_repeat_ngram_size=no_repeat_ngram_size,
-            repetition_penalty=repetition_penalty,
-            early_stopping=False,
-            length_penalty=length_penalty,
-            eos_token_id=eos_token_id,
-            pad_token_id=pad_token_id,
-        )
+        input_ids=input_ids.to(device),
+        attention_mask=attention_mask.to(device),
+        max_length=input_ids.shape[1] + 150,  # Fixed generous limit
+        num_beams=10,
+        do_sample=False,
+        early_stopping=False,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_id,
+    )
 
         use_amp = torch.cuda.is_available() and getattr(args, "fp16", False)
         if use_amp:
@@ -760,6 +758,19 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
                 gen_text = gen_text.split("REF:")[1].strip()
             predictions.append(gen_text)
             references_list.append(mr_to_references[mr])
+        if len(predictions) >= 10:
+            logger.info("=== DEBUGGING GENERATION LENGTH ===")
+            sample_lengths = [len(pred.split()) for pred in predictions[:10]]
+            ref_lengths = [len(refs.split()) for refs in references_list[:10]]
+            logger.info(f"Generated lengths: {sample_lengths} (avg: {sum(sample_lengths)/len(sample_lengths):.1f})")
+            logger.info(f"Reference lengths: {ref_lengths} (avg: {sum(ref_lengths)/len(ref_lengths):.1f})")
+            
+            logger.info("=== SAMPLE PREDICTIONS vs REFERENCES ===")
+            for i in range(5):
+                logger.info(f"MR: {all_mrs[i]}")
+                logger.info(f"Generated ({len(predictions[i].split())} tokens): {predictions[i]}")
+                logger.info(f"Reference ({len(references_list[i][0].split())} tokens): {references_list[i]}")
+                logger.info("-" * 50)
 
     # --- Metrics (exactly the same logic you had) ---
     bleu_scorer = BLEUScore()
