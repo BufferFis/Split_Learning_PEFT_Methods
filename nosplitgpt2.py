@@ -672,10 +672,43 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
     
     return global_step, tr_loss / global_step
 
+from collections import Counter
+import re
+
+def extract_mr_slots(mr):
+    """Extract actual slots and values from MR string"""
+    slots = {}
+    # Parse MR format: name[Blue Spice], eatType[coffee shop], etc.
+    pattern = r'(\w+)\[([^\]]+)\]'
+    matches = re.findall(pattern, mr)
+    for slot_name, slot_value in matches:
+        slots[slot_name.lower()] = slot_value.lower()
+    return slots
+
+def calculate_slot_coverage(generated_text, mr):
+    """Calculate how well the generated text covers MR slots"""
+    mr_slots = extract_mr_slots(mr)
+    generated_lower = generated_text.lower()
+    
+    coverage_score = 0
+    total_slots = len(mr_slots)
+    
+    for slot_name, slot_value in mr_slots.items():
+        # Check if slot value appears in generated text
+        if slot_value in generated_lower:
+            coverage_score += 1
+        # Partial credit for slot names
+        elif slot_name in generated_lower:
+            coverage_score += 0.5
+    
+    return coverage_score / total_slots if total_slots > 0 else 0
+
+
 
 def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
-    """Evaluate using E2E Python implementation (no Perl required) -- batched generation."""
+    """Evaluate using E2E Python implementation with beam reranking."""
     import sys
+    import re
     sys.path.append('./e2e-metrics')
     
     try:
@@ -687,31 +720,120 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.eval()
 
+    # Beam reranking helper functions
+    def extract_mr_slots(mr):
+        """Extract actual slots and values from MR string"""
+        slots = {}
+        pattern = r'(\w+)\[([^\]]+)\]'
+        matches = re.findall(pattern, mr)
+        for slot_name, slot_value in matches:
+            slots[slot_name.lower()] = slot_value.lower()
+        return slots
+
+    def calculate_slot_coverage(generated_text, mr):
+        """Calculate how well the generated text covers MR slots"""
+        mr_slots = extract_mr_slots(mr)
+        generated_lower = generated_text.lower()
+        
+        coverage_score = 0
+        total_slots = len(mr_slots)
+        
+        for slot_name, slot_value in mr_slots.items():
+            if slot_value in generated_lower:
+                coverage_score += 1
+            elif slot_name in generated_lower:
+                coverage_score += 0.5
+        
+        return coverage_score / total_slots if total_slots > 0 else 0
+
+    def generate_with_beam_reranking(input_ids, attention_mask, mr):
+        """Generate text using beam search and rerank by slot coverage"""
+        
+        # Generate multiple candidates
+        with torch.no_grad():
+            use_amp = torch.cuda.is_available() and getattr(args, "fp16", False)
+            
+            if use_amp:
+                with autocast():
+                    outputs = model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        max_length=input_ids.shape[1] + 40,
+                        num_beams=8,
+                        num_return_sequences=5,  # Generate 5 candidates
+                        early_stopping=True,
+                        no_repeat_ngram_size=2,
+                        repetition_penalty=1.15,
+                        length_penalty=0.9,
+                        pad_token_id=tokenizer.eos_token_id,
+                        eos_token_id=tokenizer.eos_token_id,
+                    )
+            else:
+                outputs = model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_length=input_ids.shape[1] + 40,
+                    num_beams=8,
+                    num_return_sequences=5,  # Generate 5 candidates
+                    early_stopping=True,
+                    no_repeat_ngram_size=2,
+                    repetition_penalty=1.15,
+                    length_penalty=0.9,
+                    pad_token_id=tokenizer.eos_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+        
+        # Decode candidates
+        candidates = []
+        for output in outputs:
+            decoded = tokenizer.decode(output, skip_special_tokens=True)
+            if "REF:" in decoded:
+                generated_part = decoded.split("REF:")[1].strip()
+                candidates.append(generated_part)
+        
+        if not candidates:
+            return ""
+        
+        # Rerank by slot coverage and length
+        scored_candidates = []
+        for candidate in candidates:
+            coverage_score = calculate_slot_coverage(candidate, mr)
+            length_penalty = len(candidate.split()) / 25.0  # Prefer ~25 words
+            length_penalty = 1.0 if length_penalty <= 1.0 else 1.0 / length_penalty
+            
+            total_score = coverage_score * 0.7 + length_penalty * 0.3
+            scored_candidates.append((candidate, total_score))
+        
+        # Return best candidate
+        best_candidate = max(scored_candidates, key=lambda x: x[1])
+        return best_candidate
+
     # MR -> refs mapping (unchanged)
     mr_to_references = eval_dataset.mr_to_refs
     all_mrs = list(mr_to_references.keys())
     predictions = []
     references_list = []
 
-    logger.info("Generating predictions for E2E evaluation (batched)...")
+    logger.info("Generating predictions for E2E evaluation with beam reranking...")
 
     # Heuristics tuned for A4000 (16GB) & safety
     if getattr(args, "fp16", False) and torch.cuda.is_available():
-        eval_batch_size = 14   # A4000 + AMP can often handle ~14 with reduced beams
+        eval_batch_size = 6   # Reduced due to multiple candidates generation
         num_beams = 8
     else:
-        eval_batch_size = 8
+        eval_batch_size = 4   # Reduced due to multiple candidates generation
         num_beams = 8
 
     # global generation defaults (tweakable)
-    max_new_tokens_cap =  120      # max tokens to generate beyond the prompt
-    no_repeat_ngram_size = 0
-    repetition_penalty = 1.0
-    length_penalty = 1.0
+    max_new_tokens_cap = 30      # max tokens to generate beyond the prompt
+    no_repeat_ngram_size = 4
+    repetition_penalty = 1.25
+    length_penalty = 0.8
     eos_token_id = tokenizer.eos_token_id
     pad_token_id = tokenizer.eos_token_id
 
     logger.info(f"Eval batch size: {eval_batch_size}, num_beams: {num_beams}, max_new_tokens_cap: {max_new_tokens_cap}, fp16: {getattr(args, 'fp16', False)}")
+    logger.info("Using beam reranking with slot coverage scoring...")
 
     from torch.cuda.amp import autocast
 
@@ -724,43 +846,16 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
         input_ids = inputs["input_ids"]
         attention_mask = inputs["attention_mask"]
 
-        # derive per-batch safe max_new_tokens from prompt length
-        prompt_len = input_ids.shape[1]  # length of tokenized prompt (including any padding tokens in the batch)
-        # compute available space (args.max_length is the token budget we prepared for training)
-        space = max(1, args.max_length - prompt_len)
-        # final max_new for this batch is the min of cap and available space (and at least 5)
-        batch_max_new = max_new_tokens_cap
-        batch_max_new = max(5, batch_max_new)
-
-        gen_kwargs = dict(
-        input_ids=input_ids.to(device),
-        attention_mask=attention_mask.to(device),
-        max_length=input_ids.shape[1] + 60,  # Fixed generous limit
-        repetition_penalty = 1.0,
-        no_repeat_ngram_size = 4,
-        length_penalty = 0.8,
-        num_beams=10,
-        do_sample=False,
-        early_stopping=True,
-        pad_token_id=pad_token_id,
-        eos_token_id=eos_token_id,
-    )
-
-        use_amp = torch.cuda.is_available() and getattr(args, "fp16", False)
-        if use_amp:
-            with autocast():
-                generated_ids = model.generate(**gen_kwargs)
-        else:
-            with torch.no_grad():
-                generated_ids = model.generate(**gen_kwargs)
-
-        decoded_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
-
-        for mr, gen_text in zip(mrs_batch, decoded_texts):
-            if "REF:" in gen_text:
-                gen_text = gen_text.split("REF:")[1].strip()
-            predictions.append(gen_text)
+        # Generate with beam reranking for each MR individually
+        for i, mr in enumerate(mrs_batch):
+            single_input = input_ids[i:i+1]
+            single_mask = attention_mask[i:i+1]
+            
+            best_generation = generate_with_beam_reranking(single_input, single_mask, mr)
+            
+            predictions.append(best_generation)
             references_list.append(mr_to_references[mr])
+
         if len(predictions) >= 10:
             logger.info("=== DEBUGGING GENERATION LENGTH ===")
             sample_lengths = [len(pred.split()) for pred in predictions[:10]]
@@ -802,7 +897,7 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
     }
 
     logger.info("=" * 60)
-    logger.info("E2E PYTHON EVALUATION RESULTS")
+    logger.info("E2E PYTHON EVALUATION RESULTS (WITH BEAM RERANKING)")
     logger.info("=" * 60)
     logger.info(f"BLEU:    {bleu_score:.4f}")
     logger.info(f"NIST:    {nist_score:.4f}")
@@ -810,6 +905,7 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
     logger.info("=" * 60)
 
     return results
+
 
 
 
