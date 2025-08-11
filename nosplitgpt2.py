@@ -490,13 +490,11 @@ def prepare_for_generation(input_ids: torch.LongTensor,
                            attention_mask: torch.LongTensor,
                            pad_token_id: int = None):
     """
-    Trim pad tokens and left-align the real tokens for generation.
-    Works whether the batch is left-padded or right-padded.
-
-    Args:
-        input_ids: (B, S) tensor on device
-        attention_mask: (B, S) tensor on device (1 for real tokens, 0 for pad)
-        pad_token_id: id to use for pad in the returned tensor (optional)
+    Trim pad tokens while preserving the original padding side.
+    If the batch was left-padded (padding on the left, tokens at right),
+    the returned tensors will also be left-padded (tokens at right).
+    If the batch was right-padded (padding on the right, tokens at left),
+    the returned tensors will also be right-padded (tokens at left).
 
     Returns:
         new_input_ids, new_attention_mask  # shapes (B, max_nonpad_len)
@@ -504,22 +502,22 @@ def prepare_for_generation(input_ids: torch.LongTensor,
     device = input_ids.device
     b, s = input_ids.size()
 
-    # detect padding side by checking first/last columns of attention_mask
+    # detect padding side from attention_mask
     first_col_nonpad = int(attention_mask[:, 0].sum().item())
     last_col_nonpad = int(attention_mask[:, -1].sum().item())
 
     if first_col_nonpad == 0 and last_col_nonpad > 0:
-        padding_side = "left"
+        padding_side = "left"   # original data is LEFT-PADDED (tokens at right)
     elif last_col_nonpad == 0 and first_col_nonpad > 0:
-        padding_side = "right"
+        padding_side = "right"  # original data is RIGHT-PADDED (tokens at left)
     else:
-        # ambiguous — default to right (most common). This rarely happens.
+        # ambiguous -> assume 'right' (common), but this is unlikely for your dataset
         padding_side = "right"
 
     nonpad_lens = attention_mask.sum(dim=1).long().tolist()
     max_len = max(nonpad_lens) if max(nonpad_lens) > 0 else 1
 
-    # fill value for pad -- if not provided fallback to input_ids' pad or 0
+    # determine pad token fallback
     if pad_token_id is None:
         try:
             pad_val = int(input_ids.new_tensor([0]).item())
@@ -528,6 +526,7 @@ def prepare_for_generation(input_ids: torch.LongTensor,
     else:
         pad_val = int(pad_token_id)
 
+    # create output tensors of shape (B, max_len)
     new_input_ids = torch.full((b, max_len), pad_val, dtype=input_ids.dtype, device=device)
     new_attention_mask = torch.zeros((b, max_len), dtype=attention_mask.dtype, device=device)
 
@@ -535,15 +534,18 @@ def prepare_for_generation(input_ids: torch.LongTensor,
         if l == 0:
             continue
         if padding_side == "right":
-            # tokens start at left; keep first `l` tokens
+            # original has tokens at left -> keep them at left in the trimmed tensor
             new_input_ids[i, :l] = input_ids[i, :l]
             new_attention_mask[i, :l] = 1
         else:
-            # tokens end at right; take last `l` tokens and left-align them in new tensor
-            new_input_ids[i, :l] = input_ids[i, -l:]
-            new_attention_mask[i, :l] = 1
+            # original has tokens at right (LEFT-PAD) -> keep tokens at right:
+            # place tokens in the LAST `l` positions of the trimmed tensor
+            start = max_len - l
+            new_input_ids[i, start:] = input_ids[i, -l:]
+            new_attention_mask[i, start:] = 1
 
     return new_input_ids, new_attention_mask
+
 
 
 
