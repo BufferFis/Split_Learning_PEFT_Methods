@@ -34,6 +34,18 @@ from peft import (
     PeftModel,
     prepare_model_for_kbit_training,
 )
+
+
+import warnings
+import logging
+
+# At the top of your script, suppress this specific warning
+warnings.filterwarnings("ignore", message=".*right-padding was detected.*")
+
+# Or suppress transformers generation warnings
+logging.getLogger("transformers.generation.utils").setLevel(logging.ERROR)
+
+
 def calculate_e2e_bleu(predictions, references_list):
     """Calculate BLEU using sacreBLEU (E2E standard)"""
     try:
@@ -662,7 +674,7 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
                             prompt_inputs["attention_mask"], 
                             pad_token_id=tokenizer.pad_token_id
                         )
-                        
+
                         gen_outputs = model.generate(
                             input_ids=trim_ids,
                             attention_mask=trim_mask,
