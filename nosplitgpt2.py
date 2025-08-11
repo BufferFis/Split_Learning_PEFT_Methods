@@ -675,6 +675,10 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
 from collections import Counter
 import re
 
+def is_complete_sentence(text):
+    """Check if text ends with proper punctuation"""
+    return text.strip().endswith(('.', '?', '!'))
+
 def extract_mr_slots(mr):
     """Extract actual slots and values from MR string"""
     slots = {}
@@ -752,36 +756,24 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
         # Generate multiple candidates
         with torch.no_grad():
             use_amp = torch.cuda.is_available() and getattr(args, "fp16", False)
-            
+            gen_kwargs = {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "max_length": input_ids.shape[1] + 15,      # Reduced from 25
+                    "num_beams": 8,
+                    "num_return_sequences": 5,
+                    "early_stopping": True,
+                    "no_repeat_ngram_size": 4,
+                    "repetition_penalty": 1.2,                  # Reduced from 1.25
+                    "length_penalty": 1.1,                      # Increased from 0.8
+                    "pad_token_id": tokenizer.eos_token_id,
+                    "eos_token_id": tokenizer.eos_token_id,
+                }
             if use_amp:
                 with autocast():
-                    outputs = model.generate(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        max_length=input_ids.shape[1] + 25,
-                        num_beams=10,
-                        num_return_sequences=5,  # Generate 5 candidates
-                        early_stopping=True,
-                        no_repeat_ngram_size=4,
-                        repetition_penalty=1.25,
-                        length_penalty=0.8,
-                        pad_token_id=tokenizer.eos_token_id,
-                        eos_token_id=tokenizer.eos_token_id,
-                    )
+                    outputs = model.generate(**gen_kwargs)
             else:
-                outputs = model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    max_length=input_ids.shape[1] + 25,
-                    num_beams=10,
-                    num_return_sequences=5,  # Generate 5 candidates
-                    early_stopping=True,
-                    no_repeat_ngram_size=4,
-                    repetition_penalty=1.25,
-                    length_penalty=0.8,
-                    pad_token_id=tokenizer.eos_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
-                )
+                outputs = model.generate(**gen_kwargs)
         
         # Decode candidates
         candidates = []
@@ -794,14 +786,16 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
         if not candidates:
             return ""
         
+
         # Rerank by slot coverage and length
         scored_candidates = []
         for candidate in candidates:
             coverage_score = calculate_slot_coverage(candidate, mr)
-            length_penalty = len(candidate.split()) / 25.0  # Prefer ~25 words
-            length_penalty = 1.0 if length_penalty <= 1.0 else 1.0 / length_penalty
+            length_factor = len(candidate.split()) / 15.0  # Target 15 words
+            length_score = 1.0 if length_factor <= 1.0 else 1.0 / length_factor
+            completeness_score = 1.0 if is_complete_sentence(candidate) else 0.3  # Heavy penalty for incomplete
             
-            total_score = coverage_score * 0.6 + length_penalty * 0.4
+            total_score = coverage_score * 0.5 + length_score * 0.3 + completeness_score * 0.2
             scored_candidates.append((candidate, total_score))
         
         # Return best candidate
