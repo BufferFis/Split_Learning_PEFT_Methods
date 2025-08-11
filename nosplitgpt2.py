@@ -1136,9 +1136,10 @@ def main():
     
     # Load tokenizer and model
     logger.info(f"Loading model: {args.model_name_or_path}")
-    tokenizer = GPT2Tokenizer.from_pretrained(args.model_name_or_path)
-    tokenizer.padding_side = "left"
-    tokenizer.truncation_side = "left"
+    tokenizer = GPT2Tokenizer.from_pretrained(args.model_name_or_path, padding_side="left",      # set at init (recommended)
+                                    truncation_side="left")
+    #tokenizer.padding_side = "left"
+    
 
     # Properly set up pad token
     if tokenizer.pad_token is None:
