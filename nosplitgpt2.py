@@ -333,7 +333,7 @@ def sanity_check(model, tokenizer, mrs, device, max_length=256):
     with torch.no_grad():
         for i, mr in enumerate(mrs[:5]):  # Generate for up to 5 MRs
             prompt = f"MR: {mr} REF:"
-            inputs = tokenizer(prompt, return_tensors="pt", padding=True)
+            inputs = tokenizer(prompt, return_tensors="pt", padding=True, padding_side="left")
             input_ids = inputs["input_ids"].to(device)
             attention_mask = inputs["attention_mask"].to(device)
             
@@ -910,7 +910,7 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
         prompts = [f"MR: {mr} REF:" for mr in mrs_batch]
 
         # Left padding already set earlier (tokenizer.padding_side = "left")
-        inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
+        inputs = tokenizer(prompts, return_tensors="pt", padding=True,padding_side="left" ,truncation=True).to(device)
         input_ids = inputs["input_ids"]
         attention_mask = inputs["attention_mask"]
 
@@ -1077,12 +1077,19 @@ def main():
     logger.info(f"Loading model: {args.model_name_or_path}")
     tokenizer = GPT2Tokenizer.from_pretrained(args.model_name_or_path)
     tokenizer.padding_side = "left"
+    tokenizer.truncation_side = "left"
+
     # Properly set up pad token
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"
+    tokenizer.model_max_length = args.max_length
     # Check if we're resuming from checkpoint
+    # Verify the setting
+    logger.info(f"Tokenizer padding side: {tokenizer.padding_side}")
+    logger.info(f"Tokenizer pad token: {tokenizer.pad_token}")
+
     if args.resume_from_checkpoint:
         logger.info(f"Loading base model for fine-tuning from: {args.model_name_or_path}")
         model = GPT2LMHeadModel.from_pretrained(args.model_name_or_path)
