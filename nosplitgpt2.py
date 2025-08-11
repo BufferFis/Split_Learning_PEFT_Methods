@@ -647,12 +647,19 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
                         # Get MRs for this batch
                         batch_mrs = batch["mr"]
                         
-                        # Generate text samples
-                        prompt_inputs = input_ids[:, :input_ids.size(1)//2]
-                        prompt_mask = attention_mask[:, :attention_mask.size(1)//2]
+                        prompts = [f"MR: {mr} REF:" for mr in batch_mrs]
+                        prompt_inputs = tokenizer(
+                            prompts, 
+                            return_tensors="pt", 
+                            padding=True, 
+                            padding_side="left",
+                            truncation=True
+                        ).to(device)
+                        
+                        # Use prepare_for_generation on the prompt inputs
                         trim_ids, trim_mask = prepare_for_generation(
-                            prompt_inputs, 
-                            prompt_mask, 
+                            prompt_inputs["input_ids"], 
+                            prompt_inputs["attention_mask"], 
                             pad_token_id=tokenizer.pad_token_id
                         )
                         
