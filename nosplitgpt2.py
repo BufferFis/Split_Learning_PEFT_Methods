@@ -648,7 +648,13 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
                         batch_mrs = batch["mr"]
                         
                         # Generate text samples
-                        trim_ids, trim_mask = prepare_for_generation(input_ids, attention_mask, pad_token_id=tokenizer.eos_token_id)
+                        prompt_inputs = input_ids[:, :input_ids.size(1)//2]
+                        prompt_mask = attention_mask[:, :attention_mask.size(1)//2]
+                        trim_ids, trim_mask = prepare_for_generation(
+                            prompt_inputs, 
+                            prompt_mask, 
+                            pad_token_id=tokenizer.pad_token_id
+                        )
                         
                         gen_outputs = model.generate(
                             input_ids=trim_ids,
