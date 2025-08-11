@@ -759,13 +759,13 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
             gen_kwargs = {
                     "input_ids": input_ids,
                     "attention_mask": attention_mask,
-                    "max_length": input_ids.shape[1] + 17,      # Reduced from 25
+                    "max_length": input_ids.shape[1] + 23,      # Reduced from 25
                     "num_beams": 8,
                     "num_return_sequences": 5,
                     "early_stopping": True,
                     "no_repeat_ngram_size": 4,
                     "repetition_penalty": 1.2,                  # Reduced from 1.25
-                    "length_penalty": 1.1,                      # Increased from 0.8
+                    "length_penalty": 1,                      
                     "pad_token_id": tokenizer.eos_token_id,
                     "eos_token_id": tokenizer.eos_token_id,
                 }
@@ -793,9 +793,9 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
             coverage_score = calculate_slot_coverage(candidate, mr)
             length_factor = len(candidate.split()) / 15.0  # Target 15 words
             length_score = 1.0 if length_factor <= 1.0 else 1.0 / length_factor
-            completeness_score = 1.0 if is_complete_sentence(candidate) else 0.3  # Heavy penalty for incomplete
+            completeness_score = 1.0 if is_complete_sentence(candidate) else 0.1  # Heavy penalty for incomplete
             
-            total_score = coverage_score * 0.5 + length_score * 0.3 + completeness_score * 0.2
+            total_score = coverage_score * 0.5 + length_score * 0.2 + completeness_score * 0.3
             scored_candidates.append((candidate, total_score))
         
         # Return best candidate
