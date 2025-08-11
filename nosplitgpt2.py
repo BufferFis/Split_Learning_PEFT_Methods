@@ -577,37 +577,42 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
             )
             loss = outputs.loss
 
-            if global_step % 5 == 0:  # Run coverage loss every 4 steps
-                with torch.no_grad():
-                    # Get MRs for this batch
-                    batch_mrs = batch["mr"]  # Extract MRs from batch
+            if global_step % 5 == 0:
+                try:
+                    with torch.no_grad():
+                        # Get MRs for this batch
+                        batch_mrs = batch["mr"]
+                        
+                        # Generate text samples
+                        prompt_inputs = input_ids[:, :input_ids.size(1)//2]
+                        prompt_mask = attention_mask[:, :attention_mask.size(1)//2]
+                        
+                        gen_outputs = model.generate(
+                            input_ids=prompt_inputs,
+                            attention_mask=prompt_mask,
+                            max_length=prompt_inputs.size(1) + 25,
+                            num_beams=3,
+                            early_stopping=True,
+                            pad_token_id=tokenizer.eos_token_id,
+                            do_sample=False
+                        )
+                        
+                        # Decode generated texts
+                        generated_texts = [tokenizer.decode(g, skip_special_tokens=True) for g in gen_outputs]
                     
-                    # Generate text samples
-                    prompt_inputs = input_ids[:, :input_ids.size(1)//2]  # Use prompt part only
-                    prompt_mask = attention_mask[:, :attention_mask.size(1)//2]
-                    
-                    gen_outputs = model.generate(
-                        input_ids=prompt_inputs,
-                        attention_mask=prompt_mask,
-                        max_length=prompt_inputs.size(1) + 25,
-                        num_beams=3,  # Reduced for speed during training
-                        early_stopping=True,
-                        pad_token_id=tokenizer.eos_token_id,
-                        do_sample=False
-                    )
-                    
-                    # Decode generated texts
-                    generated_texts = [tokenizer.decode(g, skip_special_tokens=True) for g in gen_outputs]
-                    
-                    # Calculate coverage loss
-                    cv_loss = coverage_loss_function(generated_texts, batch_mrs, weight=0.3)
+                    # Calculate coverage loss (outside no_grad context)
+                    cv_loss = coverage_loss_function(generated_texts, batch_mrs, weight=args.coverage_loss_weight)
                     
                     # Combine losses
                     total_loss = loss + cv_loss
                     
                     # Log coverage loss for monitoring
                     if global_step % 100 == 0:
-                        logger.info(f"Step {global_step} - LM Loss: {lm_loss:.4f}, Coverage Loss: {cv_loss:.4f}")
+                        logger.info(f"Step {global_step} - LM Loss: {loss:.4f}, Coverage Loss: {cv_loss:.4f}")
+                        
+                except Exception as e:
+                    logger.warning(f"Coverage loss computation failed: {e}. Using LM loss only.")
+                    total_loss = loss
             else:
                 total_loss = loss
 
@@ -753,11 +758,14 @@ def calculate_slot_coverage(generated_text, mr):
 def coverage_loss_function(generated_texts, mrs, weight=0.3):
     """
     Compute coverage loss penalizing missing slots in generated texts.
-    Higher weight = stronger penalty for missing slots.
+    Fixed version that maintains gradients properly.
     """
-    losses = []
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
+    if not generated_texts or not mrs:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+    
+    losses = []
     for gen_text, mr in zip(generated_texts, mrs):
         # Extract only the generated part after "REF:"
         if "REF:" in gen_text:
@@ -767,10 +775,12 @@ def coverage_loss_function(generated_texts, mrs, weight=0.3):
         coverage_penalty = 1.0 - slot_coverage  # Penalize missing slots
         losses.append(coverage_penalty)
     
+    # FIXED: Create tensor that requires gradients
     if losses:
-        return torch.tensor(losses, dtype=torch.float32, device=device).mean() * weight
+        losses_tensor = torch.tensor(losses, dtype=torch.float32, device=device, requires_grad=True)
+        return losses_tensor.mean() * weight
     else:
-        return torch.tensor(0.0, device=device)
+        return torch.tensor(0.0, device=device, requires_grad=True)
 
 
 def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
@@ -1071,7 +1081,7 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
-    
+    tokenizer.padding_side = "left"
     # Check if we're resuming from checkpoint
     if args.resume_from_checkpoint:
         logger.info(f"Loading base model for fine-tuning from: {args.model_name_or_path}")
