@@ -486,6 +486,68 @@ def load_checkpoint(args, model, tokenizer, optimizer, scheduler, scaler=None):
     return model, optimizer, scheduler, epoch, global_step, tr_loss, losses, perplexities, sanity_check_results
 
 
+def prepare_for_generation(input_ids: torch.LongTensor,
+                           attention_mask: torch.LongTensor,
+                           pad_token_id: int = None):
+    """
+    Trim pad tokens and left-align the real tokens for generation.
+    Works whether the batch is left-padded or right-padded.
+
+    Args:
+        input_ids: (B, S) tensor on device
+        attention_mask: (B, S) tensor on device (1 for real tokens, 0 for pad)
+        pad_token_id: id to use for pad in the returned tensor (optional)
+
+    Returns:
+        new_input_ids, new_attention_mask  # shapes (B, max_nonpad_len)
+    """
+    device = input_ids.device
+    b, s = input_ids.size()
+
+    # detect padding side by checking first/last columns of attention_mask
+    first_col_nonpad = int(attention_mask[:, 0].sum().item())
+    last_col_nonpad = int(attention_mask[:, -1].sum().item())
+
+    if first_col_nonpad == 0 and last_col_nonpad > 0:
+        padding_side = "left"
+    elif last_col_nonpad == 0 and first_col_nonpad > 0:
+        padding_side = "right"
+    else:
+        # ambiguous — default to right (most common). This rarely happens.
+        padding_side = "right"
+
+    nonpad_lens = attention_mask.sum(dim=1).long().tolist()
+    max_len = max(nonpad_lens) if max(nonpad_lens) > 0 else 1
+
+    # fill value for pad -- if not provided fallback to input_ids' pad or 0
+    if pad_token_id is None:
+        try:
+            pad_val = int(input_ids.new_tensor([0]).item())
+        except Exception:
+            pad_val = 0
+    else:
+        pad_val = int(pad_token_id)
+
+    new_input_ids = torch.full((b, max_len), pad_val, dtype=input_ids.dtype, device=device)
+    new_attention_mask = torch.zeros((b, max_len), dtype=attention_mask.dtype, device=device)
+
+    for i, l in enumerate(nonpad_lens):
+        if l == 0:
+            continue
+        if padding_side == "right":
+            # tokens start at left; keep first `l` tokens
+            new_input_ids[i, :l] = input_ids[i, :l]
+            new_attention_mask[i, :l] = 1
+        else:
+            # tokens end at right; take last `l` tokens and left-align them in new tensor
+            new_input_ids[i, :l] = input_ids[i, -l:]
+            new_attention_mask[i, :l] = 1
+
+    return new_input_ids, new_attention_mask
+
+
+
+
 def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_dataset, valid_dataset):
     """Train the model and evaluate on validation set."""
     # Set up device
@@ -584,13 +646,12 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
                         batch_mrs = batch["mr"]
                         
                         # Generate text samples
-                        prompt_inputs = input_ids[:, :input_ids.size(1)//2]
-                        prompt_mask = attention_mask[:, :attention_mask.size(1)//2]
+                        trim_ids, trim_mask = prepare_for_generation(input_ids, attention_mask, pad_token_id=tokenizer.eos_token_id)
                         
                         gen_outputs = model.generate(
-                            input_ids=prompt_inputs,
-                            attention_mask=prompt_mask,
-                            max_length=prompt_inputs.size(1) + 25,
+                            input_ids=trim_ids,
+                            attention_mask=trim_mask,
+                            max_length=trim_ids.size(1) + 25,
                             num_beams=3,
                             early_stopping=True,
                             pad_token_id=tokenizer.eos_token_id,
