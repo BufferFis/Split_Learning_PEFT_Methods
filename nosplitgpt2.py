@@ -193,6 +193,14 @@ def parse_args():
         default="./results", 
         help="Output directory for models and results"
     )
+
+    parser.add_argument(
+        "--coverage_loss_weight",
+        type=float,
+        default=0.3,
+        help="Weight for coverage loss (0.2-0.4 recommended)"
+    )
+
     parser.add_argument(
         "--model_name_or_path",
         type=str,
@@ -568,16 +576,51 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
                 return_dict=True,
             )
             loss = outputs.loss
+
+            if global_step % 5 == 0:  # Run coverage loss every 4 steps
+                with torch.no_grad():
+                    # Get MRs for this batch
+                    batch_mrs = batch["mr"]  # Extract MRs from batch
+                    
+                    # Generate text samples
+                    prompt_inputs = input_ids[:, :input_ids.size(1)//2]  # Use prompt part only
+                    prompt_mask = attention_mask[:, :attention_mask.size(1)//2]
+                    
+                    gen_outputs = model.generate(
+                        input_ids=prompt_inputs,
+                        attention_mask=prompt_mask,
+                        max_length=prompt_inputs.size(1) + 25,
+                        num_beams=3,  # Reduced for speed during training
+                        early_stopping=True,
+                        pad_token_id=tokenizer.eos_token_id,
+                        do_sample=False
+                    )
+                    
+                    # Decode generated texts
+                    generated_texts = [tokenizer.decode(g, skip_special_tokens=True) for g in gen_outputs]
+                    
+                    # Calculate coverage loss
+                    cv_loss = coverage_loss_function(generated_texts, batch_mrs, weight=0.3)
+                    
+                    # Combine losses
+                    total_loss = loss + cv_loss
+                    
+                    # Log coverage loss for monitoring
+                    if global_step % 100 == 0:
+                        logger.info(f"Step {global_step} - LM Loss: {lm_loss:.4f}, Coverage Loss: {cv_loss:.4f}")
+            else:
+                total_loss = loss
+
             
             # Scale loss if gradient accumulation is used
             if args.gradient_accumulation_steps > 1:
-                loss = loss / args.gradient_accumulation_steps
+                total_loss = total_loss / args.gradient_accumulation_steps
             
             # Standard backward pass
-            loss.backward()
+            total_loss.backward()
             
-            tr_loss += loss.item() * args.gradient_accumulation_steps
-            epoch_loss += loss.item() * args.gradient_accumulation_steps
+            tr_loss += total_loss.item() * args.gradient_accumulation_steps
+            epoch_loss += total_loss.item() * args.gradient_accumulation_steps
             
             # Only update parameters after accumulating enough gradients
             if (step + 1) % args.gradient_accumulation_steps == 0:
@@ -707,6 +750,27 @@ def calculate_slot_coverage(generated_text, mr):
     
     return coverage_score / total_slots if total_slots > 0 else 0
 
+def coverage_loss_function(generated_texts, mrs, weight=0.3):
+    """
+    Compute coverage loss penalizing missing slots in generated texts.
+    Higher weight = stronger penalty for missing slots.
+    """
+    losses = []
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    for gen_text, mr in zip(generated_texts, mrs):
+        # Extract only the generated part after "REF:"
+        if "REF:" in gen_text:
+            gen_text = gen_text.split("REF:")[1].strip()
+        
+        slot_coverage = calculate_slot_coverage(gen_text, mr)
+        coverage_penalty = 1.0 - slot_coverage  # Penalize missing slots
+        losses.append(coverage_penalty)
+    
+    if losses:
+        return torch.tensor(losses, dtype=torch.float32, device=device).mean() * weight
+    else:
+        return torch.tensor(0.0, device=device)
 
 
 def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
