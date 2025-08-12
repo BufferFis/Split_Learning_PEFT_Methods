@@ -653,7 +653,7 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
             )
             loss = outputs.loss
 
-            if global_step % 5 == 0:
+            if global_step % 20 == 0:
                 try:
                     with torch.no_grad():
                         # Get MRs for this batch
