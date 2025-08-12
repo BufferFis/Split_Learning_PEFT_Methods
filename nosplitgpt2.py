@@ -651,7 +651,7 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
                 labels=labels,
                 return_dict=True,
             )
-            loss = outputs.loss
+            total_loss = outputs.loss
 
             # if global_step % 20 == 0:
             #     try:
