@@ -737,14 +737,14 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
                 model.zero_grad()
                 global_step += 1
 
-                step_loss = loss.item() * args.gradient_accumulation_steps
+                step_loss = total_loss.item() * args.gradient_accumulation_steps
 
                 # append to CSV
                 with open(loss_log_path, "a") as f:
                     f.write(f"{global_step},{epoch+1},{step},{step_loss:.6f}\n")
                 
                 # Update progress bar
-                epoch_iterator.set_postfix(loss=loss.item() * args.gradient_accumulation_steps)
+                epoch_iterator.set_postfix(loss=total_loss.item() * args.gradient_accumulation_steps)
                 
                 # Record loss every 10 steps
                 if global_step % 10 == 0:
