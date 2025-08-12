@@ -653,56 +653,56 @@ def train(args, model, tokenizer, train_dataloader, valid_dataloader, train_data
             )
             loss = outputs.loss
 
-            if global_step % 20 == 0:
-                try:
-                    with torch.no_grad():
-                        # Get MRs for this batch
-                        batch_mrs = batch["mr"]
+            # if global_step % 20 == 0:
+            #     try:
+            #         with torch.no_grad():
+            #             # Get MRs for this batch
+            #             batch_mrs = batch["mr"]
                         
-                        prompts = [f"MR: {mr} REF:" for mr in batch_mrs]
-                        prompt_inputs = tokenizer(
-                            prompts, 
-                            return_tensors="pt", 
-                            padding=True, 
-                            padding_side="left",
-                            truncation=True
-                        ).to(device)
+            #             prompts = [f"MR: {mr} REF:" for mr in batch_mrs]
+            #             prompt_inputs = tokenizer(
+            #                 prompts, 
+            #                 return_tensors="pt", 
+            #                 padding=True, 
+            #                 padding_side="left",
+            #                 truncation=True
+            #             ).to(device)
                         
-                        # Use prepare_for_generation on the prompt inputs
-                        trim_ids, trim_mask = prepare_for_generation(
-                            prompt_inputs["input_ids"], 
-                            prompt_inputs["attention_mask"], 
-                            pad_token_id=tokenizer.pad_token_id
-                        )
+            #             # Use prepare_for_generation on the prompt inputs
+            #             trim_ids, trim_mask = prepare_for_generation(
+            #                 prompt_inputs["input_ids"], 
+            #                 prompt_inputs["attention_mask"], 
+            #                 pad_token_id=tokenizer.pad_token_id
+            #             )
 
-                        gen_outputs = model.generate(
-                            input_ids=trim_ids,
-                            attention_mask=trim_mask,
-                            max_length=trim_ids.size(1) + 25,
-                            num_beams=3,
-                            early_stopping=True,
-                            pad_token_id=tokenizer.eos_token_id,
-                            do_sample=False
-                        )
+            #             gen_outputs = model.generate(
+            #                 input_ids=trim_ids,
+            #                 attention_mask=trim_mask,
+            #                 max_length=trim_ids.size(1) + 25,
+            #                 num_beams=3,
+            #                 early_stopping=True,
+            #                 pad_token_id=tokenizer.eos_token_id,
+            #                 do_sample=False
+            #             )
                         
-                        # Decode generated texts
-                        generated_texts = [tokenizer.decode(g, skip_special_tokens=True) for g in gen_outputs]
+            #             # Decode generated texts
+            #             generated_texts = [tokenizer.decode(g, skip_special_tokens=True) for g in gen_outputs]
                     
-                    # Calculate coverage loss (outside no_grad context)
-                    cv_loss = coverage_loss_function(generated_texts, batch_mrs, weight=args.coverage_loss_weight)
+            #         # Calculate coverage loss (outside no_grad context)
+            #         cv_loss = coverage_loss_function(generated_texts, batch_mrs, weight=args.coverage_loss_weight)
                     
-                    # Combine losses
-                    total_loss = loss + cv_loss
+            #         # Combine losses
+            #         total_loss = loss + cv_loss
                     
-                    # Log coverage loss for monitoring
-                    if global_step % 100 == 0:
-                        logger.info(f"Step {global_step} - LM Loss: {loss:.4f}, Coverage Loss: {cv_loss:.4f}")
+            #         # Log coverage loss for monitoring
+            #         if global_step % 100 == 0:
+            #             logger.info(f"Step {global_step} - LM Loss: {loss:.4f}, Coverage Loss: {cv_loss:.4f}")
                         
-                except Exception as e:
-                    logger.warning(f"Coverage loss computation failed: {e}. Using LM loss only.")
-                    total_loss = loss
-            else:
-                total_loss = loss
+            #     except Exception as e:
+            #         logger.warning(f"Coverage loss computation failed: {e}. Using LM loss only.")
+            #         total_loss = loss
+            # else:
+            #     total_loss = loss
 
             
             # Scale loss if gradient accumulation is used
