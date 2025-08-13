@@ -308,10 +308,9 @@ def train_and_evaluate(args: TRAIN_ARGS):
         lora_alpha=args.lora_alpha,
         target_modules=args.target_modules,
         lora_dropout=args.lora_dropout,
-        bias="none",
+        bias="lora_only",
         task_type="CAUSAL_LM",
-        enabled=True,
-        use_dora=args.use_dora,  # enable DoRA
+        use_dora=True
     )
 
     # Wrap model with PEFT
