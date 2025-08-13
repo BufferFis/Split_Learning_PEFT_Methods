@@ -252,13 +252,13 @@ def parse_args():
     parser.add_argument(
         "--lora_rank",
         type=int,
-        default=8,
+        default=16,
         help="Rank for LoRA adapters"
     )
     parser.add_argument(
         "--lora_alpha",
         type=int,
-        default=32,
+        default=64,
         help="Alpha parameter for LoRA"
     )
     parser.add_argument(
@@ -957,7 +957,9 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
             #length_score = 1.0 if length_factor <= 1.0 else 1.0 / length_factor
             completeness_score = 1.0 if is_complete_sentence(candidate) else 0.1  # Heavy penalty for incomplete
             
-            total_score = coverage_score * 0.5 +  completeness_score * 0.5
+            total_score = (coverage_score * 0.45 + 
+                      length_score * 0.35 + 
+                      completeness_score * 0.20)
             scored_candidates.append((candidate, total_score))
         
         # Return best candidate
