@@ -288,7 +288,7 @@ def build_lora_dora_config() -> LoraConfig:
         lora_dropout=0.05,
         target_modules=["c_attn", "c_proj", "c_fc"],
         use_dora=True,
-        bias="none",
+        bias="lora_only",
     )
 
 
