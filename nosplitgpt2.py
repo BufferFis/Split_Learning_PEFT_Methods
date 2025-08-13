@@ -921,13 +921,13 @@ def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
             gen_kwargs = {
                     "input_ids": input_ids,
                     "attention_mask": attention_mask,
-                    "max_length": input_ids.shape[1] + 23,      # Reduced from 25
+                    "max_length": input_ids.shape[1] + 25,      # Reduced from 25
                     "num_beams": 8,
                     "num_return_sequences": 5,
                     "early_stopping": True,
                     "no_repeat_ngram_size": 4,
-                    "repetition_penalty": 1.2,                  # Reduced from 1.25
-                    "length_penalty": 1,                      
+                    "repetition_penalty": 1.25,                  # Reduced from 1.25
+                    "length_penalty": 0.8,                      
                     "pad_token_id": tokenizer.eos_token_id,
                     "eos_token_id": tokenizer.eos_token_id,
                 }
