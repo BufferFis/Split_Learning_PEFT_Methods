@@ -157,7 +157,7 @@ class E2EDataset(Dataset):
 
             # If combined longer than max_length, keep the last max_length tokens (preserve ref)
             if combined.size(0) > self.max_length:
-                combined = combined[-self.max_length:]
+                combined = combined[:self.max_length]
 
             # Create pad-filled tensors and LEFT-PAD tokens (so padding is on the left)
             input_ids = torch.full((self.max_length,), self.tokenizer.pad_token_id, dtype=torch.long)
