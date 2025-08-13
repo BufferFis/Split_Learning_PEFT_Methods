@@ -1,579 +1,1082 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 """
-(Updated) Full training + evaluation script for fine-tuning GPT-2 on the E2E NLG dataset
-Changes from original:
- - small sanity-check generation after wrapping model with PEFT (prints a generated sample)
- - set model.config.pad_token_id after setting tokenizer.pad_token
- - save tokenizer files and adapter config when checkpointing adapter
- - gentle handling/diagnostic message if pycocoevalcap is unavailable
- - comments to explain the pad-token caveat
-"""
+Train GPT-2 or GPT-2-medium on the E2E NLG dataset with:
+- Mixed precision (FP16)
+- PEFT (LoRA with DoRA)
+- Linear LR decay scheduler with warmup
+- Robust checkpointing (adapters, optimizer, scheduler, GradScaler, metadata)
+- Periodic validation and early stopping to prevent overfitting
+- Beam search decoding (10 beams)
+- Evaluation with BLEU, NIST, METEOR, ROUGE-L, CIDEr using a pure-Python path:
+  * Try to import/install the official E2E pure-Python metrics
+  * Fallback to pure-Python implementations (BLEU, NIST, ROUGE-L, METEOR via NLTK, CIDEr)
 
-# ---------------------------
-# Requirements (install before running)
-# ---------------------------
-# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-# pip install transformers datasets accelerate peft sentencepiece tqdm
-# pip install nltk rouge-score
-# pip install pycocoevalcap        # optional but recommended for CIDEr
-# pip install git+https://github.com/NVlabs/DoRA.git  # optional if you want NVlabs DoRA implementation
-#
-# ---------------------------
+Run:
+  python train_e2e_gpt2.py --model_name gpt2 --output_dir ./outputs
+
+Install deps (example):
+  pip install torch transformers peft pandas numpy nltk requests
+
+"""
 
 import os
+import re
+import csv
+import io
+import sys
+import gc
 import math
 import json
 import time
+import copy
+import glob
+import types
 import random
+import shutil
+import string
+import zipfile
+import logging
 import argparse
+import itertools
 from dataclasses import dataclass
-from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 import numpy as np
-import torch
-from torch.utils.data import Dataset, DataLoader
-from tqdm.auto import tqdm
+import pandas as pd
+import requests
 
-from datasets import load_dataset
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
 from transformers import (
     AutoTokenizer,
+    AutoConfig,
     AutoModelForCausalLM,
-    get_linear_schedule_with_warmup
+    get_linear_schedule_with_warmup,
+    set_seed as hf_set_seed,
 )
 
-# PEFT imports
-from peft import LoraConfig, get_peft_model, PeftModel, prepare_model_for_kbit_training
+# PEFT: DoRA via LoRA config with use_dora=True
+from peft import (
+    LoraConfig,
+    TaskType,
+    get_peft_model,
+    PeftModel,
+    PeftConfig,
+)
 
-# Mixed precision tools
-from torch.cuda.amp import GradScaler, autocast
-
-# Metrics (pure-Python where possible)
 import nltk
-from nltk.translate.bleu_score import corpus_bleu
-from nltk.translate.meteor_score import meteor_score
+from nltk.translate import bleu_score
 from nltk.translate.nist_score import sentence_nist
-from rouge_score import rouge_scorer
-
-# pycocoevalcap for CIDEr (Python implementation) - optional
-try:
-    from pycocoevalcap.cider.cider import Cider
-    _HAS_PYCOCO = True
-except Exception as e:
-    print("[warn] pycocoevalcap import failed -- CIDEr will not be available. Install pycocoevalcap for CIDEr. Error:", e)
-    _HAS_PYCOCO = False
-
-# Ensure required NLTK downloads
-nltk.download('wordnet', quiet=True)   # used by meteor
-nltk.download('punkt', quiet=True)     # sentence tokenizer sometimes helpful
-
-# ---------------------------
-# Configurable arguments
-# ---------------------------
-@dataclass
-class TRAIN_ARGS:
-    model_name: str = "gpt2-medium"       # "gpt2" or "gpt2-medium"
-    output_dir: str = "./checkpoints"
-    adapter_dir: str = "./checkpoints/peft_adapter"
-    dataset_name: str = "tuetschek/e2e_nlg"  # Hugging Face dataset id
-    max_length: int = 128
-    train_batch_size: int = 4
-    eval_batch_size: int = 8
-    gradient_accumulation_steps: int = 2
-    lr: float = 2e-5
-    weight_decay: float = 0.01
-    num_epochs: int = 3
-    warmup_steps: int = 200
-    save_every_steps: int = 2000
-    seed: int = 42
-    fp16: bool = True
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    patience: int = 2   # early stopping patience on validation loss
-    num_beams: int = 10
-    max_gen_len: int = 80
-    use_dora: bool = True   # enable DoRA in PEFT LoraConfig
-    lora_r: int = 8
-    lora_alpha: int = 32
-    lora_dropout: float = 0.05
-    target_modules: List[str] = None   # set below if None
-
-# set target modules for GPT-2
-if TRAIN_ARGS.target_modules is None:
-    TRAIN_ARGS.target_modules = ["c_attn", "c_proj"]
+from nltk.translate.meteor_score import meteor_score
 
 
-# ---------------------------
-# Utilities & dataset handling
-# ---------------------------
-class E2EDataset(Dataset):
-    """Wrap HuggingFace E2E dataset into PyTorch Dataset ready for LM training.
+# -------------------------
+# Utilities and constants
+# -------------------------
 
-    We create sequences like: "<MR>  <SEP>  <REFERENCE>"
-    and set labels to -100 for MR portion so LM loss is computed only on the target.
+E2E_DEFAULT_URLS = {
+    "train": "https://raw.githubusercontent.com/tuetschek/e2e-dataset/master/e2e-dataset/trainset.csv",
+    "dev":   "https://raw.githubusercontent.com/tuetschek/e2e-dataset/master/e2e-dataset/devset.csv",
+    "test":  "https://raw.githubusercontent.com/tuetschek/e2e-dataset/master/e2e-dataset/testset.csv",
+}
+
+# Tokenizer-safe whitespace normalization
+_WS_RE = re.compile(r"\s+")
+
+def normalize_ws(s: str) -> str:
+    return _WS_RE.sub(" ", s.strip())
+
+def set_all_seeds(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    hf_set_seed(seed)
+
+def ensure_nltk_resources():
+    try:
+        nltk.data.find('corpora/wordnet')
+    except LookupError:
+        nltk.download('wordnet', quiet=True)
+    try:
+        nltk.data.find('corpora/omw-1.4')
+    except LookupError:
+        nltk.download('omw-1.4', quiet=True)
+    # For tokenizers (optional, but harmless)
+    try:
+        nltk.data.find('tokenizers/punkt')
+    except LookupError:
+        nltk.download('punkt', quiet=True)
+
+def safe_mkdir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+def download_file(url: str, dest_path: str, timeout: int = 60):
+    resp = requests.get(url, timeout=timeout)
+    resp.raise_for_status()
+    with open(dest_path, "wb") as f:
+        f.write(resp.content)
+
+
+# ---------------------------------
+# Data handling for E2E CSV format
+# ---------------------------------
+
+def auto_find_csv(data_dir: str, split_keyword: str) -> Optional[str]:
     """
-    def __init__(self, hf_dataset, tokenizer: AutoTokenizer, split: str = "train", max_length: int = 128):
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.examples = []
+    Try to find a CSV file in data_dir whose name contains split_keyword (e.g., 'train', 'dev', 'test').
+    """
+    candidates = glob.glob(os.path.join(data_dir, "*.csv"))
+    for c in candidates:
+        name = os.path.basename(c).lower()
+        if split_keyword in name:
+            return c
+    return None
 
-        if isinstance(hf_dataset, dict) and split in hf_dataset:
-            ds = hf_dataset[split]
-        else:
-            ds = hf_dataset
+def load_e2e_csvs(data_dir: Optional[str], work_dir: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Load train/dev/test CSVs. If data_dir is None, download from default URLs into work_dir.
+    The function expects columns: 'mr' and 'ref' for train/dev. Test may or may not include 'ref'.
+    """
+    safe_mkdir(work_dir)
+    if data_dir and os.path.isdir(data_dir):
+        train_fp = auto_find_csv(data_dir, "train")
+        dev_fp = auto_find_csv(data_dir, "dev")
+        test_fp = auto_find_csv(data_dir, "test")
+        if not train_fp or not dev_fp or not test_fp:
+            raise FileNotFoundError("Could not locate train/dev/test CSV files in provided data_dir.")
+        train_df = pd.read_csv(train_fp)
+        dev_df = pd.read_csv(dev_fp)
+        test_df = pd.read_csv(test_fp)
+    else:
+        # Download
+        train_fp = os.path.join(work_dir, "trainset.csv")
+        dev_fp   = os.path.join(work_dir, "devset.csv")
+        test_fp  = os.path.join(work_dir, "testset.csv")
+        if not os.path.exists(train_fp):
+            download_file(E2E_DEFAULT_URLS["train"], train_fp)
+        if not os.path.exists(dev_fp):
+            download_file(E2E_DEFAULT_URLS["dev"], dev_fp)
+        if not os.path.exists(test_fp):
+            download_file(E2E_DEFAULT_URLS["test"], test_fp)
+        train_df = pd.read_csv(train_fp)
+        dev_df   = pd.read_csv(dev_fp)
+        test_df  = pd.read_csv(test_fp)
 
-        for ex in ds:
-            mr = ex.get("meaning_representation") or ex.get("mr") or ex.get("MR") or ex.get("source")
-            ref = ex.get("human_reference") or ex.get("ref") or ex.get("references") or ex.get("reference")
-            if isinstance(ref, list):
-                if len(ref) == 0:
-                    continue
-                ref_text = ref[0]
-            else:
-                ref_text = ref
-            mr_text = " ; ".join([part.strip() for part in str(mr).split(",")]) if isinstance(mr, str) else str(mr)
-            seq = f"MR: {mr_text} ||| REF: {ref_text}"
-            tok = tokenizer(seq, truncation=True, max_length=self.max_length, padding=False)
-            input_ids = tok["input_ids"]
-            attention_mask = tok["attention_mask"]
-            # compute split index where the REF starts so we can mask MR portion in labels
-            ref_prefix_tok = tokenizer(" REF: ", add_special_tokens=False)["input_ids"]
-            ref_start_idx = 0
-            seq_ids = input_ids
-            for i in range(len(seq_ids) - len(ref_prefix_tok) + 1):
-                if seq_ids[i:i+len(ref_prefix_tok)] == ref_prefix_tok:
-                    ref_start_idx = i + len(ref_prefix_tok)
-                    break
-            labels = input_ids.copy()
-            for i in range(0, ref_start_idx):
-                labels[i] = -100
-            self.examples.append({"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels, "mr_text": mr_text, "ref_text": ref_text})
+    # Normalize columns
+    req_cols = ["mr", "ref"]
+    for df, name in [(train_df, "train"), (dev_df, "dev")]:
+        if not all(c in df.columns for c in req_cols):
+            raise ValueError(f"{name} CSV must contain columns {req_cols}. Found: {list(df.columns)}")
+
+    # Test may lack refs historically; we try to proceed if present, fallback to dev for eval if absent
+    if "mr" not in test_df.columns:
+        raise ValueError("test CSV must contain 'mr' column.")
+    return train_df, dev_df, test_df
+
+def group_references_by_mr(df: pd.DataFrame) -> Dict[str, List[str]]:
+    """
+    Build a mapping from MR string to list of references.
+    """
+    grouped: Dict[str, List[str]] = {}
+    for _, row in df.iterrows():
+        mr = normalize_ws(str(row["mr"]))
+        ref = normalize_ws(str(row["ref"])) if "ref" in row and not (pd.isna(row["ref"])) else None
+        if ref is None:
+            # skip rows without ref
+            continue
+        grouped.setdefault(mr, []).append(ref)
+    return grouped
+
+def build_training_pairs(df: pd.DataFrame) -> List[Tuple[str, str]]:
+    """
+    Create (mr, ref) pairs for training. Each row is one training sample.
+    """
+    pairs: List[Tuple[str, str]] = []
+    for _, row in df.iterrows():
+        mr = normalize_ws(str(row["mr"]))
+        ref = normalize_ws(str(row["ref"]))
+        pairs.append((mr, ref))
+    return pairs
+
+
+# ---------------------------
+# Dataset and Collator
+# ---------------------------
+
+def build_prompt_from_mr(mr: str, delimiter: str = " =>") -> str:
+    return f"{mr}{delimiter}"
+
+class E2ETrainDataset(Dataset):
+    def __init__(
+        self,
+        pairs: List[Tuple[str, str]],
+        tokenizer,
+        max_source_len: int,
+        max_target_len: int,
+        delimiter: str = " =>",
+    ):
+        self.examples = pairs
+        self.tok = tokenizer
+        self.max_source_len = max_source_len
+        self.max_target_len = max_target_len
+        self.delimiter = delimiter
 
     def __len__(self):
         return len(self.examples)
 
-    def __getitem__(self, i):
-        return self.examples[i]
+    def __getitem__(self, idx):
+        mr, ref = self.examples[idx]
+        prompt = build_prompt_from_mr(mr, self.delimiter)
+        # Tokenize separately to know prompt length
+        prompt_ids = self.tok(prompt, add_special_tokens=False)["input_ids"]
+        target_ids = self.tok(ref, add_special_tokens=False)["input_ids"]
+        # Truncate prompt and target while preserving prompt+target within model max length
+        prompt_ids = prompt_ids[: self.max_source_len]
+        target_ids = target_ids[: self.max_target_len]
+        input_ids = prompt_ids + target_ids + [self.tok.eos_token_id]
+        attention_mask = [1] * len(input_ids)
+
+        labels = [-100] * len(prompt_ids) + target_ids + [self.tok.eos_token_id]
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+            "prompt_len": len(prompt_ids),
+        }
+
+@dataclass
+class PadCollator:
+    pad_token_id: int
+
+    def __call__(self, batch):
+        max_len = max(len(x["input_ids"]) for x in batch)
+        input_ids, attention_mask, labels = [], [], []
+        for x in batch:
+            pad_len = max_len - len(x["input_ids"])
+            input_ids.append(
+                torch.cat([x["input_ids"], torch.full((pad_len,), self.pad_token_id, dtype=torch.long)])
+            )
+            attention_mask.append(
+                torch.cat([x["attention_mask"], torch.zeros((pad_len,), dtype=torch.long)])
+            )
+            # Pad labels with -100
+            labels.append(
+                torch.cat([x["labels"], torch.full((pad_len,), -100, dtype=torch.long)])
+            )
+        return {
+            "input_ids": torch.stack(input_ids, dim=0),
+            "attention_mask": torch.stack(attention_mask, dim=0),
+            "labels": torch.stack(labels, dim=0),
+        }
 
 
-def collate_fn(batch: List[Dict], tokenizer: AutoTokenizer):
-    input_ids = [torch.tensor(example["input_ids"], dtype=torch.long) for example in batch]
-    labels = [torch.tensor(example["labels"], dtype=torch.long) for example in batch]
-    attention_mask = [torch.tensor(example["attention_mask"], dtype=torch.long) for example in batch]
+# ------------------------------------
+# PEFT: LoRA with DoRA configuration
+# ------------------------------------
 
-    input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=tokenizer.pad_token_id)
-    labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100)
-    attention_mask = torch.nn.utils.rnn.pad_sequence(attention_mask, batch_first=True, padding_value=0)
-
-    return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
-
-
-# ---------------------------
-# Checkpointing helpers
-# ---------------------------
-def save_checkpoint(state: dict, checkpoint_dir: str, step: int):
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    path = os.path.join(checkpoint_dir, f"checkpoint_step_{step}.pt")
-    torch.save(state, path)
-    print(f"[checkpoint] saved {path}")
-
-
-def load_checkpoint(path: str, model, optimizer=None, scheduler=None, scaler=None, device="cuda"):
-    if not os.path.exists(path):
-        raise FileNotFoundError(path)
-    print(f"[checkpoint] loading {path}")
-    ckpt = torch.load(path, map_location=device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    if optimizer and "optimizer_state_dict" in ckpt:
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    if scheduler and "scheduler_state_dict" in ckpt:
-        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-    if scaler and "scaler_state_dict" in ckpt:
-        scaler.load_state_dict(ckpt["scaler_state_dict"])
-    epoch = ckpt.get("epoch", 0)
-    step = ckpt.get("step", 0)
-    return epoch, step
-
-
-# ---------------------------
-# Metric computations (pure Python)
-# ---------------------------
-def compute_cider(hypotheses: List[str], references_list: List[List[str]]) -> float:
-    if not _HAS_PYCOCO:
-        print("[warn] CIDEr unavailable: pycocoevalcap not installed.")
-        return 0.0
-    gts = {}
-    res = {}
-    for i, (hyps, refs) in enumerate(zip(hypotheses, references_list)):
-        gts[i] = refs
-        res[i] = [hyps]
-    cider = Cider()
-    score, scores = cider.compute_score(gts, res)
-    return float(score)
-
-
-def compute_rouge_l(hypotheses: List[str], references_list: List[List[str]]) -> float:
-    scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
-    f_scores = []
-    for hyp, refs in zip(hypotheses, references_list):
-        best_f = 0.0
-        for r in refs:
-            sc = scorer.score(r, hyp)
-            f = sc["rougeL"].fmeasure
-            if f > best_f:
-                best_f = f
-        f_scores.append(best_f)
-    return float(np.mean(f_scores))
-
-
-def compute_bleu(hypotheses: List[str], references_list: List[List[str]]) -> float:
-    tokenized_refs = [[nltk.word_tokenize(r.lower()) for r in refs] for refs in references_list]
-    tokenized_hyps = [nltk.word_tokenize(h.lower()) for h in hypotheses]
-    bleu_score = corpus_bleu(tokenized_refs, tokenized_hyps)
-    return float(bleu_score)
-
-
-def compute_meteor(hypotheses: List[str], references_list: List[List[str]]) -> float:
-    # Use NLTK's multi-reference meteor by passing refs list directly (preferred).
-    scores = []
-    for hyp, refs in zip(hypotheses, references_list):
-        try:
-            sc = meteor_score(refs, hyp)
-        except Exception:
-            # fallback to best-of per-ref if something goes wrong
-            best = 0.0
-            for r in refs:
-                sc2 = meteor_score([r], hyp)
-                if sc2 > best:
-                    best = sc2
-            sc = best
-        scores.append(sc)
-    return float(np.mean(scores))
-
-
-def compute_nist(hypotheses: List[str], references_list: List[List[str]]) -> float:
-    scores = []
-    for hyp, refs in zip(hypotheses, references_list):
-        tok_hyp = nltk.word_tokenize(hyp.lower())
-        tok_refs = [nltk.word_tokenize(r.lower()) for r in refs]
-        try:
-            sc = sentence_nist(tok_refs, tok_hyp, n=5)
-        except Exception:
-            sc = 0.0
-        scores.append(sc)
-    return float(np.mean(scores))
-
-
-def compute_all_metrics(hypotheses: List[str], references_list: List[List[str]]) -> Dict[str, float]:
-    cider = compute_cider(hypotheses, references_list)
-    rouge_l = compute_rouge_l(hypotheses, references_list)
-    bleu = compute_bleu(hypotheses, references_list)
-    meteor = compute_meteor(hypotheses, references_list)
-    nist = compute_nist(hypotheses, references_list)
-    return {"CIDEr": cider, "ROUGE-L": rouge_l, "BLEU": bleu, "METEOR": meteor, "NIST": nist}
-
-
-# ---------------------------
-# Training & evaluation flow
-# ---------------------------
-def train_and_evaluate(args: TRAIN_ARGS):
-    # reproducibility
-    seed = args.seed
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if args.device.startswith("cuda"):
-        torch.cuda.manual_seed_all(seed)
-
-    # load tokenizer and model
-    print(f"[init] loading tokenizer and model: {args.model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    # If pad token is missing, set it. NOTE: setting pad_token == eos_token is common for GPT-2,
-    # but it has the caveat that the model may learn not to output the eos token if it's used as pad.
-    # We keep pad_token == eos_token to allow batching/padding; generation uses eos_token_id explicitly.
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    # ensure model.config has pad_token_id set later after loading model
-
-    model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float32)
-    model.resize_token_embeddings(len(tokenizer))  # in case we set pad token
-    # make sure model.config.pad_token_id is set for generation/configs
-    model.config.pad_token_id = tokenizer.pad_token_id
-
-    model.to(args.device)
-
-    # Apply PEFT with DoRA via LoraConfig (peft exposes a DoRA toggle)
-    print("[peft] preparing PEFT DoRA config")
-    lora_config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        target_modules=args.target_modules,
-        lora_dropout=args.lora_dropout,
-        bias="lora_only",
-        task_type="CAUSAL_LM",
-        use_dora=True
+def build_lora_dora_config() -> LoraConfig:
+    # Target GPT-2 Conv1D modules commonly adapted: attention and MLP projections
+    # "c_attn", "c_proj", "c_fc" are module name substrings in GPT-2 blocks.
+    return LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=8,
+        lora_alpha=16,
+        lora_dropout=0.05,
+        target_modules=["c_attn", "c_proj", "c_fc"],
+        use_dora=True,
+        bias="none",
     )
 
-    # Wrap model with PEFT
-    print("[peft] wrapping model with get_peft_model()")
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()  # helpful logging
 
-    # ---------------------------
-    # SANITY CHECK: quick generate on a toy MR to ensure tokenizer+model generate pipeline works
-    # (This is done *before* training; the adapter is freshly created so generation will be close to base behavior)
-    # ---------------------------
-    try:
-        model.eval()
-        sample_mr = "name[Blue Spice], food[Indian], area[riverside], familyFriendly[yes]"
-        prefix = f"MR: {' ; '.join([s.strip() for s in sample_mr.split(',')])} ||| REF:"
-        tokens = tokenizer(prefix, return_tensors="pt").to(args.device)
-        with torch.no_grad():
-            # small, fast beam for sanity
-            gen = model.generate(
-                **tokens,
-                max_length=50,
-                num_beams=3,
-                early_stopping=True,
-                no_repeat_ngram_size=2,
-                pad_token_id=tokenizer.eos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-        gen_text = tokenizer.decode(gen[0], skip_special_tokens=True)
-        if gen_text.startswith(prefix):
-            sanity_out = gen_text[len(prefix):].strip()
-        else:
-            sanity_out = gen_text
-        print("[sanity check] sample MR:", sample_mr)
-        print("[sanity check] model generated:", sanity_out)
-    except Exception as e:
-        print("[sanity check] generation failed:", e)
-    finally:
-        model.train()
-    # ---------------------------
+# ------------------------------------
+# Checkpointing (robust, resumable)
+# ------------------------------------
 
-    # Prepare datasets
-    print(f"[data] loading dataset {args.dataset_name} from HuggingFace datasets")
-    raw = load_dataset(args.dataset_name)
-    train_ds = E2EDataset(raw, tokenizer, split="train", max_length=args.max_length)
-    val_raw = raw["validation"] if "validation" in raw else (raw["dev"] if "dev" in raw else raw.get("test", raw["train"][:200]))
-    val_ds = E2EDataset(val_raw, tokenizer, split=None, max_length=args.max_length)
-    test_raw = raw["test"] if "test" in raw else val_raw
+def save_checkpoint(
+    peft_model: PeftModel,
+    tokenizer,
+    optimizer,
+    scheduler,
+    scaler: torch.cuda.amp.GradScaler,
+    output_dir: str,
+    step: int,
+    epoch: int,
+    best_val_loss: float,
+    patience_count: int,
+    base_model_name: str,
+):
+    ckpt_dir = os.path.join(output_dir, f"checkpoint-step{step:08d}")
+    safe_mkdir(ckpt_dir)
 
-    train_loader = DataLoader(train_ds, batch_size=args.train_batch_size, shuffle=True, collate_fn=lambda b: collate_fn(b, tokenizer))
-    val_loader = DataLoader(val_ds, batch_size=args.eval_batch_size, shuffle=False, collate_fn=lambda b: collate_fn(b, tokenizer))
+    # Save PEFT adapters (contains DoRA weights/config)
+    peft_model.save_pretrained(ckpt_dir)
+    # Save tokenizer for reproducibility
+    tokenizer.save_pretrained(ckpt_dir)
 
-    # optimizer and scheduler
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    total_steps = max(1, (len(train_loader) // args.gradient_accumulation_steps) * args.num_epochs)
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=total_steps)
+    # Save training state
+    training_state = {
+        "step": step,
+        "epoch": epoch,
+        "best_val_loss": best_val_loss,
+        "patience_count": patience_count,
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict() if scheduler is not None else None,
+        "scaler": scaler.state_dict() if scaler is not None else None,
+        "base_model_name": base_model_name,
+        "rng_state": {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state().tolist(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+        },
+    }
+    torch.save(training_state, os.path.join(ckpt_dir, "training_state.pt"))
+    return ckpt_dir
 
-    # mixed precision scaler
-    scaler = GradScaler(enabled=args.fp16 and (args.device.startswith("cuda")))
+def find_latest_checkpoint(output_dir: str) -> Optional[str]:
+    if not os.path.isdir(output_dir):
+        return None
+    ckpts = sorted(glob.glob(os.path.join(output_dir, "checkpoint-step*")))
+    return ckpts[-1] if ckpts else None
 
-    # trainer state
-    global_step = 0
-    best_val_loss = float("inf")
-    patience_counter = 0
+def load_checkpoint(
+    base_model_name: str,
+    device: torch.device,
+    resume_path: str,
+):
+    """
+    Load a base model, then load PEFT adapters from resume_path, plus optimizer/scheduler/scaler state.
+    Returns: peft_model, tokenizer, training_state
+    """
+    tokenizer = AutoTokenizer.from_pretrained(resume_path, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-    # optionally resume from the latest checkpoint
-    latest_ckpt = None
-    ckpt_dir = args.output_dir
-    if os.path.isdir(ckpt_dir):
-        ckpt_files = [f for f in os.listdir(ckpt_dir) if f.startswith("checkpoint_step_") and f.endswith(".pt")]
-        if ckpt_files:
-            ckpt_files.sort(key=lambda x: int(x.split("_")[-1].split(".")[0]))
-            latest_ckpt = os.path.join(ckpt_dir, ckpt_files[-1])
-    if latest_ckpt:
+    config = AutoConfig.from_pretrained(base_model_name)
+    model = AutoModelForCausalLM.from_pretrained(base_model_name, config=config)
+    model.resize_token_embeddings(len(tokenizer))
+    model.config.pad_token_id = tokenizer.pad_token_id
+    model.config.use_cache = False  # important for training with gradient checkpointing
+
+    peft_model = PeftModel.from_pretrained(model, resume_path)
+    peft_model.to(device)
+
+    # Load training state
+    state_fp = os.path.join(resume_path, "training_state.pt")
+    if not os.path.exists(state_fp):
+        raise FileNotFoundError(f"training_state.pt not found in {resume_path}")
+    training_state = torch.load(state_fp, map_location="cpu")
+
+    return peft_model, tokenizer, training_state
+
+
+# ------------------------------------
+# Official E2E metrics (pure Python)
+# ------------------------------------
+
+def try_import_official_e2e_metrics():
+    """
+    Try to import official E2E metrics (pure Python) from the public repository.
+    We attempt:
+      - import e2e_metrics if already installed
+      - pip install directly from GitHub (pure Python) and import
+    Returns a callable evaluate_fn(references: List[List[str]], hypotheses: List[str]) -> Dict[str, float]
+    or None if not available.
+    """
+    # 1) Try a pre-installed package-style import
+    for modname in ["e2e_metrics", "e2e_metrics.metrics", "metrics"]:
         try:
-            start_epoch, global_step = load_checkpoint(latest_ckpt, model, optimizer=optimizer, scheduler=scheduler, scaler=scaler, device=args.device)
-            print(f"[resume] resumed from checkpoint {latest_ckpt} at epoch {start_epoch}, global_step {global_step}")
-        except Exception as e:
-            print(f"[resume] failed to load checkpoint {latest_ckpt}: {e}")
+            mod = __import__(modname, fromlist=['*'])
+            # heuristic: look for a function that returns dict of metrics
+            if hasattr(mod, "evaluate"):
+                return getattr(mod, "evaluate")
+            if hasattr(mod, "calc_scores"):
+                return getattr(mod, "calc_scores")
+        except Exception:
+            pass
 
+    # 2) Attempt to pip install from GitHub in pure Python
+    try:
+        import subprocess, sys as _sys
+        subprocess.check_call([_sys.executable, "-m", "pip", "install", "--quiet",
+                               "git+https://github.com/tuetschek/e2e-metrics"])
+        # retry import
+        for modname in ["e2e_metrics", "e2e_metrics.metrics", "metrics"]:
+            try:
+                mod = __import__(modname, fromlist=['*'])
+                if hasattr(mod, "evaluate"):
+                    return getattr(mod, "evaluate")
+                if hasattr(mod, "calc_scores"):
+                    return getattr(mod, "calc_scores")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return None
+
+
+# ------------------------------------
+# Fallback pure-Python metrics
+# ------------------------------------
+
+def tokenize_for_metrics(s: str) -> List[str]:
+    # Simple tokenizer: lowercase, split on whitespace and punctuation boundaries
+    s = s.lower().strip()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    return [t for t in s.split() if t]
+
+def corpus_bleu_nltk(references: List[List[str]], hypotheses: List[str], max_n: int = 4) -> float:
+    refs_tok = [[tokenize_for_metrics(r) for r in refs] for refs in references]
+    hyps_tok = [tokenize_for_metrics(h) for h in hypotheses]
+    weights = tuple([1.0/max_n]*max_n)
+    # Smoothing method
+    smoothie = bleu_score.SmoothingFunction().method1
+    return bleu_score.corpus_bleu(refs_tok, hyps_tok, weights=weights, smoothing_function=smoothie) * 100.0
+
+def corpus_nist_nltk(references: List[List[str]], hypotheses: List[str], n: int = 5) -> float:
+    """
+    Average sentence-level NIST score (scaled to 100)
+    """
+    refs_tok = [[tokenize_for_metrics(r) for r in refs] for refs in references]
+    hyps_tok = [tokenize_for_metrics(h) for h in hypotheses]
+    scores = []
+    for refs, hyp in zip(refs_tok, hyps_tok):
+        try:
+            scores.append(sentence_nist(refs, hyp, n=n))
+        except ZeroDivisionError:
+            scores.append(0.0)
+        except ValueError:
+            scores.append(0.0)
+    return float(np.mean(scores) * 100.0)
+
+def rouge_l_score(hyp_tokens: List[str], ref_tokens: List[str]) -> Tuple[float, float, float]:
+    """
+    ROUGE-L F-measure computation via LCS.
+    Returns (precision, recall, f1)
+    """
+    # LCS length
+    m, n = len(hyp_tokens), len(ref_tokens)
+    if m == 0 or n == 0:
+        return 0.0, 0.0, 0.0
+    dp = [[0]*(n+1) for _ in range(m+1)]
+    for i in range(m):
+        for j in range(n):
+            if hyp_tokens[i] == ref_tokens[j]:
+                dp[i+1][j+1] = dp[i][j] + 1
+            else:
+                dp[i+1][j+1] = max(dp[i][j+1], dp[i+1][j])
+    lcs = dp[m][n]
+    prec = lcs / max(m, 1)
+    rec = lcs / max(n, 1)
+    if prec + rec == 0:
+        f1 = 0.0
+    else:
+        beta = (1.2)**2  # common in ROUGE-L F-measure
+        f1 = ((1 + beta) * prec * rec) / (rec + beta * prec)
+    return prec, rec, f1
+
+def corpus_rouge_l(references: List[List[str]], hypotheses: List[str]) -> float:
+    scores = []
+    for refs, hyp in zip(references, hypotheses):
+        hyp_tok = tokenize_for_metrics(hyp)
+        best_f1 = 0.0
+        for r in refs:
+            ref_tok = tokenize_for_metrics(r)
+            _, _, f1 = rouge_l_score(hyp_tok, ref_tok)
+            if f1 > best_f1:
+                best_f1 = f1
+        scores.append(best_f1)
+    return float(np.mean(scores) * 100.0)
+
+def corpus_meteor_nltk(references: List[List[str]], hypotheses: List[str]) -> float:
+    ensure_nltk_resources()
+    scores = []
+    for refs, hyp in zip(references, hypotheses):
+        # NLTK's meteor_score expects list of reference strings and one hypothesis string
+        try:
+            scores.append(meteor_score(refs, hyp))
+        except Exception:
+            scores.append(0.0)
+    return float(np.mean(scores) * 100.0)
+
+def extract_ngrams(tokens: List[str], n: int) -> Dict[Tuple[str, ...], int]:
+    counts: Dict[Tuple[str, ...], int] = {}
+    if len(tokens) < n:
+        return counts
+    for i in range(len(tokens) - n + 1):
+        ng = tuple(tokens[i:i+n])
+        counts[ng] = counts.get(ng, 0) + 1
+    return counts
+
+def compute_cider(
+    references: List[List[str]],
+    hypotheses: List[str],
+    n: int = 4,
+    sigma: float = 6.0
+) -> float:
+    """
+    CIDEr-D-like implementation.
+    Steps:
+      - Build DF over all reference sentences.
+      - For each sentence, build TF vectors for n=1..4 grams.
+      - Compute idf = log((N + eps) / (df + eps)).
+      - Compute cosine similarity between hyp and mean(refs) vectors across n, apply Gaussian length penalty, average, then scale by 10.
+    """
+    eps = 1e-12
+    # Build DF across all refs
+    all_ref_tokens = [tokenize_for_metrics(r) for refs in references for r in refs]
+    df: List[Dict[Tuple[str, ...], int]] = [dict() for _ in range(n)]
+    for r_tokens in all_ref_tokens:
+        for k in range(1, n+1):
+            seen = set(extract_ngrams(r_tokens, k).keys())
+            for ng in seen:
+                df[k-1][ng] = df[k-1].get(ng, 0) + 1
+    N_docs = len(all_ref_tokens) + eps
+
+    def tf_vec(tokens: List[str], k: int) -> Dict[Tuple[str, ...], float]:
+        counts = extract_ngrams(tokens, k)
+        total = sum(counts.values()) + eps
+        return {ng: c / total for ng, c in counts.items()}
+
+    def idf(ng: Tuple[str, ...], k: int) -> float:
+        return math.log((N_docs) / (df[k-1].get(ng, 0) + eps))
+
+    def cider_for_pair(h_tokens: List[str], refs_tokens: List[List[str]]) -> float:
+        scores_n = []
+        for k in range(1, n+1):
+            h_tf = tf_vec(h_tokens, k)
+            ref_tfs = [tf_vec(r, k) for r in refs_tokens]
+            # Average ref tf
+            # Build union keys
+            keys = set(h_tf.keys())
+            for tf in ref_tfs:
+                keys |= set(tf.keys())
+            if not keys:
+                scores_n.append(0.0)
+                continue
+            # Weighted vectors with idf
+            h_vec = []
+            r_vec = []
+            for ng in keys:
+                w = idf(ng, k)
+                h_val = h_tf.get(ng, 0.0) * w
+                r_val = sum(tf.get(ng, 0.0) for tf in ref_tfs) / max(len(ref_tfs), 1) * w
+                h_vec.append(h_val)
+                r_vec.append(r_val)
+            # Cosine similarity
+            h_norm = math.sqrt(sum(v*v for v in h_vec)) + eps
+            r_norm = math.sqrt(sum(v*v for v in r_vec)) + eps
+            dot = sum(hv*rv for hv, rv in zip(h_vec, r_vec))
+            cos = dot / (h_norm * r_norm)
+            scores_n.append(cos)
+        # Gaussian length penalty
+        ref_lens = [len(r) for r in refs_tokens if len(r) > 0]
+        if len(ref_lens) == 0:
+            gp = 1.0
+        else:
+            ref_len = np.mean(ref_lens)
+            diff = len(h_tokens) - ref_len
+            gp = math.exp(-(diff*diff) / (2 * sigma * sigma))
+        return float(np.mean(scores_n) * gp * 10.0)
+
+    scores = []
+    for refs, hyp in zip(references, hypotheses):
+        h_tokens = tokenize_for_metrics(hyp)
+        refs_tokens = [tokenize_for_metrics(r) for r in refs]
+        scores.append(cider_for_pair(h_tokens, refs_tokens))
+    return float(np.mean(scores))
+
+
+def evaluate_with_metrics(
+    grouped_refs: Dict[str, List[str]],
+    mr_list: List[str],
+    generations: List[str],
+) -> Dict[str, float]:
+    """
+    Evaluate with official E2E metrics if available (pure Python), otherwise fallback to in-script metrics.
+    Input:
+      - grouped_refs: dict MR -> list of refs
+      - mr_list: list of MRs corresponding to generated hypotheses
+      - generations: list of strings (hypotheses)
+    Output: dict with BLEU, NIST, METEOR, ROUGE_L, CIDEr
+    """
+    # Align references for the given MR order
+    references = [grouped_refs[mr] if mr in grouped_refs else [""] for mr in mr_list]
+    hypotheses = generations
+
+    # Try official evaluator first
+    evaluate_fn = try_import_official_e2e_metrics()
+    if evaluate_fn is not None:
+        try:
+            scores = evaluate_fn(references=references, hypotheses=hypotheses)
+            # Normalize keys if needed
+            norm_scores = {}
+            for k, v in scores.items():
+                key = k.upper().replace("-", "_").replace(" ", "_")
+                norm_scores[key] = float(v)
+            # Ensure all requested keys exist; if not, compute fallback for missing ones
+            required = ["BLEU", "NIST", "METEOR", "ROUGE_L", "CIDEr", "CIDER"]
+            have = set(norm_scores.keys())
+            # Canonical CIDEr key
+            if "CIDER" in have and "CIDEr" not in have:
+                norm_scores["CIDEr"] = norm_scores["CIDER"]
+            # Add missing via fallback if necessary
+            if "BLEU" not in have:
+                norm_scores["BLEU"] = corpus_bleu_nltk(references, hypotheses)
+            if "NIST" not in have:
+                norm_scores["NIST"] = corpus_nist_nltk(references, hypotheses)
+            if "METEOR" not in have:
+                norm_scores["METEOR"] = corpus_meteor_nltk(references, hypotheses)
+            if "ROUGE_L" not in have:
+                norm_scores["ROUGE_L"] = corpus_rouge_l(references, hypotheses)
+            if "CIDEr" not in have:
+                norm_scores["CIDEr"] = compute_cider(references, hypotheses)
+            return {
+                "BLEU": float(norm_scores["BLEU"]),
+                "NIST": float(norm_scores["NIST"]),
+                "METEOR": float(norm_scores["METEOR"]),
+                "ROUGE_L": float(norm_scores["ROUGE_L"]),
+                "CIDEr": float(norm_scores["CIDEr"]),
+            }
+        except Exception:
+            # Fall back to local
+            pass
+
+    # Fallback local implementation
+    return {
+        "BLEU": corpus_bleu_nltk(references, hypotheses),
+        "NIST": corpus_nist_nltk(references, hypotheses),
+        "METEOR": corpus_meteor_nltk(references, hypotheses),
+        "ROUGE_L": corpus_rouge_l(references, hypotheses),
+        "CIDEr": compute_cider(references, hypotheses),
+    }
+
+
+# ---------------------------
+# Training and evaluation
+# ---------------------------
+
+def evaluate_perplexity(model: nn.Module, dataloader: DataLoader, device: torch.device) -> float:
+    model.eval()
+    losses = []
+    with torch.no_grad():
+        for batch in dataloader:
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            labels = batch["labels"].to(device, non_blocking=True)
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            loss = outputs.loss.detach().float()
+            losses.append(loss.item())
     model.train()
+    mean_loss = float(np.mean(losses)) if losses else float("inf")
+    ppl = math.exp(min(20.0, mean_loss))
+    return ppl
 
-    for epoch in range(1, args.num_epochs + 1):
-        epoch_start = time.time()
-        epoch_loss = 0.0
-        progress = tqdm(train_loader, desc=f"Epoch {epoch}", leave=False)
-        for step, batch in enumerate(progress):
-            input_ids = batch["input_ids"].to(args.device)
-            attention_mask = batch["attention_mask"].to(args.device)
-            labels = batch["labels"].to(args.device)
+def generate_for_eval(
+    model: nn.Module,
+    tokenizer,
+    mrs: List[str],
+    device: torch.device,
+    num_beams: int = 10,
+    max_new_tokens: int = 120,
+    delimiter: str = " =>",
+    no_repeat_ngram_size: int = 3,
+) -> List[str]:
+    model.eval()
+    generations = []
+    for mr in mrs:
+        prompt = build_prompt_from_mr(mr, delimiter)
+        enc = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+        input_ids = enc["input_ids"].to(device)
+        attention_mask = enc["attention_mask"].to(device)
+        prompt_len = input_ids.shape[1]
+        with torch.no_grad():
+            gen_ids = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                num_beams=num_beams,
+                max_new_tokens=max_new_tokens,
+                early_stopping=True,
+                do_sample=False,
+                no_repeat_ngram_size=no_repeat_ngram_size,
+                length_penalty=1.0,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+        # Take only the newly generated tokens after the prompt
+        new_tokens = gen_ids[0][prompt_len:]
+        text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        # Basic cleanup
+        text = normalize_ws(text)
+        generations.append(text)
+    model.train()
+    return generations
 
-            with autocast(enabled=args.fp16 and (args.device.startswith("cuda"))):
+
+def main():
+    parser = argparse.ArgumentParser()
+    # Model/tokenizer
+    parser.add_argument("--model_name", type=str, default="gpt2", choices=["gpt2", "gpt2-medium"], help="Pretrained GPT-2 variant.")
+    parser.add_argument("--output_dir", type=str, default="./outputs", help="Where to save checkpoints and final artifacts.")
+    parser.add_argument("--data_dir", type=str, default="", help="Directory containing E2E CSVs; if empty, auto-download.")
+    # Data parameters
+    parser.add_argument("--max_source_len", type=int, default=128)
+    parser.add_argument("--max_target_len", type=int, default=128)
+    # Training
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--num_epochs", type=int, default=3)
+    parser.add_argument("--learning_rate", type=float, default=5e-5)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--warmup_steps", type=int, default=500)
+    parser.add_argument("--logging_steps", type=int, default=10)
+    parser.add_argument("--eval_steps", type=int, default=200)
+    parser.add_argument("--save_steps", type=int, default=500)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--patience", type=int, default=3, help="Early stopping patience on validation loss.")
+    parser.add_argument("--resume_from", type=str, default="", help="Path to a checkpoint directory to resume from.")
+    parser.add_argument("--sample_every_steps", type=int, default=100, help="Run a quick sanity generation every N optimizer steps.")
+    # Generation
+    parser.add_argument("--num_beams", type=int, default=10)
+    parser.add_argument("--gen_max_new_tokens", type=int, default=120)
+    parser.add_argument("--no_repeat_ngram_size", type=int, default=3)
+    # Mixed precision
+    parser.add_argument("--fp16", action="store_true", help="Enable FP16 mixed-precision training.")
+    args = parser.parse_args()
+
+    safe_mkdir(args.output_dir)
+    set_all_seeds(args.seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Load data
+    work_dir = os.path.join(args.output_dir, "data_cache")
+    train_df, dev_df, test_df = load_e2e_csvs(args.data_dir if args.data_dir else None, work_dir)
+
+    # Build mappings and datasets
+    train_pairs = build_training_pairs(train_df)
+    dev_pairs = build_training_pairs(dev_df)
+
+    # References grouped for validation/test
+    dev_refs_grouped = group_references_by_mr(dev_df)
+    test_has_refs = "ref" in test_df.columns and not test_df["ref"].isna().all()
+    test_refs_grouped = group_references_by_mr(test_df) if test_has_refs else None
+
+    # Precompute a list of dev MRs for quick sanity generations
+    dev_mr_list = list(dev_refs_grouped.keys())
+
+    # Tokenizer and model
+    if args.resume_from:
+        # Resume path contains tokenizer + adapters; base model determined from state
+        # Need training state to know base model
+        _, _, training_state = load_checkpoint(args.model_name, device, args.resume_from)
+        base_model_name = training_state.get("base_model_name", args.model_name)
+        peft_model, tokenizer, _ = load_checkpoint(base_model_name, device, args.resume_from)
+        model = peft_model
+        print(f"Resumed PEFT model from {args.resume_from} (base: {base_model_name})")
+    else:
+        base_model_name = args.model_name
+        tokenizer = AutoTokenizer.from_pretrained(base_model_name, use_fast=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        config = AutoConfig.from_pretrained(base_model_name)
+        model = AutoModelForCausalLM.from_pretrained(base_model_name, config=config)
+        model.resize_token_embeddings(len(tokenizer))
+        model.config.pad_token_id = tokenizer.pad_token_id
+        model.config.use_cache = False  # important for training with gradient checkpointing and PEFT
+
+        # Apply PEFT (LoRA with DoRA)
+        lora_config = build_lora_dora_config()
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
+        model.to(device)
+
+    # Dataloaders
+    train_dataset = E2ETrainDataset(
+        train_pairs, tokenizer, args.max_source_len, args.max_target_len
+    )
+    dev_dataset = E2ETrainDataset(
+        dev_pairs, tokenizer, args.max_source_len, args.max_target_len
+    )
+
+    collator = PadCollator(pad_token_id=tokenizer.pad_token_id)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True,
+        collate_fn=collator,
+    )
+    dev_loader = DataLoader(
+        dev_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True,
+        collate_fn=collator,
+    )
+
+    # Optimizer and scheduler
+    # Only optimize adapter params (PEFT wraps model such that .parameters() returns trainables)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    total_training_steps = (len(train_loader) // max(1, args.gradient_accumulation_steps)) * args.num_epochs
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=args.warmup_steps,
+        num_training_steps=total_training_steps,
+    )
+
+    scaler = torch.cuda.amp.GradScaler(enabled=(args.fp16 and device.type == "cuda"))
+
+    # Resume optimizer/scheduler/scaler if requested
+    global_step = 0
+    start_epoch = 0
+    best_val_loss = float("inf")
+    patience_count = 0
+
+    if args.resume_from:
+        _, _, training_state = load_checkpoint(args.model_name, device, args.resume_from)
+        if training_state.get("optimizer"):
+            optimizer.load_state_dict(training_state["optimizer"])
+        if training_state.get("scheduler"):
+            scheduler.load_state_dict(training_state["scheduler"])
+        if scaler and training_state.get("scaler"):
+            scaler.load_state_dict(training_state["scaler"])
+        global_step = training_state.get("step", 0)
+        start_epoch = training_state.get("epoch", 0)
+        best_val_loss = training_state.get("best_val_loss", float("inf"))
+        patience_count = training_state.get("patience_count", 0)
+        print(f"Resumed training state: step={global_step}, epoch={start_epoch}, best_val_loss={best_val_loss}")
+
+    # Training loop
+    model.train()
+    print("Starting training...")
+    running_loss = 0.0
+
+    for epoch in range(start_epoch, args.num_epochs):
+        for step, batch in enumerate(train_loader):
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            labels = batch["labels"].to(device, non_blocking=True)
+
+            with torch.cuda.amp.autocast(enabled=(args.fp16 and device.type == "cuda")):
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                loss = outputs.loss / args.gradient_accumulation_steps
+                loss = outputs.loss / max(1, args.gradient_accumulation_steps)
 
-            scaler.scale(loss).backward()
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
-                scaler.unscale_(optimizer)
+                if scaler.is_enabled():
+                    scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
+                if scaler.is_enabled():
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
                 scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
-                train_loss = float(loss.item() * args.gradient_accumulation_steps)
-                epoch_loss += train_loss
-                ppl = math.exp(train_loss) if train_loss < 20 else float("inf")
-                progress.set_postfix({"step": global_step, "train_loss": f"{train_loss:.4f}", "ppl": f"{ppl:.2f}"})
+                running_loss += loss.item() * max(1, args.gradient_accumulation_steps)
 
-                # periodic checkpointing
-                if global_step % args.save_every_steps == 0:
-                    state = {
-                        "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "scheduler_state_dict": scheduler.state_dict(),
-                        "scaler_state_dict": scaler.state_dict(),
-                        "epoch": epoch,
-                        "step": global_step,
-                    }
-                    save_checkpoint(state, args.output_dir, global_step)
-                    # save PEFT adapter separately and tokenizer
-                    os.makedirs(args.adapter_dir, exist_ok=True)
-                    model.save_pretrained(args.adapter_dir)  # adapter config & weights
-                    tokenizer.save_pretrained(args.adapter_dir)  # helpful to have tokenizer there too
-                    print(f"[peft save] adapter + tokenizer saved to {args.adapter_dir}")
+                # Logging (loss and perplexity). Set --logging_steps 1 to log every step.
+                if args.logging_steps > 0 and global_step % args.logging_steps == 0:
+                    avg_loss = running_loss / args.logging_steps
+                    ppl = math.exp(min(20.0, avg_loss))
+                    print(f"[epoch {epoch+1}/{args.num_epochs}] step {global_step} - loss: {avg_loss:.4f} - ppl: {ppl:.2f}")
+                    running_loss = 0.0
 
-        epoch_time = time.time() - epoch_start
-        avg_epoch_loss = epoch_loss / max(1, len(train_loader) // args.gradient_accumulation_steps)
-        print(f"[epoch {epoch}] avg_train_loss={avg_epoch_loss:.4f} epoch_time={epoch_time:.1f}s")
+                # Periodic validation to monitor overfitting
+                if args.eval_steps > 0 and global_step % args.eval_steps == 0:
+                    val_ppl = evaluate_perplexity(model, dev_loader, device)
+                    # Convert PPL to loss approximation
+                    val_loss = min(20.0, math.log(max(val_ppl, 1e-8)))
+                    print(f"Validation - step {global_step} - ppl: {val_ppl:.2f} (loss≈{val_loss:.4f})")
+                    if val_loss + 1e-6 < best_val_loss:
+                        best_val_loss = val_loss
+                        patience_count = 0
+                    else:
+                        patience_count += 1
+                        print(f"Validation loss did not improve. Patience {patience_count}/{args.patience}")
+                        if patience_count >= args.patience:
+                            print("Early stopping triggered.")
+                            # Save final checkpoint before stopping
+                            save_checkpoint(
+                                model, tokenizer, optimizer, scheduler, scaler,
+                                args.output_dir, global_step, epoch, best_val_loss, patience_count,
+                                base_model_name
+                            )
+                            # Proceed to evaluation and exit
+                            raise StopIteration
 
-        # Validation
-        model.eval()
-        val_losses = []
-        with torch.no_grad():
-            for batch in val_loader:
-                input_ids = batch["input_ids"].to(args.device)
-                attention_mask = batch["attention_mask"].to(args.device)
-                labels = batch["labels"].to(args.device)
-                with autocast(enabled=args.fp16 and (args.device.startswith("cuda"))):
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                    val_losses.append(float(outputs.loss.item()))
-        mean_val_loss = float(np.mean(val_losses)) if len(val_losses) > 0 else float("inf")
-        mean_val_ppl = math.exp(mean_val_loss) if mean_val_loss < 20 else float("inf")
-        print(f"[validation] val_loss={mean_val_loss:.4f}, val_ppl={mean_val_ppl:.2f}")
+                # NEW: quick sanity generation every N steps
+                if args.sample_every_steps > 0 and global_step % args.sample_every_steps == 0:
+                    try:
+                        sanity_mr = random.choice(dev_mr_list) if dev_mr_list else None
+                        if sanity_mr:
+                            model.eval()
+                            hyp = generate_for_eval(
+                                model,
+                                tokenizer,
+                                [sanity_mr],
+                                device,
+                                num_beams=min(5, args.num_beams),
+                                max_new_tokens=min(60, args.gen_max_new_tokens),
+                                delimiter=" =>",
+                                no_repeat_ngram_size=args.no_repeat_ngram_size,
+                            )[0]
+                            refs = dev_refs_grouped.get(sanity_mr, [])[:3]
+                            print(f"[sanity] step {global_step}")
+                            print(f"[sanity] MR  : {sanity_mr}")
+                            for i, r in enumerate(refs, 1):
+                                print(f"[sanity] ref{i}: {r}")
+                            print(f"[sanity] hyp : {hyp}")
+                    except Exception as e:
+                        print(f"[sanity] generation failed at step {global_step}: {e}")
+                    finally:
+                        model.train()
 
-        # early stopping logic based on validation loss
-        if mean_val_loss < best_val_loss - 1e-4:
-            best_val_loss = mean_val_loss
-            patience_counter = 0
-            best_state = {
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "scaler_state_dict": scaler.state_dict(),
-                "epoch": epoch,
-                "step": global_step,
-            }
-            save_checkpoint(best_state, args.output_dir, global_step)
-            model.save_pretrained(args.adapter_dir)
-            tokenizer.save_pretrained(args.adapter_dir)
-            print(f"[best] new best val loss; saved adapter+tokenizer to {args.adapter_dir}")
-        else:
-            patience_counter += 1
-            print(f"[earlystop] patience {patience_counter}/{args.patience}")
-            if patience_counter >= args.patience:
-                print("[earlystop] stopping training due to validation loss increase")
-                break
-        model.train()
+                # Periodic checkpointing
+                if args.save_steps > 0 and global_step % args.save_steps == 0:
+                    ckpt_dir = save_checkpoint(
+                        model, tokenizer, optimizer, scheduler, scaler,
+                        args.output_dir, global_step, epoch, best_val_loss, patience_count,
+                        base_model_name
+                    )
+                    print(f"Saved checkpoint: {ckpt_dir}")
 
-    # Training complete: finalize save
-    final_state = {
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict(),
-        "scaler_state_dict": scaler.state_dict(),
-        "epoch": epoch,
-        "step": global_step,
-    }
-    save_checkpoint(final_state, args.output_dir, global_step)
-    model.save_pretrained(args.adapter_dir)
-    tokenizer.save_pretrained(args.adapter_dir)
-    print("[train] training finished and model+adapter+tokenizer saved")
-
-    # ---------------------------
-    # Evaluation on test set (generation + metrics)
-    # ---------------------------
-    print("[eval] Generation on test set with beam search")
-    test_split_data = raw["test"] if "test" in raw else raw["validation"]
-    mrs = []
-    refs_list = []
-    for ex in test_split_data:
-        mr = ex.get("meaning_representation") or ex.get("mr") or ex.get("source")
-        refs = ex.get("human_reference") or ex.get("references") or ex.get("ref") or ex.get("reference")
-        if isinstance(refs, list):
-            ref_texts = refs
-        elif isinstance(refs, str):
-            ref_texts = [refs]
-        else:
-            ref_texts = [str(refs)]
-        mrs.append(mr)
-        refs_list.append(ref_texts)
-
-    hypotheses = []
-    model.eval()
-    for mr in tqdm(mrs, desc="gen"):
-        mr_text = " ; ".join([part.strip() for part in str(mr).split(",")]) if isinstance(mr, str) else str(mr)
-        prefix = f"MR: {mr_text} ||| REF:"
-        tokens = tokenizer(prefix, return_tensors="pt").to(args.device)
-        gen_tokens = model.generate(
-            **tokens,
-            max_length=args.max_gen_len,
-            num_beams=args.num_beams,
-            early_stopping=True,
-            no_repeat_ngram_size=2,
-            pad_token_id=tokenizer.eos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            use_cache=True,
+        # End of epoch: save checkpoint
+        ckpt_dir = save_checkpoint(
+            model, tokenizer, optimizer, scheduler, scaler,
+            args.output_dir, global_step, epoch, best_val_loss, patience_count,
+            base_model_name
         )
-        gen_text = tokenizer.decode(gen_tokens[0], skip_special_tokens=True)
-        if gen_text.startswith(prefix):
-            hyp = gen_text[len(prefix):].strip()
-        else:
-            if "REF:" in gen_text:
-                hyp = gen_text.split("REF:", 1)[1].strip()
-            else:
-                hyp = gen_text.strip()
-        hypotheses.append(hyp)
+        print(f"Saved end-of-epoch checkpoint: {ckpt_dir}")
 
-    print("[eval] computing metrics (CIDEr, ROUGE-L, BLEU, METEOR, NIST) -- this may take a minute")
-    scores = compute_all_metrics(hypotheses, refs_list)
-    print("[RESULTS]")
-    for k, v in scores.items():
-        print(f"{k}: {v:.6f}")
+    # End training
 
-    return scores
+    # Evaluation on test set using beam search
+    print("Decoding on test set with beam search...")
+    # Prepare MR lists for test (unique MRs preserving order)
+    test_mrs = []
+    seen = set()
+    for _, row in test_df.iterrows():
+        mr = normalize_ws(str(row["mr"]))
+        if mr not in seen:
+            seen.add(mr)
+            test_mrs.append(mr)
+
+    generations = generate_for_eval(
+        model,
+        tokenizer,
+        test_mrs,
+        device,
+        num_beams=args.num_beams,
+        max_new_tokens=args.gen_max_new_tokens,
+        delimiter=" =>",
+        no_repeat_ngram_size=args.no_repeat_ngram_size,
+    )
+
+    # Determine references set to use for evaluation
+    if test_has_refs and test_refs_grouped and len(test_refs_grouped) > 0:
+        refs_grouped = test_refs_grouped
+        print("Using test references for evaluation.")
+    else:
+        refs_grouped = dev_refs_grouped
+        print("Test references missing; using validation (dev) references for evaluation as a fallback.")
+
+    scores = evaluate_with_metrics(refs_grouped, test_mrs, generations)
+
+    print("Final evaluation scores:")
+    print(json.dumps(scores, indent=2, sort_keys=True))
+
+    # Save generations and scores
+    gen_fp = os.path.join(args.output_dir, "test_generations.jsonl")
+    with open(gen_fp, "w", encoding="utf-8") as f:
+        for mr, hyp in zip(test_mrs, generations):
+            f.write(json.dumps({"mr": mr, "hyp": hyp}, ensure_ascii=False) + "\n")
+    print(f"Wrote generations: {gen_fp}")
+
+    scores_fp = os.path.join(args.output_dir, "test_scores.json")
+    with open(scores_fp, "w", encoding="utf-8") as f:
+        json.dump(scores, f, indent=2, ensure_ascii=False)
+    print(f"Wrote scores: {scores_fp}")
 
 
-# ---------------------------
-# Entrypoint
-# ---------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Fine-tune GPT-2 on E2E NLG with PEFT DoRA and evaluate with pure-Python metrics.")
-    parser.add_argument("--model_name", default=TRAIN_ARGS.model_name)
-    parser.add_argument("--output_dir", default=TRAIN_ARGS.output_dir)
-    parser.add_argument("--adapter_dir", default=TRAIN_ARGS.adapter_dir)
-    parser.add_argument("--dataset_name", default=TRAIN_ARGS.dataset_name)
-    parser.add_argument("--epochs", type=int, default=TRAIN_ARGS.num_epochs)
-    parser.add_argument("--batch_size", type=int, default=TRAIN_ARGS.train_batch_size)
-    parser.add_argument("--eval_batch_size", type=int, default=TRAIN_ARGS.eval_batch_size)
-    parser.add_argument("--max_length", type=int, default=TRAIN_ARGS.max_length)
-    parser.add_argument("--save_every_steps", type=int, default=TRAIN_ARGS.save_every_steps)
-    args_ns = parser.parse_args()
+    try:
+        main()
+    except StopIteration:
+        # Early stopping short-circuit; still run final evaluation on latest checkpoint
+        # Try to resume from latest checkpoint and evaluate
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--output_dir", type=str, default="./outputs")
+        parser.add_argument("--model_name", type=str, default="gpt2")
+        parser.add_argument("--num_beams", type=int, default=10)
+        parser.add_argument("--gen_max_new_tokens", type=int, default=120)
+        parser.add_argument("--no_repeat_ngram_size", type=int, default=3)
+        parser.add_argument("--data_dir", type=str, default="")
+        args, _ = parser.parse_known_args()
 
-    ta = TRAIN_ARGS
-    ta.model_name = args_ns.model_name
-    ta.output_dir = args_ns.output_dir
-    ta.adapter_dir = args_ns.adapter_dir
-    ta.dataset_name = args_ns.dataset_name
-    ta.num_epochs = args_ns.epochs
-    ta.train_batch_size = args_ns.batch_size
-    ta.eval_batch_size = args_ns.eval_batch_size
-    ta.max_length = args_ns.max_length
-    ta.save_every_steps = args_ns.save_every_steps
+        latest_ckpt = find_latest_checkpoint(args.output_dir)
+        if not latest_ckpt:
+            print("No checkpoint found to evaluate after early stopping.")
+            sys.exit(0)
 
-    train_and_evaluate(ta)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        peft_model, tokenizer, training_state = load_checkpoint(args.model_name, device, latest_ckpt)
+        model = peft_model
+        model.eval()
+
+        # Reload data to evaluate
+        work_dir = os.path.join(args.output_dir, "data_cache")
+        train_df, dev_df, test_df = load_e2e_csvs(args.data_dir if args.data_dir else None, work_dir)
+        dev_refs_grouped = group_references_by_mr(dev_df)
+        test_has_refs = "ref" in test_df.columns and not test_df["ref"].isna().all()
+        test_refs_grouped = group_references_by_mr(test_df) if test_has_refs else None
+
+        # Prepare MR list
+        test_mrs = []
+        seen = set()
+        for _, row in test_df.iterrows():
+            mr = normalize_ws(str(row["mr"]))
+            if mr not in seen:
+                seen.add(mr)
+                test_mrs.append(mr)
+
+        generations = generate_for_eval(
+            model,
+            tokenizer,
+            test_mrs,
+            device,
+            num_beams=args.num_beams,
+            max_new_tokens=args.gen_max_new_tokens,
+            delimiter=" =>",
+            no_repeat_ngram_size=args.no_repeat_ngram_size,
+        )
+
+        refs_grouped = test_refs_grouped if (test_has_refs and test_refs_grouped) else dev_refs_grouped
+        scores = evaluate_with_metrics(refs_grouped, test_mrs, generations)
+        print("Final evaluation scores (after early stopping):")
+        print(json.dumps(scores, indent=2, sort_keys=True))
+
+        gen_fp = os.path.join(args.output_dir, "test_generations.jsonl")
+        with open(gen_fp, "w", encoding="utf-8") as f:
+            for mr, hyp in zip(test_mrs, generations):
+                f.write(json.dumps({"mr": mr, "hyp": hyp}, ensure_ascii=False) + "\n")
+        scores_fp = os.path.join(args.output_dir, "test_scores.json")
+        with open(scores_fp, "w", encoding="utf-8") as f:
+            json.dump(scores, f, indent=2, ensure_ascii=False)
+        print(f"Wrote generations: {gen_fp}")
+        print(f"Wrote scores: {scores_fp}")
