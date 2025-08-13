@@ -395,9 +395,9 @@ def main():
     ap.add_argument("--output_dir", type=str, default="./outputs")
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--num_epochs", type=int, default=3)
-    ap.add_argument("--learning_rate", type=float, default=2e-4)
+    ap.add_argument("--learning_rate", type=float, default=1e-4)  # lower default LR to avoid divergence
     ap.add_argument("--weight_decay", type=float, default=0.01)
-    ap.add_argument("--adam_eps", type=float, default=1e-8)
+    ap.add_argument("--adam_eps", type=float, default=1e-6)       # more stable eps
     ap.add_argument("--warmup_steps", type=int, default=500)
     ap.add_argument("--gradient_accumulation_steps", type=int, default=1)
     ap.add_argument("--logging_steps", type=int, default=10)
@@ -414,7 +414,7 @@ def main():
     ap.add_argument("--dataset_name", type=str, default="e2e_nlg", help='HF dataset id (default "e2e_nlg"; falls back to "GEM/e2e_nlg")')
     ap.add_argument("--resume_from", type=str, default="", help="Path to a previous ckpt_step_xxxxxxxx directory to resume from.")
     ap.add_argument("--num_workers", type=int, default=0, help="DataLoader workers. 0 avoids forking (safer on clusters).")
-    ap.add_argument("--max_grad_norm", type=float, default=1.0)
+    ap.add_argument("--max_grad_norm", type=float, default=0.5)   # stricter clipping
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -505,7 +505,8 @@ def main():
 
     # Training
     print("[train] starting...")
-    running_loss = 0.0
+    running_sum = 0.0       # sum of finite losses in the last logging window
+    running_count = 0       # number of finite steps accumulated
     try:
         for epoch in range(start_epoch, args.num_epochs):
             steps_this_epoch = len(train_loader) // max(1, args.gradient_accumulation_steps)
@@ -521,12 +522,13 @@ def main():
                     out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                     loss = out.loss / max(1, args.gradient_accumulation_steps)
 
-                # Standard AMP pattern: always scale/backward; scaler handles inf/NaN and skips step automatically
+                # Backward
                 if scaler.is_enabled():
                     scaler.scale(loss).backward()
                 else:
                     loss.backward()
 
+                stepped = False
                 # Optimizer step when accumulation boundary hit
                 if (step + 1) % args.gradient_accumulation_steps == 0:
                     if scaler.is_enabled():
@@ -534,55 +536,69 @@ def main():
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
                     if scaler.is_enabled():
-                        scaler.step(optimizer)   # does nothing and sets found_inf when grads are inf/nan
-                        scaler.update()          # updates scale (down on overflow, up otherwise)
+                        prev_scale = scaler.get_scale()
+                        scaler.step(optimizer)   # skips on inf/nan
+                        scaler.update()
+                        stepped = scaler.get_scale() >= prev_scale  # if scale went down, we overflowed and skipped
                     else:
                         optimizer.step()
+                        stepped = True
 
-                    scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
+                    if stepped:
+                        scheduler.step()
+                        optimizer.zero_grad(set_to_none=True)
 
-                    global_step += 1
-                    train_loss = float(loss.item() * max(1, args.gradient_accumulation_steps))
-                    if not np.isfinite(train_loss):
-                        # If forward loss was inf/nan, logging uses inf; scaler already handled the step
-                        train_loss = float("inf")
-                    train_ppl = math.exp(min(20.0, train_loss)) if np.isfinite(train_loss) else float("inf")
-                    running_loss += 0.0 if not np.isfinite(train_loss) else train_loss
-                    lr = float(scheduler.get_last_lr()[0])
+                        global_step += 1
+                        train_loss = float(loss.item() * max(1, args.gradient_accumulation_steps))
+                        if np.isfinite(train_loss):
+                            running_sum += train_loss
+                            running_count += 1
+                            train_ppl = math.exp(min(20.0, train_loss))
+                        else:
+                            train_ppl = float("inf")
 
-                    log_jsonl({"phase": "train", "epoch": epoch+1, "step": global_step, "loss": train_loss, "ppl": train_ppl, "lr": lr})
+                        lr = float(scheduler.get_last_lr()[0])
+                        log_jsonl({"phase": "train", "epoch": epoch+1, "step": global_step, "loss": train_loss if np.isfinite(train_loss) else "inf", "ppl": train_ppl, "lr": lr})
 
-                    try:
-                        pbar.update(1)
-                        pbar.set_postfix({"loss": f"{train_loss:.4f}" if np.isfinite(train_loss) else "inf",
-                                          "ppl": f"{train_ppl:.2f}" if np.isfinite(train_ppl) else "inf"})
-                    except Exception:
-                        pass
-
-                    if args.logging_steps > 0 and global_step % args.logging_steps == 0:
-                        avg = running_loss / max(1, args.logging_steps)
-                        avg_ppl = math.exp(min(20.0, avg)) if np.isfinite(avg) else float("inf")
-                        print(f"[epoch {epoch+1}/{args.num_epochs}] step {global_step} - loss {avg:.4f} - ppl {avg_ppl:.2f}")
-                        running_loss = 0.0
-
-                    if args.sample_every_steps > 0 and global_step % args.sample_every_steps == 0 and val_mrs:
                         try:
-                            mr = random.choice(val_mrs)
-                            hyp = generate_for_mrs(model, tokenizer, [mr], device, num_beams=min(5, args.num_beams), max_new_tokens=min(60, args.gen_max_new_tokens))[0]
-                            print(f"[sanity] MR: {mr}\n[snty ] H:  {hyp}\n")
-                            log_jsonl({"phase": "sanity", "epoch": epoch+1, "step": global_step, "mr": mr, "hyp": hyp})
-                        except Exception as e:
-                            print(f"[sanity] failed: {e}")
+                            pbar.update(1)
+                            pbar.set_postfix({
+                                "loss": f"{train_loss:.4f}" if np.isfinite(train_loss) else "inf",
+                                "ppl": f"{train_ppl:.2f}" if np.isfinite(train_ppl) else "inf"
+                            })
+                        except Exception:
+                            pass
 
-                    if args.eval_steps > 0 and global_step % args.eval_steps == 0:
-                        val_ppl = eval_perplexity(model, val_loader, device)
-                        val_loss = min(20.0, math.log(max(val_ppl, 1e-8)))
-                        print(f"[val] step {global_step} - ppl {val_ppl:.2f} (loss≈{val_loss:.4f})")
-                        log_jsonl({"phase": "val", "epoch": epoch+1, "step": global_step, "loss": float(val_loss), "ppl": float(val_ppl)})
+                        if args.logging_steps > 0 and global_step % args.logging_steps == 0:
+                            if running_count > 0:
+                                avg = running_sum / running_count
+                                avg_ppl = math.exp(min(20.0, avg))
+                                print(f"[epoch {epoch+1}/{args.num_epochs}] step {global_step} - loss {avg:.4f} - ppl {avg_ppl:.2f}")
+                            else:
+                                print(f"[epoch {epoch+1}/{args.num_epochs}] step {global_step} - loss (no finite steps in window)")
+                            running_sum = 0.0
+                            running_count = 0
 
-                    if args.save_steps > 0 and global_step % args.save_steps == 0:
-                        save_checkpoint(model, tokenizer, optimizer, scheduler, scaler, args.output_dir, global_step, epoch, base_model_name)
+                        if args.sample_every_steps > 0 and global_step % args.sample_every_steps == 0 and val_mrs:
+                            try:
+                                mr = random.choice(val_mrs)
+                                hyp = generate_for_mrs(model, tokenizer, [mr], device, num_beams=min(5, args.num_beams), max_new_tokens=min(60, args.gen_max_new_tokens))[0]
+                                print(f"[sanity] MR: {mr}\n[snty ] H:  {hyp}\n")
+                                log_jsonl({"phase": "sanity", "epoch": epoch+1, "step": global_step, "mr": mr, "hyp": hyp})
+                            except Exception as e:
+                                print(f"[sanity] failed: {e}")
+
+                        if args.eval_steps > 0 and global_step % args.eval_steps == 0:
+                            val_ppl = eval_perplexity(model, val_loader, device)
+                            val_loss = min(20.0, math.log(max(val_ppl, 1e-8)))
+                            print(f"[val] step {global_step} - ppl {val_ppl:.2f} (loss≈{val_loss:.4f})")
+                            log_jsonl({"phase": "val", "epoch": epoch+1, "step": global_step, "loss": float(val_loss), "ppl": float(val_ppl)})
+
+                        if args.save_steps > 0 and global_step % args.save_steps == 0:
+                            save_checkpoint(model, tokenizer, optimizer, scheduler, scaler, args.output_dir, global_step, epoch, base_model_name)
+                    else:
+                        # Skipped optimizer step due to overflow; just clear grads
+                        optimizer.zero_grad(set_to_none=True)
 
             try:
                 pbar.close()
