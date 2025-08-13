@@ -12,13 +12,10 @@ Simple GPT-2 fine-tuning on the E2E NLG dataset using Hugging Face datasets:
 - Final beam-search decoding on test and multi-reference BLEU/METEOR/ROUGE-L
 - Checkpointing for full training resume: adapters + tokenizer + optimizer + scheduler + GradScaler (fp16) + RNG state
 - Progress bar with ETA per epoch (tqdm)
-
-Resuming:
-  Use --resume_from PATH pointing to a checkpoint directory created by this script (e.g., outputs/ckpt_step_00001000).
 """
 
 import os
-# Silence HF tokenizers fork warning and disable internal parallelism (prevents NaN from weird fork/thread races)
+# Prevent fork/parallelism warning and potential deadlocks in tokenizers
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import re
@@ -34,7 +31,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
-# Slightly more numerically stable/faster on CUDA (safe for GPT-2)
+# Improve numeric stability/perf on NVIDIA
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -93,10 +90,6 @@ def ensure_nltk():
 # -------------------------
 
 def load_e2e_hf(dataset_name: str = "e2e_nlg"):
-    """
-    Returns (train, validation, test) as datasets.Dataset splits.
-    Tries dataset_name, falls back to "GEM/e2e_nlg".
-    """
     try:
         raw = load_dataset(dataset_name)
     except Exception:
@@ -114,10 +107,6 @@ def load_e2e_hf(dataset_name: str = "e2e_nlg"):
     return train, val, test
 
 def get_mr_and_refs(example) -> Tuple[str, List[str]]:
-    """
-    Extract MR string and list of reference strings from a dataset example.
-    Supports common field variants across E2E dataset mirrors.
-    """
     mr = example.get("meaning_representation") or example.get("mr") or example.get("source") or ""
     refs = example.get("references") or example.get("human_references") or example.get("human_reference") or example.get("ref") or example.get("reference")
     if isinstance(refs, list):
@@ -129,9 +118,6 @@ def get_mr_and_refs(example) -> Tuple[str, List[str]]:
     return normalize_ws(mr), ref_list
 
 def flatten_pairs(split_ds) -> List[Tuple[str, str]]:
-    """
-    Build (MR, ref) training pairs, one example per reference.
-    """
     pairs = []
     for ex in split_ds:
         mr, refs = get_mr_and_refs(ex)
@@ -139,14 +125,11 @@ def flatten_pairs(split_ds) -> List[Tuple[str, str]]:
             continue
         for r in refs:
             r_norm = normalize_ws(r)
-            if r_norm:  # skip truly empty refs
+            if r_norm:
                 pairs.append((mr, r_norm))
     return pairs
 
 def group_refs(split_ds) -> Dict[str, List[str]]:
-    """
-    MR -> [ref1, ref2, ...] (multi-reference map).
-    """
     mp: Dict[str, List[str]] = {}
     for ex in split_ds:
         mr, refs = get_mr_and_refs(ex)
@@ -184,7 +167,7 @@ class E2ETrainDataset(Dataset):
         prompt_ids = self.tok(prompt, add_special_tokens=False)["input_ids"][: self.max_source_len]
         target_ids = self.tok(ref, add_special_tokens=False)["input_ids"][: self.max_target_len]
 
-        # If target becomes empty after truncation, ensure we still train on at least EOS
+        # Ensure at least one supervised token (EOS) even if target truncates to empty
         input_ids = prompt_ids + (target_ids if len(target_ids) > 0 else []) + [self.tok.eos_token_id]
         labels = [-100] * len(prompt_ids) + (target_ids if len(target_ids) > 0 else []) + [self.tok.eos_token_id]
         attention_mask = [1] * len(input_ids)
@@ -363,26 +346,22 @@ def save_checkpoint(model: PeftModel,
         },
     }
     torch.save(state, os.path.join(ckpt, "training_state.pt"))
-    # Write a small latest marker
     with open(os.path.join(output_dir, "latest_checkpoint.txt"), "w", encoding="utf-8") as f:
         f.write(ckpt + "\n")
     print(f"[checkpoint] saved: {ckpt}")
     return ckpt
 
 def load_checkpoint(resume_dir: str, device):
-    # Load training state
     state_fp = os.path.join(resume_dir, "training_state.pt")
     if not os.path.exists(state_fp):
         raise FileNotFoundError(f"training_state.pt not found in {resume_dir}")
     state = torch.load(state_fp, map_location="cpu")
     base_model_name = state["base_model_name"]
 
-    # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(resume_dir, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Base model + adapters
     base_cfg = AutoConfig.from_pretrained(base_model_name)
     base = AutoModelForCausalLM.from_pretrained(base_model_name, config=base_cfg)
     base.resize_token_embeddings(len(tokenizer))
@@ -399,7 +378,6 @@ def latest_checkpoint_dir(output_dir: str) -> Optional[str]:
             path = f.readline().strip()
         if path and os.path.isdir(path):
             return path
-    # Fallback: find by pattern
     candidates = [os.path.join(output_dir, d) for d in os.listdir(output_dir) if d.startswith("ckpt_step_")]
     candidates = [d for d in candidates if os.path.isdir(d)]
     if not candidates:
@@ -435,7 +413,7 @@ def main():
     ap.add_argument("--metrics_jsonl", type=str, default="metrics.jsonl")
     ap.add_argument("--dataset_name", type=str, default="e2e_nlg", help='HF dataset id (default "e2e_nlg"; falls back to "GEM/e2e_nlg")')
     ap.add_argument("--resume_from", type=str, default="", help="Path to a previous ckpt_step_xxxxxxxx directory to resume from.")
-    ap.add_argument("--num_workers", type=int, default=2, help="DataLoader workers. Set 0 to fully avoid forking.")
+    ap.add_argument("--num_workers", type=int, default=0, help="DataLoader workers. 0 avoids forking (safer on clusters).")
     ap.add_argument("--max_grad_norm", type=float, default=1.0)
     args = ap.parse_args()
 
@@ -530,7 +508,6 @@ def main():
     running_loss = 0.0
     try:
         for epoch in range(start_epoch, args.num_epochs):
-            # Progress bar over optimizer steps in this epoch
             steps_this_epoch = len(train_loader) // max(1, args.gradient_accumulation_steps)
             pbar = tqdm(total=steps_this_epoch, desc=f"Epoch {epoch+1}/{args.num_epochs}", unit="step", leave=False)
 
@@ -544,14 +521,7 @@ def main():
                     out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                     loss = out.loss / max(1, args.gradient_accumulation_steps)
 
-                # Guard: if loss is non-finite, skip this step to avoid NaNs propagating
-                if not torch.isfinite(loss.detach()):
-                    print(f"[warn] non-finite loss detected at epoch {epoch+1}, loader_step {step+1}, global_step {global_step+1}. Skipping optimizer step.")
-                    optimizer.zero_grad(set_to_none=True)
-                    if scaler.is_enabled():
-                        scaler.update()  # keep scaler ticking to recover from overflow
-                    continue
-
+                # Standard AMP pattern: always scale/backward; scaler handles inf/NaN and skips step automatically
                 if scaler.is_enabled():
                     scaler.scale(loss).backward()
                 else:
@@ -561,12 +531,11 @@ def main():
                 if (step + 1) % args.gradient_accumulation_steps == 0:
                     if scaler.is_enabled():
                         scaler.unscale_(optimizer)
-                    # Clip to keep grads bounded (helps prevent NaNs)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
                     if scaler.is_enabled():
-                        scaler.step(optimizer)
-                        scaler.update()
+                        scaler.step(optimizer)   # does nothing and sets found_inf when grads are inf/nan
+                        scaler.update()          # updates scale (down on overflow, up otherwise)
                     else:
                         optimizer.step()
 
@@ -575,17 +544,15 @@ def main():
 
                     global_step += 1
                     train_loss = float(loss.item() * max(1, args.gradient_accumulation_steps))
-                    # Another guard: replace non-finite values in logging computations
                     if not np.isfinite(train_loss):
+                        # If forward loss was inf/nan, logging uses inf; scaler already handled the step
                         train_loss = float("inf")
                     train_ppl = math.exp(min(20.0, train_loss)) if np.isfinite(train_loss) else float("inf")
                     running_loss += 0.0 if not np.isfinite(train_loss) else train_loss
                     lr = float(scheduler.get_last_lr()[0])
 
-                    # JSON per-step
                     log_jsonl({"phase": "train", "epoch": epoch+1, "step": global_step, "loss": train_loss, "ppl": train_ppl, "lr": lr})
 
-                    # Progress bar + optional postfix
                     try:
                         pbar.update(1)
                         pbar.set_postfix({"loss": f"{train_loss:.4f}" if np.isfinite(train_loss) else "inf",
@@ -593,14 +560,12 @@ def main():
                     except Exception:
                         pass
 
-                    # Console log
                     if args.logging_steps > 0 and global_step % args.logging_steps == 0:
                         avg = running_loss / max(1, args.logging_steps)
                         avg_ppl = math.exp(min(20.0, avg)) if np.isfinite(avg) else float("inf")
                         print(f"[epoch {epoch+1}/{args.num_epochs}] step {global_step} - loss {avg:.4f} - ppl {avg_ppl:.2f}")
                         running_loss = 0.0
 
-                    # Sanity sample
                     if args.sample_every_steps > 0 and global_step % args.sample_every_steps == 0 and val_mrs:
                         try:
                             mr = random.choice(val_mrs)
@@ -610,18 +575,15 @@ def main():
                         except Exception as e:
                             print(f"[sanity] failed: {e}")
 
-                    # Validation
                     if args.eval_steps > 0 and global_step % args.eval_steps == 0:
                         val_ppl = eval_perplexity(model, val_loader, device)
                         val_loss = min(20.0, math.log(max(val_ppl, 1e-8)))
                         print(f"[val] step {global_step} - ppl {val_ppl:.2f} (loss≈{val_loss:.4f})")
                         log_jsonl({"phase": "val", "epoch": epoch+1, "step": global_step, "loss": float(val_loss), "ppl": float(val_ppl)})
 
-                    # Checkpoint save
                     if args.save_steps > 0 and global_step % args.save_steps == 0:
                         save_checkpoint(model, tokenizer, optimizer, scheduler, scaler, args.output_dir, global_step, epoch, base_model_name)
 
-            # End of epoch checkpoint
             try:
                 pbar.close()
             except Exception:
@@ -639,7 +601,6 @@ def main():
     # Final eval on test set
     # -------------------------
     print("[eval] decoding test...")
-    # Unique MRs preserving order
     seen = set()
     test_mrs = []
     for ex in test_split:
@@ -659,7 +620,6 @@ def main():
     scores = {"BLEU": bleu, "METEOR": meteor, "ROUGE_L": rouge_l}
     print(json.dumps(scores, indent=2))
 
-    # Save generations and scores
     gens_fp = os.path.join(args.output_dir, "test_generations.jsonl")
     with open(gens_fp, "w", encoding="utf-8") as f:
         for mr, h in zip(test_mrs, hyps):
