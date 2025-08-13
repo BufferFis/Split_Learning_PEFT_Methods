@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Simple GPT-2 fine-tuning on the E2E NLG dataset using Hugging Face datasets:
+Stable GPT-2 fine-tuning on the E2E NLG dataset using Hugging Face datasets:
 - Loads dataset via load_dataset("e2e_nlg") (falls back to "GEM/e2e_nlg")
 - GPT-2 + PEFT LoRA (optional DoRA)
 - Mixed precision optional (--fp16)
@@ -10,12 +10,19 @@ Simple GPT-2 fine-tuning on the E2E NLG dataset using Hugging Face datasets:
 - Periodic sanity generation on a random MR
 - Validation perplexity during training
 - Final beam-search decoding on test and multi-reference BLEU/METEOR/ROUGE-L
-- Checkpointing for full training resume: adapters + tokenizer + optimizer + scheduler + GradScaler (fp16) + RNG state
+- Checkpointing to fully resume: adapters + tokenizer + optimizer + scheduler + GradScaler (fp16) + RNG state
 - Progress bar with ETA per epoch (tqdm)
+
+Key stabilization changes:
+- No scheduler or optimizer step unless at least one finite backward() happened in the accumulation window.
+- Never call scaler.step()/update() unless backward() was called (prevents GradScaler assertions).
+- Clip grads every step after unscale_ to prevent explosion.
+- Lower default LR and tighter grad clip (still configurable).
+- Filter empty refs and always supervise at least EOS.
+- Disable HF tokenizers parallelism to avoid fork warnings/races.
 """
 
 import os
-# Prevent fork/parallelism warning and potential deadlocks in tokenizers
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import re
@@ -31,7 +38,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
-# Improve numeric stability/perf on NVIDIA
+# Enable TF32 for stability/perf on NVIDIA
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -327,10 +334,8 @@ def save_checkpoint(model: PeftModel,
                     base_model_name: str):
     ckpt = checkpoint_dir(output_dir, global_step)
     os.makedirs(ckpt, exist_ok=True)
-    # Save adapters + tokenizer
     model.save_pretrained(ckpt)
     tokenizer.save_pretrained(ckpt)
-    # Save training state (optimizer/scheduler/scaler + RNG)
     state = {
         "global_step": int(global_step),
         "epoch": int(epoch),
@@ -395,7 +400,7 @@ def main():
     ap.add_argument("--output_dir", type=str, default="./outputs")
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--num_epochs", type=int, default=3)
-    ap.add_argument("--learning_rate", type=float, default=1e-4)  # lower default LR to avoid divergence
+    ap.add_argument("--learning_rate", type=float, default=1e-4)  # conservative default
     ap.add_argument("--weight_decay", type=float, default=0.01)
     ap.add_argument("--adam_eps", type=float, default=1e-6)       # more stable eps
     ap.add_argument("--warmup_steps", type=int, default=500)
@@ -504,13 +509,16 @@ def main():
         mfile.flush()
 
     # Training
-    print("[train] starting...")
-    running_sum = 0.0       # sum of finite losses in the last logging window
-    running_count = 0       # number of finite steps accumulated
+    print("[train] starting...]")
+    running_sum = 0.0     # sum of finite losses in last window
+    running_count = 0     # number of finite steps in last window
     try:
         for epoch in range(start_epoch, args.num_epochs):
             steps_this_epoch = len(train_loader) // max(1, args.gradient_accumulation_steps)
             pbar = tqdm(total=steps_this_epoch, desc=f"Epoch {epoch+1}/{args.num_epochs}", unit="step", leave=False)
+
+            did_backward = False
+            last_finite_loss = None
 
             for step, batch in enumerate(train_loader):
                 model.train()
@@ -522,48 +530,51 @@ def main():
                     out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                     loss = out.loss / max(1, args.gradient_accumulation_steps)
 
-                # Backward
-                if scaler.is_enabled():
-                    scaler.scale(loss).backward()
+                # Skip this micro-batch if loss is non-finite (don't call backward)
+                if not torch.isfinite(loss.detach()):
+                    # clear grads from any previous micro-batches (will handle at boundary)
+                    pass
                 else:
-                    loss.backward()
-
-                stepped = False
-                # Optimizer step when accumulation boundary hit
-                if (step + 1) % args.gradient_accumulation_steps == 0:
                     if scaler.is_enabled():
-                        scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-
-                    if scaler.is_enabled():
-                        prev_scale = scaler.get_scale()
-                        scaler.step(optimizer)   # skips on inf/nan
-                        scaler.update()
-                        stepped = scaler.get_scale() >= prev_scale  # if scale went down, we overflowed and skipped
+                        scaler.scale(loss).backward()
                     else:
-                        optimizer.step()
-                        stepped = True
+                        loss.backward()
+                    did_backward = True
+                    last_finite_loss = float(loss.item() * max(1, args.gradient_accumulation_steps))
 
-                    if stepped:
+                # Optimizer step at accumulation boundary
+                if (step + 1) % args.gradient_accumulation_steps == 0:
+                    if did_backward:
+                        if scaler.is_enabled():
+                            scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
+                        if scaler.is_enabled():
+                            scaler.step(optimizer)   # if grads inf/nan, this will skip
+                            scaler.update()
+                        else:
+                            optimizer.step()
+
                         scheduler.step()
                         optimizer.zero_grad(set_to_none=True)
 
                         global_step += 1
-                        train_loss = float(loss.item() * max(1, args.gradient_accumulation_steps))
-                        if np.isfinite(train_loss):
-                            running_sum += train_loss
+                        if last_finite_loss is not None and np.isfinite(last_finite_loss):
+                            running_sum += last_finite_loss
                             running_count += 1
-                            train_ppl = math.exp(min(20.0, train_loss))
+                            train_ppl = math.exp(min(20.0, last_finite_loss))
+                            log_loss = last_finite_loss
                         else:
                             train_ppl = float("inf")
+                            log_loss = "inf"
 
                         lr = float(scheduler.get_last_lr()[0])
-                        log_jsonl({"phase": "train", "epoch": epoch+1, "step": global_step, "loss": train_loss if np.isfinite(train_loss) else "inf", "ppl": train_ppl, "lr": lr})
+                        log_jsonl({"phase": "train", "epoch": epoch+1, "step": global_step, "loss": log_loss, "ppl": train_ppl, "lr": lr})
 
                         try:
                             pbar.update(1)
                             pbar.set_postfix({
-                                "loss": f"{train_loss:.4f}" if np.isfinite(train_loss) else "inf",
+                                "loss": f"{log_loss:.4f}" if isinstance(log_loss, float) and np.isfinite(log_loss) else "inf",
                                 "ppl": f"{train_ppl:.2f}" if np.isfinite(train_ppl) else "inf"
                             })
                         except Exception:
@@ -597,8 +608,12 @@ def main():
                         if args.save_steps > 0 and global_step % args.save_steps == 0:
                             save_checkpoint(model, tokenizer, optimizer, scheduler, scaler, args.output_dir, global_step, epoch, base_model_name)
                     else:
-                        # Skipped optimizer step due to overflow; just clear grads
+                        # No finite backward accumulated in this window; just clear grads without stepping/scheduler
                         optimizer.zero_grad(set_to_none=True)
+
+                    # Reset accumulation flags
+                    did_backward = False
+                    last_finite_loss = None
 
             try:
                 pbar.close()
