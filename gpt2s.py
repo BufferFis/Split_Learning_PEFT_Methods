@@ -18,6 +18,9 @@ Resuming:
 """
 
 import os
+# Silence HF tokenizers fork warning and disable internal parallelism (prevents NaN from weird fork/thread races)
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import re
 import math
 import json
@@ -30,6 +33,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+
+# Slightly more numerically stable/faster on CUDA (safe for GPT-2)
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
 from datasets import load_dataset
 from transformers import (
@@ -101,6 +109,7 @@ def load_e2e_hf(dataset_name: str = "e2e_nlg"):
         val = raw["dev"]
     else:
         val = raw["train"].select(range(min(500, len(raw["train"]))))
+
     test = raw["test"] if "test" in raw else val
     return train, val, test
 
@@ -129,7 +138,9 @@ def flatten_pairs(split_ds) -> List[Tuple[str, str]]:
         if not refs:
             continue
         for r in refs:
-            pairs.append((mr, r))
+            r_norm = normalize_ws(r)
+            if r_norm:  # skip truly empty refs
+                pairs.append((mr, r_norm))
     return pairs
 
 def group_refs(split_ds) -> Dict[str, List[str]]:
@@ -141,7 +152,11 @@ def group_refs(split_ds) -> Dict[str, List[str]]:
         mr, refs = get_mr_and_refs(ex)
         if not refs:
             continue
-        mp.setdefault(mr, []).extend(refs)
+        for r in refs:
+            r_norm = normalize_ws(r)
+            if not r_norm:
+                continue
+            mp.setdefault(mr, []).append(r_norm)
     return mp
 
 
@@ -169,8 +184,9 @@ class E2ETrainDataset(Dataset):
         prompt_ids = self.tok(prompt, add_special_tokens=False)["input_ids"][: self.max_source_len]
         target_ids = self.tok(ref, add_special_tokens=False)["input_ids"][: self.max_target_len]
 
-        input_ids = prompt_ids + target_ids + [self.tok.eos_token_id]
-        labels = [-100] * len(prompt_ids) + target_ids + [self.tok.eos_token_id]
+        # If target becomes empty after truncation, ensure we still train on at least EOS
+        input_ids = prompt_ids + (target_ids if len(target_ids) > 0 else []) + [self.tok.eos_token_id]
+        labels = [-100] * len(prompt_ids) + (target_ids if len(target_ids) > 0 else []) + [self.tok.eos_token_id]
         attention_mask = [1] * len(input_ids)
 
         return {
@@ -403,6 +419,7 @@ def main():
     ap.add_argument("--num_epochs", type=int, default=3)
     ap.add_argument("--learning_rate", type=float, default=2e-4)
     ap.add_argument("--weight_decay", type=float, default=0.01)
+    ap.add_argument("--adam_eps", type=float, default=1e-8)
     ap.add_argument("--warmup_steps", type=int, default=500)
     ap.add_argument("--gradient_accumulation_steps", type=int, default=1)
     ap.add_argument("--logging_steps", type=int, default=10)
@@ -418,6 +435,8 @@ def main():
     ap.add_argument("--metrics_jsonl", type=str, default="metrics.jsonl")
     ap.add_argument("--dataset_name", type=str, default="e2e_nlg", help='HF dataset id (default "e2e_nlg"; falls back to "GEM/e2e_nlg")')
     ap.add_argument("--resume_from", type=str, default="", help="Path to a previous ckpt_step_xxxxxxxx directory to resume from.")
+    ap.add_argument("--num_workers", type=int, default=2, help="DataLoader workers. Set 0 to fully avoid forking.")
+    ap.add_argument("--max_grad_norm", type=float, default=1.0)
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -439,9 +458,6 @@ def main():
     start_epoch = 0
 
     if args.resume_from:
-        # Build dummy optimizer/scheduler to load state after model is ready
-        base_model_name = None  # will be filled from state
-        # Load model/tokenizer and state
         model, tokenizer, state = load_checkpoint(args.resume_from, device)
         base_model_name = state.get("base_model_name", args.model_name)
         global_step = int(state.get("global_step", 0))
@@ -465,13 +481,17 @@ def main():
     collator = PadCollator(pad_token_id=tokenizer.pad_token_id)
     train_ds = E2ETrainDataset(train_pairs, tokenizer, max_source_len=128, max_target_len=128)
     val_ds   = E2ETrainDataset(val_pairs, tokenizer, max_source_len=128, max_target_len=128)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collator, num_workers=2, pin_memory=True)
-    val_loader   = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collator, num_workers=2, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collator, num_workers=args.num_workers, pin_memory=True)
+    val_loader   = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collator, num_workers=args.num_workers, pin_memory=True)
 
     # Optimizer/scheduler/scaler
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay, eps=args.adam_eps)
     total_steps = (len(train_loader) // max(1, args.gradient_accumulation_steps)) * args.num_epochs
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=total_steps)
+    warmup_steps = args.warmup_steps
+    if total_steps > 0 and warmup_steps >= total_steps:
+        warmup_steps = max(1, int(0.1 * total_steps))
+        print(f"[sched] Adjusted warmup_steps to {warmup_steps} (from {args.warmup_steps}) to be < total_steps={total_steps}")
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
     scaler = torch.cuda.amp.GradScaler(enabled=(args.fp16 and device.type == "cuda"))
 
     # Resume optimizer/scheduler/scaler + RNG if requested
@@ -524,6 +544,14 @@ def main():
                     out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                     loss = out.loss / max(1, args.gradient_accumulation_steps)
 
+                # Guard: if loss is non-finite, skip this step to avoid NaNs propagating
+                if not torch.isfinite(loss.detach()):
+                    print(f"[warn] non-finite loss detected at epoch {epoch+1}, loader_step {step+1}, global_step {global_step+1}. Skipping optimizer step.")
+                    optimizer.zero_grad(set_to_none=True)
+                    if scaler.is_enabled():
+                        scaler.update()  # keep scaler ticking to recover from overflow
+                    continue
+
                 if scaler.is_enabled():
                     scaler.scale(loss).backward()
                 else:
@@ -533,19 +561,25 @@ def main():
                 if (step + 1) % args.gradient_accumulation_steps == 0:
                     if scaler.is_enabled():
                         scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    # Clip to keep grads bounded (helps prevent NaNs)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
                     if scaler.is_enabled():
                         scaler.step(optimizer)
                         scaler.update()
                     else:
                         optimizer.step()
+
                     scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
 
                     global_step += 1
                     train_loss = float(loss.item() * max(1, args.gradient_accumulation_steps))
-                    train_ppl = math.exp(min(20.0, train_loss))
-                    running_loss += train_loss
+                    # Another guard: replace non-finite values in logging computations
+                    if not np.isfinite(train_loss):
+                        train_loss = float("inf")
+                    train_ppl = math.exp(min(20.0, train_loss)) if np.isfinite(train_loss) else float("inf")
+                    running_loss += 0.0 if not np.isfinite(train_loss) else train_loss
                     lr = float(scheduler.get_last_lr()[0])
 
                     # JSON per-step
@@ -554,14 +588,15 @@ def main():
                     # Progress bar + optional postfix
                     try:
                         pbar.update(1)
-                        pbar.set_postfix({"loss": f"{train_loss:.4f}", "ppl": f"{train_ppl:.2f}"})
+                        pbar.set_postfix({"loss": f"{train_loss:.4f}" if np.isfinite(train_loss) else "inf",
+                                          "ppl": f"{train_ppl:.2f}" if np.isfinite(train_ppl) else "inf"})
                     except Exception:
                         pass
 
                     # Console log
                     if args.logging_steps > 0 and global_step % args.logging_steps == 0:
-                        avg = running_loss / args.logging_steps
-                        avg_ppl = math.exp(min(20.0, avg))
+                        avg = running_loss / max(1, args.logging_steps)
+                        avg_ppl = math.exp(min(20.0, avg)) if np.isfinite(avg) else float("inf")
                         print(f"[epoch {epoch+1}/{args.num_epochs}] step {global_step} - loss {avg:.4f} - ppl {avg_ppl:.2f}")
                         running_loss = 0.0
 
