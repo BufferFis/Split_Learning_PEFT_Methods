@@ -206,7 +206,7 @@ class PadCollator:
 # PEFT (LoRA/DoRA)
 # -------------------------
 
-def build_lora_config(r=8, alpha=16, dropout=0.05, use_dora=False) -> LoraConfig:
+def build_lora_config(r=8, alpha=16, dropout=0.05, use_dora=True) -> LoraConfig:
     return LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         r=r,
@@ -214,7 +214,7 @@ def build_lora_config(r=8, alpha=16, dropout=0.05, use_dora=False) -> LoraConfig
         lora_dropout=dropout,
         target_modules=["c_attn", "c_proj", "c_fc"],
         use_dora=use_dora,
-        bias="none",
+        bias="lora_only",
     )
 
 
