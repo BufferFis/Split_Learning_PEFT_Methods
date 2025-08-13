@@ -2,16 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-Simple GPT-2 fine-tuning on the E2E NLG dataset using Hugging Face datasets (no manual CSVs):
-- Loads dataset via load_dataset("e2e_nlg") (falls back to "GEM/e2e_nlg" if needed)
-- GPT-2 + PEFT LoRA (optional DoRA) for efficient training
+Simple GPT-2 fine-tuning on the E2E NLG dataset using Hugging Face datasets:
+- Loads dataset via load_dataset("e2e_nlg") (falls back to "GEM/e2e_nlg")
+- GPT-2 + PEFT LoRA (optional DoRA)
 - Mixed precision optional (--fp16)
 - Per-step JSON logging of loss and perplexity (metrics.jsonl)
 - Periodic sanity generation on a random MR
 - Validation perplexity during training
 - Final beam-search decoding on test and multi-reference BLEU/METEOR/ROUGE-L
+- Checkpointing for full training resume: adapters + tokenizer + optimizer + scheduler + GradScaler (fp16) + RNG state
+- Progress bar with ETA per epoch (tqdm)
 
-Keep it simple: one file, no complex checkpointing (save adapters + tokenizer at epoch end and final).
+Resuming:
+  Use --resume_from PATH pointing to a checkpoint directory created by this script (e.g., outputs/ckpt_step_00001000).
 """
 
 import os
@@ -42,6 +45,8 @@ from peft import (
     get_peft_model,
     PeftModel,
 )
+
+from tqdm.auto import tqdm
 
 import nltk
 from nltk.translate import bleu_score
@@ -95,9 +100,7 @@ def load_e2e_hf(dataset_name: str = "e2e_nlg"):
     elif "dev" in raw:
         val = raw["dev"]
     else:
-        # small slice of train if no val split
         val = raw["train"].select(range(min(500, len(raw["train"]))))
-
     test = raw["test"] if "test" in raw else val
     return train, val, test
 
@@ -146,7 +149,7 @@ def group_refs(split_ds) -> Dict[str, List[str]]:
 # Dataset + Collator
 # -------------------------
 
-def build_prompt(mr: str, delimiter: str = " |") -> str:
+def build_prompt(mr: str, delimiter: str = " =>") -> str:
     return f"{mr}{delimiter}"
 
 class E2ETrainDataset(Dataset):
@@ -197,15 +200,15 @@ class PadCollator:
 # PEFT (LoRA/DoRA)
 # -------------------------
 
-def build_lora_config(r=8, alpha=16, dropout=0.05, use_dora=True) -> LoraConfig:
+def build_lora_config(r=8, alpha=16, dropout=0.05, use_dora=False) -> LoraConfig:
     return LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         r=r,
         lora_alpha=alpha,
         lora_dropout=dropout,
         target_modules=["c_attn", "c_proj", "c_fc"],
-        use_dora=True,
-        bias="lora_only",
+        use_dora=use_dora,
+        bias="none",
     )
 
 
@@ -308,16 +311,84 @@ def eval_perplexity(model: nn.Module, loader: DataLoader, device) -> float:
 
 
 # -------------------------
-# Save/load minimal (final)
+# Checkpointing (resume-ready)
 # -------------------------
 
-def save_adapters_and_tokenizer(model: PeftModel, tokenizer, out_dir: str, tag: str):
-    save_dir = os.path.join(out_dir, tag)
-    os.makedirs(save_dir, exist_ok=True)
-    model.save_pretrained(save_dir)
-    tokenizer.save_pretrained(save_dir)
-    print(f"[save] adapters + tokenizer -> {save_dir}")
-    return save_dir
+def checkpoint_dir(output_dir: str, global_step: int) -> str:
+    return os.path.join(output_dir, f"ckpt_step_{global_step:08d}")
+
+def save_checkpoint(model: PeftModel,
+                    tokenizer,
+                    optimizer,
+                    scheduler,
+                    scaler: torch.cuda.amp.GradScaler,
+                    output_dir: str,
+                    global_step: int,
+                    epoch: int,
+                    base_model_name: str):
+    ckpt = checkpoint_dir(output_dir, global_step)
+    os.makedirs(ckpt, exist_ok=True)
+    # Save adapters + tokenizer
+    model.save_pretrained(ckpt)
+    tokenizer.save_pretrained(ckpt)
+    # Save training state (optimizer/scheduler/scaler + RNG)
+    state = {
+        "global_step": int(global_step),
+        "epoch": int(epoch),
+        "base_model_name": base_model_name,
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict() if scheduler is not None else None,
+        "scaler": scaler.state_dict() if scaler is not None else None,
+        "rng_state": {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        },
+    }
+    torch.save(state, os.path.join(ckpt, "training_state.pt"))
+    # Write a small latest marker
+    with open(os.path.join(output_dir, "latest_checkpoint.txt"), "w", encoding="utf-8") as f:
+        f.write(ckpt + "\n")
+    print(f"[checkpoint] saved: {ckpt}")
+    return ckpt
+
+def load_checkpoint(resume_dir: str, device):
+    # Load training state
+    state_fp = os.path.join(resume_dir, "training_state.pt")
+    if not os.path.exists(state_fp):
+        raise FileNotFoundError(f"training_state.pt not found in {resume_dir}")
+    state = torch.load(state_fp, map_location="cpu")
+    base_model_name = state["base_model_name"]
+
+    # Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(resume_dir, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Base model + adapters
+    base_cfg = AutoConfig.from_pretrained(base_model_name)
+    base = AutoModelForCausalLM.from_pretrained(base_model_name, config=base_cfg)
+    base.resize_token_embeddings(len(tokenizer))
+    base.config.pad_token_id = tokenizer.pad_token_id
+    base.config.use_cache = False
+    model = PeftModel.from_pretrained(base, resume_dir).to(device)
+
+    return model, tokenizer, state
+
+def latest_checkpoint_dir(output_dir: str) -> Optional[str]:
+    marker = os.path.join(output_dir, "latest_checkpoint.txt")
+    if os.path.exists(marker):
+        with open(marker, "r", encoding="utf-8") as f:
+            path = f.readline().strip()
+        if path and os.path.isdir(path):
+            return path
+    # Fallback: find by pattern
+    candidates = [os.path.join(output_dir, d) for d in os.listdir(output_dir) if d.startswith("ckpt_step_")]
+    candidates = [d for d in candidates if os.path.isdir(d)]
+    if not candidates:
+        return None
+    return sorted(candidates)[-1]
 
 
 # -------------------------
@@ -336,6 +407,7 @@ def main():
     ap.add_argument("--gradient_accumulation_steps", type=int, default=1)
     ap.add_argument("--logging_steps", type=int, default=10)
     ap.add_argument("--eval_steps", type=int, default=200)
+    ap.add_argument("--save_steps", type=int, default=1000)
     ap.add_argument("--num_beams", type=int, default=10)
     ap.add_argument("--gen_max_new_tokens", type=int, default=100)
     ap.add_argument("--no_repeat_ngram_size", type=int, default=3)
@@ -345,6 +417,7 @@ def main():
     ap.add_argument("--use_dora", action="store_true", help="Enable DoRA in LoRA (requires recent peft).")
     ap.add_argument("--metrics_jsonl", type=str, default="metrics.jsonl")
     ap.add_argument("--dataset_name", type=str, default="e2e_nlg", help='HF dataset id (default "e2e_nlg"; falls back to "GEM/e2e_nlg")')
+    ap.add_argument("--resume_from", type=str, default="", help="Path to a previous ckpt_step_xxxxxxxx directory to resume from.")
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -358,22 +431,35 @@ def main():
     train_pairs = flatten_pairs(train_split)
     val_pairs = flatten_pairs(val_split)
     val_refs = group_refs(val_split)
-    test_refs = group_refs(test_split) if len(group_refs(test_split)) > 0 else val_refs
+    test_refs_grouped = group_refs(test_split) if len(group_refs(test_split)) > 0 else val_refs
     val_mrs = list(val_refs.keys())
 
-    # Tokenizer/model
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token  # GPT-2 has no pad token; use EOS for padding
-    base_cfg = AutoConfig.from_pretrained(args.model_name)
-    base = AutoModelForCausalLM.from_pretrained(args.model_name, config=base_cfg)
-    base.resize_token_embeddings(len(tokenizer))
-    base.config.pad_token_id = tokenizer.pad_token_id
-    base.config.use_cache = False
+    # Tokenizer/model (load or build)
+    global_step = 0
+    start_epoch = 0
 
-    lora_cfg = build_lora_config(use_dora=args.use_dora)
-    model = get_peft_model(base, lora_cfg).to(device)
-    model.print_trainable_parameters()
+    if args.resume_from:
+        # Build dummy optimizer/scheduler to load state after model is ready
+        base_model_name = None  # will be filled from state
+        # Load model/tokenizer and state
+        model, tokenizer, state = load_checkpoint(args.resume_from, device)
+        base_model_name = state.get("base_model_name", args.model_name)
+        global_step = int(state.get("global_step", 0))
+        start_epoch = int(state.get("epoch", 0))
+        print(f"[resume] from {args.resume_from} (step={global_step}, epoch={start_epoch})")
+    else:
+        base_model_name = args.model_name
+        tokenizer = AutoTokenizer.from_pretrained(base_model_name, use_fast=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token  # GPT-2 has no pad; use EOS
+        base_cfg = AutoConfig.from_pretrained(base_model_name)
+        base = AutoModelForCausalLM.from_pretrained(base_model_name, config=base_cfg)
+        base.resize_token_embeddings(len(tokenizer))
+        base.config.pad_token_id = tokenizer.pad_token_id
+        base.config.use_cache = False
+        lora_cfg = build_lora_config(use_dora=args.use_dora)
+        model = get_peft_model(base, lora_cfg).to(device)
+        model.print_trainable_parameters()
 
     # Dataloaders
     collator = PadCollator(pad_token_id=tokenizer.pad_token_id)
@@ -388,6 +474,28 @@ def main():
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=total_steps)
     scaler = torch.cuda.amp.GradScaler(enabled=(args.fp16 and device.type == "cuda"))
 
+    # Resume optimizer/scheduler/scaler + RNG if requested
+    if args.resume_from:
+        _, _, state = load_checkpoint(args.resume_from, device)
+        if state.get("optimizer"):
+            optimizer.load_state_dict(state["optimizer"])
+        if state.get("scheduler"):
+            scheduler.load_state_dict(state["scheduler"])
+        if scaler and state.get("scaler"):
+            scaler.load_state_dict(state["scaler"])
+        rng = state.get("rng_state", {})
+        try:
+            if "python" in rng and rng["python"] is not None:
+                random.setstate(rng["python"])
+            if "numpy" in rng and rng["numpy"] is not None:
+                np.random.set_state(rng["numpy"])
+            if "torch" in rng and rng["torch"] is not None:
+                torch.set_rng_state(rng["torch"])
+            if torch.cuda.is_available() and "cuda" in rng and rng["cuda"] is not None:
+                torch.cuda.set_rng_state_all(rng["cuda"])
+        except Exception as e:
+            print(f"[resume] RNG restore skipped: {e}")
+
     # Metrics JSONL
     metrics_fp = os.path.join(args.output_dir, args.metrics_jsonl)
     mfile = open(metrics_fp, "a", encoding="utf-8")
@@ -400,9 +508,12 @@ def main():
     # Training
     print("[train] starting...")
     running_loss = 0.0
-    global_step = 0
     try:
-        for epoch in range(args.num_epochs):
+        for epoch in range(start_epoch, args.num_epochs):
+            # Progress bar over optimizer steps in this epoch
+            steps_this_epoch = len(train_loader) // max(1, args.gradient_accumulation_steps)
+            pbar = tqdm(total=steps_this_epoch, desc=f"Epoch {epoch+1}/{args.num_epochs}", unit="step", leave=False)
+
             for step, batch in enumerate(train_loader):
                 model.train()
                 input_ids = batch["input_ids"].to(device, non_blocking=True)
@@ -418,6 +529,7 @@ def main():
                 else:
                     loss.backward()
 
+                # Optimizer step when accumulation boundary hit
                 if (step + 1) % args.gradient_accumulation_steps == 0:
                     if scaler.is_enabled():
                         scaler.unscale_(optimizer)
@@ -438,6 +550,13 @@ def main():
 
                     # JSON per-step
                     log_jsonl({"phase": "train", "epoch": epoch+1, "step": global_step, "loss": train_loss, "ppl": train_ppl, "lr": lr})
+
+                    # Progress bar + optional postfix
+                    try:
+                        pbar.update(1)
+                        pbar.set_postfix({"loss": f"{train_loss:.4f}", "ppl": f"{train_ppl:.2f}"})
+                    except Exception:
+                        pass
 
                     # Console log
                     if args.logging_steps > 0 and global_step % args.logging_steps == 0:
@@ -463,8 +582,17 @@ def main():
                         print(f"[val] step {global_step} - ppl {val_ppl:.2f} (loss≈{val_loss:.4f})")
                         log_jsonl({"phase": "val", "epoch": epoch+1, "step": global_step, "loss": float(val_loss), "ppl": float(val_ppl)})
 
-            # Save adapters at epoch end
-            save_adapters_and_tokenizer(model, tokenizer, args.output_dir, tag=f"epoch_{epoch+1}")
+                    # Checkpoint save
+                    if args.save_steps > 0 and global_step % args.save_steps == 0:
+                        save_checkpoint(model, tokenizer, optimizer, scheduler, scaler, args.output_dir, global_step, epoch, base_model_name)
+
+            # End of epoch checkpoint
+            try:
+                pbar.close()
+            except Exception:
+                pass
+            save_checkpoint(model, tokenizer, optimizer, scheduler, scaler, args.output_dir, global_step, epoch, base_model_name)
+            log_jsonl({"phase": "epoch_end", "epoch": epoch+1, "step": global_step})
 
     finally:
         try:
@@ -472,7 +600,9 @@ def main():
         except Exception:
             pass
 
-    # Final evaluation on test
+    # -------------------------
+    # Final eval on test set
+    # -------------------------
     print("[eval] decoding test...")
     # Unique MRs preserving order
     seen = set()
@@ -484,7 +614,7 @@ def main():
             test_mrs.append(mr)
 
     hyps = generate_for_mrs(model, tokenizer, test_mrs, device, num_beams=args.num_beams, max_new_tokens=args.gen_max_new_tokens, no_repeat_ngram_size=args.no_repeat_ngram_size)
-    refs_grouped = test_refs
+    refs_grouped = test_refs_grouped
     refs_list = [refs_grouped.get(mr, [""]) for mr in test_mrs]
 
     print("[eval] computing BLEU/METEOR/ROUGE-L ...")
@@ -502,9 +632,7 @@ def main():
     with open(os.path.join(args.output_dir, "test_scores.json"), "w", encoding="utf-8") as f:
         json.dump(scores, f, indent=2, ensure_ascii=False)
     print(f"[done] wrote {gens_fp} and test_scores.json")
-    # Final adapters save
-    save_adapters_and_tokenizer(model, tokenizer, args.output_dir, tag="final")
-    
+
 
 if __name__ == "__main__":
     main()
