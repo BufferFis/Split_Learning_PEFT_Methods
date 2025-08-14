@@ -401,7 +401,11 @@ def evaluate_e2e_metrics(
         print(f"[e2e] Could not import E2E metrics (BLEU/NIST). Make sure e2e-metrics repo is cloned. Error: {e}")
         print("[e2e] Falling back to simple metrics.")
         # Fallback: simple evaluation path
-        hyps = generate_for_mrs(model, tokenizer, mrs, device, num_beams=num_beams, max_new_tokens=max_new_tokens, delimiter=delimiter, no_repeat_ngram_size=no_repeat_ngram_size)
+        hyps = generate_for_mrs(
+            model, tokenizer, mrs, device,
+            num_beams=num_beams, max_new_tokens=max_new_tokens,
+            delimiter=delimiter, no_repeat_ngram_size=no_repeat_ngram_size
+        )
         refs_list = [refs_grouped.get(mr, [""]) for mr in mrs]
         bleu = compute_bleu_multi(hyps, refs_list)
         meteor = compute_meteor_multi(hyps, refs_list)
@@ -415,6 +419,12 @@ def evaluate_e2e_metrics(
     refs_list: List[List[str]] = []
     batches = list(range(0, len(mrs), batch_size))
     pbar = tqdm(total=len(batches), desc="E2E Generate", unit="batch", leave=False)
+
+    # Force left padding for decoder-only batched generation (and restore later)
+    prev_pad = getattr(tokenizer, "padding_side", "right")
+    prev_trunc = getattr(tokenizer, "truncation_side", "right")
+    tokenizer.padding_side = "left"         # ADD
+    tokenizer.truncation_side = "left"      # ADD
 
     model.eval()
     with torch.no_grad():
@@ -450,7 +460,12 @@ def evaluate_e2e_metrics(
                         gen_ids = seqs[j, input_lengths[bi]:]
                         text = normalize_ws(tokenizer.decode(gen_ids, skip_special_tokens=True).strip())
                         candidates.append(text)
-                    best = max(candidates, key=lambda c: combined_rerank_score(c, mr, cov_w=0.45, len_w=0.35, comp_w=0.20, target_len=15))
+                    best = max(
+                        candidates,
+                        key=lambda c: combined_rerank_score(
+                            c, mr, cov_w=0.45, len_w=0.35, comp_w=0.20, target_len=15
+                        )
+                    )
                     predictions.append(best)
             else:
                 out = model.generate(
@@ -475,6 +490,11 @@ def evaluate_e2e_metrics(
 
             pbar.update(1)
     pbar.close()
+
+    # Restore original tokenizer settings
+    tokenizer.padding_side = prev_pad        # ADD
+    tokenizer.truncation_side = prev_trunc   # ADD
+
     model.train()
 
     # Compute BLEU & NIST via E2E Python metrics
@@ -486,7 +506,7 @@ def evaluate_e2e_metrics(
     e2e_bleu = float(bleu_scorer.score())
     e2e_nist = float(nist_scorer.score())
 
-    # METEOR: best-of-refs per MR (as in your nosplit script)
+    # METEOR: best-of-refs per MR
     if hf_evaluate is not None:
         meteor_metric = hf_evaluate.load("meteor")
         meteor_vals = []
@@ -500,7 +520,6 @@ def evaluate_e2e_metrics(
             meteor_vals.append(best)
         e2e_meteor = float(np.mean(meteor_vals)) if meteor_vals else 0.0
     else:
-        # fallback with nltk
         ensure_nltk()
         meteor_vals = []
         for pred, refs in zip(predictions, refs_list):
@@ -590,6 +609,8 @@ def load_checkpoint(resume_dir: str, device):
     tokenizer = AutoTokenizer.from_pretrained(resume_dir, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left" # ADD 
+    tokenizer.truncation_side = "left" # ADD
 
     base_cfg = AutoConfig.from_pretrained(base_model_name)
     base = AutoModelForCausalLM.from_pretrained(base_model_name, config=base_cfg)
@@ -686,6 +707,9 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(base_model_name, use_fast=True)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token  # GPT-2 has no pad; use EOS
+        tokenizer.padding_side = "left" # ADD
+        tokenizer.truncation_side = "left" # ADD
+
         base_cfg = AutoConfig.from_pretrained(base_model_name)
         base = AutoModelForCausalLM.from_pretrained(base_model_name, config=base_cfg)
         base.resize_token_embeddings(len(tokenizer))
