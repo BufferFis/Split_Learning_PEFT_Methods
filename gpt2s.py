@@ -356,17 +356,36 @@ def save_checkpoint(model: PeftModel,
     print(f"[checkpoint] saved: {ckpt}")
     return ckpt
 
+# Add this helper near your imports or above load_checkpoint
+def torch_load_compat(path, map_location="cpu"):
+    """
+    Compat loader for PyTorch 2.6+ where torch.load defaults to weights_only=True.
+    We explicitly set weights_only=False for our trusted checkpoints.
+    Falls back cleanly for older torch versions that don't accept the kwarg.
+    """
+    try:
+        # PyTorch 2.6+ path (explicitly disable weights_only)
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        # Older PyTorch that doesn't support weights_only
+        return torch.load(path, map_location=map_location)
+
+# Replace your existing load_checkpoint with this version
 def load_checkpoint(resume_dir: str, device):
     state_fp = os.path.join(resume_dir, "training_state.pt")
     if not os.path.exists(state_fp):
         raise FileNotFoundError(f"training_state.pt not found in {resume_dir}")
-    state = torch.load(state_fp, map_location="cpu")
+
+    # Use the compat loader to avoid _pickle.UnpicklingError on torch 2.6+
+    state = torch_load_compat(state_fp, map_location="cpu")
     base_model_name = state["base_model_name"]
 
+    # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(resume_dir, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # Base model + adapters
     base_cfg = AutoConfig.from_pretrained(base_model_name)
     base = AutoModelForCausalLM.from_pretrained(base_model_name, config=base_cfg)
     base.resize_token_embeddings(len(tokenizer))
