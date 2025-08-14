@@ -501,8 +501,6 @@ def evaluate_e2e_metrics(
                     no_repeat_ngram_size=4,
                     repetition_penalty = 1.25,
                     length_penalty = 0.8,
-                    repetition_penalty=repetition_penalty,
-                    length_penalty=length_penalty,
                     return_dict_in_generate=True,
                     output_scores=False,
                     eos_token_id=tokenizer.eos_token_id,
