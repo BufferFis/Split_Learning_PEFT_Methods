@@ -478,248 +478,312 @@ def slot_coverage_score_with_slotname(hyp: str, mr: str) -> float:
     return score / total if total else 0.0
 
 
+def atomic_write_json(path: str, data: dict):
+    """Atomically write JSON to disk to avoid partial files."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
 
-def evaluate_e2e_metrics(
-    args,
-    model,
-    tokenizer,
-    mrs: List[str],
-    refs_grouped: Dict[str, List[str]],
-    device,
-    batch_size: int,
-    num_beams: int,
-    nbest: int,
-    max_new_tokens: int,
-    no_repeat_ngram_size: int,
-    repetition_penalty: float,
-    length_penalty: float,
-    delimiter: str = " =>",
-    rerank: bool = True,
-) -> Dict[str, float]:
-    """
-    E2E Python evaluation using external e2e-metrics (BLEU+NIST) + METEOR.
-    Correctly removes the ENTIRE input prompt for left-padded batches.
-    """
-    import sys, math
-    sys.path.append("./e2e-metrics")
+# --- REPLACE your evaluate_model with this version (returns all 5 scores: BLEU, NIST, METEOR, ROUGE_L, CIDEr) ---
+def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
+    """Evaluate using E2E Python implementation with beam reranking and compute 5 metrics."""
+    import sys
+    import re
+    import math
+    sys.path.append('./e2e-metrics')
+    
     try:
         from metrics.pymteval import BLEUScore, NISTScore
-    except Exception as e:
-        print(f"[e2e] Could not import E2E metrics (BLEU/NIST). Make sure e2e-metrics repo is cloned. Error: {e}")
-        print("[e2e] Falling back to simple metrics.")
-        hyps = generate_for_mrs(
-            model, tokenizer, mrs, device,
-            num_beams=num_beams,
-            max_new_tokens=max_new_tokens,
-            no_repeat_ngram_size=no_repeat_ngram_size,
-            repetition_penalty=repetition_penalty,
-            length_penalty=length_penalty,
-            min_new_tokens=getattr(args, "min_new_tokens", 1),
-        )
-        refs_list = [refs_grouped.get(mr, [""]) for mr in mrs]
-        bleu = compute_bleu_multi(hyps, refs_list)
-        meteor = compute_meteor_multi(hyps, refs_list)
-        rouge_l = compute_rouge_l_multi(hyps, refs_list)
-        scores = {"BLEU": bleu, "METEOR": meteor, "ROUGE_L": rouge_l, "num_predictions": len(hyps)}
-        print(json.dumps(scores, indent=2))
-        return scores
-
-    predictions: List[str] = []
-    refs_list: List[List[str]] = []
-    batches = list(range(0, len(mrs), batch_size))
-    pbar = tqdm(total=len(batches), desc="E2E Generate", unit="batch", leave=False)
-
-    # Save/override pad/trunc sides for decoder-only batched generation
-    prev_pad = getattr(tokenizer, "padding_side", "right")
-    prev_trunc = getattr(tokenizer, "truncation_side", "right")
-    tokenizer.padding_side = "left"
-    tokenizer.truncation_side = "left"
-
-    beam_groups = getattr(args, "e2e_beam_groups", 1)
-    diversity_penalty = getattr(args, "e2e_diversity_penalty", 0.0)
-    min_new_tokens = getattr(args, "min_new_tokens", 1)
-
+        have_e2e = True
+    except ImportError:
+        logger.error("Could not import E2E metrics. Falling back to Python implementations for BLEU/NIST.")
+        have_e2e = False
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.eval()
-    with torch.no_grad():
-        for start in batches:
-            chunk = mrs[start:start + batch_size]
-            prompts = [f"{mr}{delimiter}" for mr in chunk]
-            enc = tokenizer(prompts, return_tensors="pt", add_special_tokens=False, padding=True)
-            # IMPORTANT: because we left-pad, remove **entire** input width for everyone
-            max_input_len = int(enc["input_ids"].shape[1])
-            enc = {k: v.to(device) for k, v in enc.items()}
 
-            if rerank:
-                beams = max(num_beams, nbest)
-                if beam_groups and beam_groups > 1 and beams % beam_groups != 0:
-                    beams = beam_groups * math.ceil(beams / beam_groups)
+    # Beam reranking helper functions
+    def extract_mr_slots(mr):
+        slots = {}
+        pattern = r'(\w+)\[([^\]]+)\]'
+        matches = re.findall(pattern, mr)
+        for slot_name, slot_value in matches:
+            slots[slot_name.lower()] = slot_value.lower()
+        return slots
 
-                gen_args = dict(
-                    **enc,
-                    num_beams=beams,
-                    num_return_sequences=nbest,
-                    max_new_tokens=max_new_tokens,
-                    min_new_tokens=min_new_tokens,
-                    early_stopping=True,
-                    do_sample=False,
-                    no_repeat_ngram_size=no_repeat_ngram_size,
-                    repetition_penalty=repetition_penalty,
-                    length_penalty=length_penalty,
-                    return_dict_in_generate=True,
-                    output_scores=False,
-                    eos_token_id=tokenizer.eos_token_id,
-                    pad_token_id=tokenizer.pad_token_id,
-                )
-                if beam_groups and beam_groups > 1:
-                    gen_args["num_beam_groups"] = beam_groups
-                    gen_args["diversity_penalty"] = diversity_penalty
+    def calculate_slot_coverage(generated_text, mr):
+        mr_slots = extract_mr_slots(mr)
+        generated_lower = generated_text.lower()
+        coverage_score = 0
+        total_slots = len(mr_slots)
+        for slot_name, slot_value in mr_slots.items():
+            if slot_value in generated_lower:
+                coverage_score += 1
+            elif slot_name in generated_lower:
+                coverage_score += 0.5
+        return coverage_score / total_slots if total_slots > 0 else 0
 
-                out = model.generate(**gen_args)
-                seqs = out.sequences  # (batch*nbest, seq_len)
+    def is_complete_sentence(text):
+        return text.strip().endswith(('.', '?', '!'))
 
-                # extract generated text: drop EXACTLY the input width (works with left padding)
-                for bi, mr in enumerate(chunk):
-                    start_i = bi * nbest
-                    end_i = start_i + nbest
-                    candidates: List[str] = []
-                    for j in range(start_i, end_i):
-                        gen_ids = seqs[j, max_input_len:]
-                        text = normalize_ws(tokenizer.decode(gen_ids, skip_special_tokens=True).strip())
-                        candidates.append(text)
-                    
-                    # Second pass (optional): union with an alternate decode setting
-                    if getattr(args, "e2e_second_pass", False):
-                        beams2 = getattr(args, "e2e_alt_num_beams", 8)
-                        nbest2 = getattr(args, "e2e_alt_nbest", 10)
-                        beam_groups2 = getattr(args, "e2e_alt_beam_groups", 1)
-                        diversity2 = getattr(args, "e2e_alt_diversity_penalty", 0.0)
-                        # Build one-example inputs to keep memory in check
-                        enc2 = tokenizer([f"{mr}{delimiter}"], return_tensors="pt", add_special_tokens=False, padding=True)
-                        max_input_len2 = int(enc2["input_ids"].shape[1])
-                        enc2 = {k: v.to(device) for k, v in enc2.items()}
-                        gen_args2 = dict(
-                            **enc2,
-                            num_beams=beams2,
-                            num_return_sequences=nbest2,
-                            max_new_tokens=max_new_tokens,
-                            min_new_tokens=min_new_tokens,
-                            early_stopping=True,
-                            do_sample=False,
-                            no_repeat_ngram_size=getattr(args, "e2e_alt_no_repeat_ngram_size", 4),
-                            repetition_penalty=getattr(args, "e2e_alt_repetition_penalty", 1.03),
-                            length_penalty=getattr(args, "e2e_alt_length_penalty", 1.1),
-                            return_dict_in_generate=True,
-                            output_scores=False,
-                            eos_token_id=tokenizer.eos_token_id,
-                            pad_token_id=tokenizer.pad_token_id,
-                        )
-                        if beam_groups2 and beam_groups2 > 1:
-                            gen_args2["num_beam_groups"] = beam_groups2
-                            gen_args2["diversity_penalty"] = diversity2
-                        out2 = model.generate(**gen_args2)
-                        seqs2 = out2.sequences  # (nbest2, seq_len)
-                        for j in range(seqs2.size(0)):
-                            gen_ids2 = seqs2[j, max_input_len2:]
-                            text2 = normalize_ws(tokenizer.decode(gen_ids2, skip_special_tokens=True).strip())
-                            candidates.append(text2)
-                    
-                    
-                    
-                    # Rerank with tunable weights
-                    best = max(
-                        candidates,
-                        key=lambda c: enhanced_rerank_score(
-                            c, mr, refs_grouped.get(mr, []),
-                            cov_w=getattr(args, "rerank_cov_w", 0.4),
-                            len_w=getattr(args, "rerank_len_w", 0.3),
-                            ngram_w=getattr(args, "rerank_ngram_w", 0.2),
-                            comp_w=getattr(args, "rerank_comp_w", 0.1),
-                        )
-                    )
-                    predictions.append(best)
+    def length_score(text, target_len=15):
+        n = max(1, len(text.split()))
+        return 1.0 if n <= target_len else (target_len / n)
+
+    def enhanced_rerank_score(hyp: str, mr: str, cov_w=0.45, len_w=0.35, comp_w=0.20) -> float:
+        cov = calculate_slot_coverage(hyp, mr)
+        ls = length_score(hyp, target_len=15)
+        cs = 1.0 if is_complete_sentence(hyp) else 0.1
+        return cov_w * cov + len_w * ls + comp_w * cs
+
+    def generate_with_beam_reranking(input_ids, attention_mask, mr):
+        with torch.no_grad():
+            use_amp = torch.cuda.is_available() and getattr(args, "fp16", False)
+            gen_kwargs = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "max_length": input_ids.shape[1] + 23,
+                "num_beams": 10,
+                "num_return_sequences": 5,
+                "early_stopping": True,
+                "no_repeat_ngram_size": 4,
+                "repetition_penalty": 1.2,
+                "length_penalty": 1.0,
+                "pad_token_id": tokenizer.eos_token_id,
+                "eos_token_id": tokenizer.eos_token_id,
+            }
+            if use_amp:
+                with autocast():
+                    outputs = model.generate(**gen_kwargs)
             else:
-                out = model.generate(
-                    **enc,
-                    num_beams=num_beams,
-                    max_new_tokens=max_new_tokens,
-                    min_new_tokens=min_new_tokens,
-                    early_stopping=True,
-                    do_sample=False,
-                    no_repeat_ngram_size=no_repeat_ngram_size,
-                    repetition_penalty=repetition_penalty,
-                    length_penalty=length_penalty,
-                    eos_token_id=tokenizer.eos_token_id,
-                    pad_token_id=tokenizer.pad_token_id,
-                )
-                # out is (batch, seq_len). Remove full input width.
-                for bi in range(out.size(0)):
-                    gen_ids = out[bi, max_input_len:]
-                    text = normalize_ws(tokenizer.decode(gen_ids, skip_special_tokens=True).strip())
-                    predictions.append(text)
+                outputs = model.generate(**gen_kwargs)
+        candidates = []
+        for output in outputs:
+            decoded = tokenizer.decode(output, skip_special_tokens=True)
+            if "REF:" in decoded:
+                generated_part = decoded.split("REF:")[1].strip()
+                candidates.append(generated_part)
+        if not candidates:
+            return ""
+        best = max(candidates, key=lambda c: enhanced_rerank_score(c, mr))
+        return best
 
-            for mr in chunk:
-                refs_list.append(refs_grouped.get(mr, [""]))
+    # MR -> refs mapping
+    mr_to_references = eval_dataset.mr_to_refs
+    all_mrs = list(mr_to_references.keys())
+    predictions = []
+    references_list = []
 
-            pbar.update(1)
-    pbar.close()
+    logger.info("Generating predictions for E2E evaluation with beam reranking...")
 
-    # Safety: number of predictions must match number of MRs
-    assert len(predictions) == len(mrs), f"e2e: predictions={len(predictions)} != MRs={len(mrs)}"
-
-    predictions = [normalize_for_bleu(p) for p in predictions]
-
-    # Restore tokenizer config
-    tokenizer.padding_side = prev_pad
-    tokenizer.truncation_side = prev_trunc
-    model.train()
-
-    bleu_scorer = BLEUScore()
-    nist_scorer = NISTScore()
-    for pred, refs in zip(predictions, refs_list):
-        bleu_scorer.append(pred, refs)
-        nist_scorer.append(pred, refs)
-    e2e_bleu = float(bleu_scorer.score())
-    e2e_nist = float(nist_scorer.score())
-
-    # METEOR (best ref)
-    if hf_evaluate is not None:
-        meteor_metric = hf_evaluate.load("meteor")
-        meteor_vals = []
-        for pred, refs in zip(predictions, refs_list):
-            best = 0.0
-            for ref in refs:
-                try:
-                    best = max(best, float(meteor_metric.compute(predictions=[pred], references=[ref])["meteor"]))
-                except Exception:
-                    pass
-            meteor_vals.append(best)
-        e2e_meteor = float(np.mean(meteor_vals)) if meteor_vals else 0.0
+    if getattr(args, "fp16", False) and torch.cuda.is_available():
+        eval_batch_size = 6
     else:
-        ensure_nltk()
-        meteor_vals = []
-        for pred, refs in zip(predictions, refs_list):
+        eval_batch_size = 4
+
+    for start in tqdm(range(0, len(all_mrs), eval_batch_size), desc="Generating"):
+        mrs_batch = all_mrs[start:start + eval_batch_size]
+        prompts = [f"MR: {mr} REF:" for mr in mrs_batch]
+        inputs = tokenizer(prompts, return_tensors="pt", padding=True, padding_side="left", truncation=True).to(device)
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs["attention_mask"]
+
+        for i, mr in enumerate(mrs_batch):
+            single_input = input_ids[i:i+1]
+            single_mask = attention_mask[i:i+1]
+            best_generation = generate_with_beam_reranking(single_input, single_mask, mr)
+            predictions.append(best_generation)
+            references_list.append(mr_to_references[mr])
+
+    # Helper tokenization for fallbacks
+    def _tok_simple(s: str):
+        return re.sub(r"[^a-z0-9\s]", " ", s.lower()).split()
+
+    # BLEU and NIST
+    if have_e2e:
+        bleu_scorer = BLEUScore()
+        for pred, refs in zip(predictions, references_list):
+            bleu_scorer.append(pred, refs)
+        bleu_score_val = float(bleu_scorer.score())
+
+        nist_scorer = NISTScore()
+        for pred, refs in zip(predictions, references_list):
+            nist_scorer.append(pred, refs)
+        nist_score_val = float(nist_scorer.score())
+    else:
+        # Python fallback BLEU
+        from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
+        refs_tok = [[_tok_simple(r) for r in refs] for refs in references_list]
+        hyps_tok = [_tok_simple(h) for h in predictions]
+        smoothie = SmoothingFunction().method1
+        bleu_score_val = float(corpus_bleu(refs_tok, hyps_tok, smoothing_function=smoothie) * 100.0)
+        # Python fallback NIST (if available)
+        try:
+            from nltk.translate.nist_score import corpus_nist
+            nist_score_val = float(corpus_nist(refs_tok, hyps_tok, n=5))
+        except Exception:
+            nist_score_val = 0.0
+
+    # METEOR (multi-reference per example; average)
+    meteor_vals = []
+    try:
+        for pred, refs in zip(predictions, references_list):
+            meteor_vals.append(float(meteor.compute(predictions=[pred], references=[refs])["meteor"]))
+        meteor_score_val = float(sum(meteor_vals) / len(meteor_vals)) if meteor_vals else 0.0
+    except Exception:
+        # Fallback to NLTK meteor_score
+        from nltk.translate.meteor_score import meteor_score as nltk_meteor
+        for pred, refs in zip(predictions, references_list):
+            try:
+                meteor_vals.append(float(nltk_meteor(refs, pred)))
+            except Exception:
+                meteor_vals.append(0.0)
+        meteor_score_val = float(sum(meteor_vals) / len(meteor_vals)) if meteor_vals else 0.0
+
+    # ROUGE-L (best over refs per example; average)
+    rouge_l_vals = []
+    try:
+        for pred, refs in zip(predictions, references_list):
             best = 0.0
             for ref in refs:
                 try:
-                    best = max(best, float(meteor_score([ref], pred)))
-                except Exception:
-                    pass
-            meteor_vals.append(best)
-        e2e_meteor = float(np.mean(meteor_vals)) if meteor_vals else 0.0
+                    val = float(rouge.compute(predictions=[pred], references=[ref])["rougeL"])
+                except KeyError:
+                    val = float(rouge.compute(predictions=[pred], references=[ref])["rougeLsum"])
+                best = max(best, val)
+            rouge_l_vals.append(best)
+        rouge_l_score_val = float(sum(rouge_l_vals) / len(rouge_l_vals)) if rouge_l_vals else 0.0
+    except Exception:
+        # Simple LCS-based fallback
+        def _lcs(a, b):
+            A, B = _tok_simple(a), _tok_simple(b)
+            m, n = len(A), len(B)
+            dp = [[0]*(n+1) for _ in range(m+1)]
+            for i in range(m):
+                for j in range(n):
+                    if A[i] == B[j]:
+                        dp[i+1][j+1] = dp[i][j] + 1
+                    else:
+                        dp[i+1][j+1] = max(dp[i][j+1], dp[i+1][j])
+            l = dp[m][n]
+            prec = l / m if m else 0.0
+            rec = l / n if n else 0.0
+            if prec + rec == 0:
+                return 0.0
+            beta2 = 1.2**2
+            return (1 + beta2) * prec * rec / (rec + beta2 * prec)
+        vals = []
+        for pred, refs in zip(predictions, references_list):
+            best = 0.0
+            for ref in refs:
+                best = max(best, _lcs(pred, ref))
+            vals.append(best)
+        rouge_l_score_val = float(sum(vals) / len(vals)) if vals else 0.0
+
+    # CIDEr (pycocoevalcap if available; else fallback TF-IDF cosine)
+    def _cider_fallback(preds: List[str], refs_list: List[List[str]], max_n=4, scale=10.0) -> float:
+        from collections import Counter
+        import math
+        def ngrams(toks, n):
+            return [tuple(toks[i:i+n]) for i in range(max(0, len(toks)-n+1))]
+        def count_ngrams(toks, max_n):
+            c = Counter()
+            for n in range(1, max_n+1):
+                c.update(ngrams(toks, n))
+            return c
+        refs_tok = [[_tok_simple(r) for r in refs] for refs in refs_list]
+        preds_tok = [_tok_simple(p) for p in preds]
+        M = max(1, len(preds_tok))
+        # DF over reference sets
+        from collections import Counter
+        df = Counter()
+        for refs in refs_tok:
+            seen = set()
+            for r in refs:
+                seen.update(count_ngrams(r, max_n=max_n).keys())
+            for ng in seen:
+                df[ng] += 1
+        idf = {ng: math.log((M + 1.0) / (df_v + 1.0)) for ng, df_v in df.items()}
+        sims = []
+        for p_tok, r_toks in zip(preds_tok, refs_tok):
+            p_counts = count_ngrams(p_tok, max_n=max_n)
+            p_vec = {ng: (c / max(1, len(p_tok))) * idf.get(ng, 0.0) for ng, c in p_counts.items()}
+            # average cosine over refs
+            ref_sims = []
+            for r_tok in r_toks:
+                r_counts = count_ngrams(r_tok, max_n=max_n)
+                r_vec = {ng: (c / max(1, len(r_tok))) * idf.get(ng, 0.0) for ng, c in r_counts.items()}
+                dot = sum(v * r_vec.get(ng, 0.0) for ng, v in p_vec.items())
+                p_norm = math.sqrt(sum(v*v for v in p_vec.values()))
+                r_norm = math.sqrt(sum(v*v for v in r_vec.values()))
+                ref_sims.append((dot / (p_norm * r_norm)) if (p_norm > 0 and r_norm > 0) else 0.0)
+            sims.append(sum(ref_sims)/len(ref_sims) if ref_sims else 0.0)
+        return float((sum(sims)/len(sims) if sims else 0.0) * scale)
+
+    try:
+        from pycocoevalcap.cider.cider import Cider
+        gts = {}
+        res = {}
+        for i, (pred, refs) in enumerate(zip(predictions, references_list)):
+            gts[i] = refs if refs else [""]
+            res[i] = [pred]
+        cider_scorer = Cider()
+        cider_score_val, _ = cider_scorer.compute_score(gts, res)
+        cider_score_val = float(cider_score_val)
+    except Exception as e:
+        logger.warning(f"CIDEr via pycocoevalcap unavailable, using fallback: {e}")
+        cider_score_val = _cider_fallback(predictions, references_list)
 
     results = {
-        "E2E_BLEU": e2e_bleu,
-        "E2E_NIST": e2e_nist,
-        "METEOR": e2e_meteor,
+        "E2E_BLEU": bleu_score_val,
+        "E2E_NIST": nist_score_val,
+        "METEOR": meteor_score_val,
+        "ROUGE_L": rouge_l_score_val,
+        "CIDEr": cider_score_val,
         "num_predictions": len(predictions),
     }
-    print("=" * 60)
-    print("E2E PYTHON EVALUATION RESULTS")
-    print("=" * 60)
-    print(json.dumps(results, indent=2))
+
+    logger.info("=" * 60)
+    logger.info("E2E PYTHON EVALUATION RESULTS (WITH BEAM RERANKING)")
+    logger.info("=" * 60)
+    logger.info(f"BLEU:     {results['E2E_BLEU']:.4f}")
+    logger.info(f"NIST:     {results['E2E_NIST']:.4f}")
+    logger.info(f"METEOR:   {results['METEOR']:.4f}")
+    logger.info(f"ROUGE-L:  {results['ROUGE_L']:.4f}")
+    logger.info(f"CIDEr:    {results['CIDEr']:.4f}")
+    logger.info("=" * 60)
+
     return results
 
+# --- REPLACE your test_model with this version (atomically saves all 5 scores) ---
+def test_model(args, model, tokenizer, test_dataloader, test_dataset):
+    """Test the model on the test set and safely store all 5 metrics to JSON."""
+    logger.info("***** Running testing *****")
+    results = evaluate_model(args, model, tokenizer, test_dataloader, test_dataset)
+    logger.info(f"Test results: {results}")
 
+    # Augment with metadata
+    out = {
+        "split": "test",
+        "timestamp": pd.Timestamp.utcnow().isoformat(),
+        "metrics": results,
+        "args": vars(args),
+    }
+
+    # Primary path
+    main_fp = os.path.join(args.output_dir, "test_results.json")
+    # Timestamped backup
+    stamp = pd.Timestamp.utcnow().strftime("%Y%m%d_%H%M%S")
+    backup_fp = os.path.join(args.output_dir, f"test_results_{stamp}.json")
+
+    # Safely write both files
+    atomic_write_json(main_fp, out)
+    atomic_write_json(backup_fp, out)
+
+    logger.info(f"Wrote results to {main_fp} and {backup_fp}")
+    return results
 
 
 # -------------------------
@@ -916,7 +980,13 @@ def main():
         base.resize_token_embeddings(len(tokenizer))
         base.config.pad_token_id = tokenizer.pad_token_id
         base.config.use_cache = False
-        lora_cfg = build_lora_config(use_dora=args.use_dora)
+        lora_cfg = build_lora_config(
+                    r=args.lora_r,
+                    alpha=args.lora_alpha,
+                    dropout=args.lora_dropout,
+                    use_dora=args.use_dora,
+                )
+
         model = get_peft_model(base, lora_cfg).to(device)
         model.print_trainable_parameters()
 
@@ -959,10 +1029,17 @@ def main():
             delimiter=" =>",
             rerank=args.e2e_rerank,
         )
+       
         out_prefix = f"{split_name}_e2e"
-        with open(os.path.join(args.output_dir, f"{out_prefix}_scores.json"), "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
-        print(f"[done] wrote {out_prefix}_scores.json")
+        out = {
+            "split": split_name,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "metrics": results,   # should include all 5 if evaluate_e2e_metrics returns them
+            "args": vars(args),
+        }
+        out_fp = os.path.join(args.output_dir, f"{out_prefix}_scores.json")
+        atomic_write_json(out_fp, out)
+        print(f"[done] wrote {out_fp}")
         return
 
     # If resuming and all epochs already completed, skip training and run default eval
