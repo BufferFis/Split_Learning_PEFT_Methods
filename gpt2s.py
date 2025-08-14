@@ -396,29 +396,27 @@ def combined_rerank_score(hyp: str, mr: str, cov_w: float = 0.45, len_w: float =
     cs  = 1.0 if is_complete_sentence(hyp) else 0.1
     return cov_w * cov + len_w * ls + comp_w * cs
 
-def enhanced_rerank_score(hyp: str, mr: str, refs: List[str], cov_w: float = 0.4, len_w: float = 0.3, ngram_w: float = 0.2, comp_w: float = 0.1) -> float:
+def enhanced_rerank_score(hyp: str, mr: str, refs: List[str],
+                          cov_w: float = 0.4, len_w: float = 0.3, ngram_w: float = 0.2, comp_w: float = 0.1) -> float:
     """Enhanced scoring with reference length matching and n-gram overlap"""
-    
-    # Slot coverage (existing)
+    # Slot coverage
     cov = slot_coverage_score_with_slotname(hyp, mr)
-    
+
     # Length matching to references
     hyp_len = len(tok_simple(hyp))
     if refs:
         ref_lens = [len(tok_simple(r)) for r in refs]
-        target_len = sum(ref_lens) / len(ref_lens)
-        
-        # Length score - penalize both too short and too long
+        target_len = sum(ref_lens) / max(1, len(ref_lens))
         if 8 <= hyp_len <= target_len * 1.3:
-            length_score = 1.0
+            len_score = 1.0
         elif hyp_len < 8:
-            length_score = hyp_len / 8
+            len_score = hyp_len / 8
         else:
-            length_score = (target_len * 1.3) / hyp_len
+            len_score = (target_len * 1.3) / max(1, hyp_len)
     else:
-        length_score = length_score(hyp, target_len=15)  # fallback
-    
-    # N-gram overlap with references (NEW - major improvement)
+        len_score = length_score(hyp, target_len=15)  # use the helper
+
+    # N-gram overlap with references
     ngram_score = 0.0
     if refs:
         hyp_tokens = set(tok_simple(hyp))
@@ -427,15 +425,12 @@ def enhanced_rerank_score(hyp: str, mr: str, refs: List[str], cov_w: float = 0.4
             if ref_tokens:
                 overlap = len(hyp_tokens & ref_tokens) / len(ref_tokens)
                 ngram_score = max(ngram_score, overlap)
-    
+
     # Completeness
     completeness = 1.0 if is_complete_sentence(hyp) else 0.2
-    
-    # Weighted combination
-    return (cov * cov_w + 
-            length_score * len_w + 
-            ngram_score * ngram_w + 
-            completeness * comp_w)
+
+    return cov_w * cov + len_w * len_score + ngram_w * ngram_score + comp_w * completeness
+
 
 
 def normalize_for_bleu(text: str) -> str:
@@ -467,7 +462,7 @@ def evaluate_e2e_metrics(
 ) -> Dict[str, float]:
     """
     E2E Python evaluation using external e2e-metrics (BLEU+NIST) + METEOR.
-    Generation is batched with a progress bar. Optional n-best reranking by slot coverage.
+    Correctly removes the ENTIRE input prompt for left-padded batches.
     """
     import sys, math
     sys.path.append("./e2e-metrics")
@@ -476,7 +471,6 @@ def evaluate_e2e_metrics(
     except Exception as e:
         print(f"[e2e] Could not import E2E metrics (BLEU/NIST). Make sure e2e-metrics repo is cloned. Error: {e}")
         print("[e2e] Falling back to simple metrics.")
-        # Fallback: simple evaluation path (now uses full decode knobs)
         hyps = generate_for_mrs(
             model, tokenizer, mrs, device,
             num_beams=num_beams,
@@ -494,19 +488,17 @@ def evaluate_e2e_metrics(
         print(json.dumps(scores, indent=2))
         return scores
 
-    # Prepare batched generation
     predictions: List[str] = []
     refs_list: List[List[str]] = []
     batches = list(range(0, len(mrs), batch_size))
     pbar = tqdm(total=len(batches), desc="E2E Generate", unit="batch", leave=False)
 
-    # Ensure left padding/truncation for decoder-only batched generation; restore after
+    # Save/override pad/trunc sides for decoder-only batched generation
     prev_pad = getattr(tokenizer, "padding_side", "right")
     prev_trunc = getattr(tokenizer, "truncation_side", "right")
     tokenizer.padding_side = "left"
     tokenizer.truncation_side = "left"
 
-    # Optional diversity knobs (CLI may or may not define them)
     beam_groups = getattr(args, "e2e_beam_groups", 1)
     diversity_penalty = getattr(args, "e2e_diversity_penalty", 0.0)
     min_new_tokens = getattr(args, "min_new_tokens", 1)
@@ -517,16 +509,14 @@ def evaluate_e2e_metrics(
             chunk = mrs[start:start + batch_size]
             prompts = [f"{mr}{delimiter}" for mr in chunk]
             enc = tokenizer(prompts, return_tensors="pt", add_special_tokens=False, padding=True)
-            input_lengths = [int(l) for l in enc["attention_mask"].sum(-1).tolist()]
+            # IMPORTANT: because we left-pad, remove **entire** input width for everyone
+            max_input_len = int(enc["input_ids"].shape[1])
             enc = {k: v.to(device) for k, v in enc.items()}
 
             if rerank:
-                # Make sure beams support n-best
                 beams = max(num_beams, nbest)
-                if beam_groups and beam_groups > 1:
-                    # Make beams a multiple of groups to satisfy HF split logic
-                    if beams % beam_groups != 0:
-                        beams = beam_groups * math.ceil(beams / beam_groups)
+                if beam_groups and beam_groups > 1 and beams % beam_groups != 0:
+                    beams = beam_groups * math.ceil(beams / beam_groups)
 
                 gen_args = dict(
                     **enc,
@@ -551,16 +541,15 @@ def evaluate_e2e_metrics(
                 out = model.generate(**gen_args)
                 seqs = out.sequences  # (batch*nbest, seq_len)
 
+                # extract generated text: drop EXACTLY the input width (works with left padding)
                 for bi, mr in enumerate(chunk):
                     start_i = bi * nbest
                     end_i = start_i + nbest
                     candidates: List[str] = []
                     for j in range(start_i, end_i):
-                        gen_ids = seqs[j, input_lengths[bi]:]
+                        gen_ids = seqs[j, max_input_len:]
                         text = normalize_ws(tokenizer.decode(gen_ids, skip_special_tokens=True).strip())
                         candidates.append(text)
-
-                    # Rerank with your enhanced scorer (uses refs for length/ngram guidance)
                     best = max(
                         candidates,
                         key=lambda c: enhanced_rerank_score(
@@ -583,8 +572,9 @@ def evaluate_e2e_metrics(
                     eos_token_id=tokenizer.eos_token_id,
                     pad_token_id=tokenizer.pad_token_id,
                 )
+                # out is (batch, seq_len). Remove full input width.
                 for bi in range(out.size(0)):
-                    gen_ids = out[bi, input_lengths[bi]:]
+                    gen_ids = out[bi, max_input_len:]
                     text = normalize_ws(tokenizer.decode(gen_ids, skip_special_tokens=True).strip())
                     predictions.append(text)
 
@@ -594,6 +584,9 @@ def evaluate_e2e_metrics(
             pbar.update(1)
     pbar.close()
 
+    # Safety: number of predictions must match number of MRs
+    assert len(predictions) == len(mrs), f"e2e: predictions={len(predictions)} != MRs={len(mrs)}"
+
     predictions = [normalize_for_bleu(p) for p in predictions]
 
     # Restore tokenizer config
@@ -601,7 +594,6 @@ def evaluate_e2e_metrics(
     tokenizer.truncation_side = prev_trunc
     model.train()
 
-    # E2E BLEU & NIST
     bleu_scorer = BLEUScore()
     nist_scorer = NISTScore()
     for pred, refs in zip(predictions, refs_list):
@@ -610,7 +602,7 @@ def evaluate_e2e_metrics(
     e2e_bleu = float(bleu_scorer.score())
     e2e_nist = float(nist_scorer.score())
 
-    # METEOR (best-of-refs)
+    # METEOR (best ref)
     if hf_evaluate is not None:
         meteor_metric = hf_evaluate.load("meteor")
         meteor_vals = []
@@ -647,6 +639,7 @@ def evaluate_e2e_metrics(
     print("=" * 60)
     print(json.dumps(results, indent=2))
     return results
+
 
 
 
