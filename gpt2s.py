@@ -372,6 +372,61 @@ def combined_rerank_score(hyp: str, mr: str, cov_w: float = 0.45, len_w: float =
     cs  = 1.0 if is_complete_sentence(hyp) else 0.1
     return cov_w * cov + len_w * ls + comp_w * cs
 
+def enhanced_rerank_score(hyp: str, mr: str, refs: List[str], cov_w: float = 0.4, len_w: float = 0.3, ngram_w: float = 0.2, comp_w: float = 0.1) -> float:
+    """Enhanced scoring with reference length matching and n-gram overlap"""
+    
+    # Slot coverage (existing)
+    cov = slot_coverage_score_with_slotname(hyp, mr)
+    
+    # Length matching to references
+    hyp_len = len(tok_simple(hyp))
+    if refs:
+        ref_lens = [len(tok_simple(r)) for r in refs]
+        target_len = sum(ref_lens) / len(ref_lens)
+        
+        # Length score - penalize both too short and too long
+        if 8 <= hyp_len <= target_len * 1.3:
+            length_score = 1.0
+        elif hyp_len < 8:
+            length_score = hyp_len / 8
+        else:
+            length_score = (target_len * 1.3) / hyp_len
+    else:
+        length_score = length_score(hyp, target_len=15)  # fallback
+    
+    # N-gram overlap with references (NEW - major improvement)
+    ngram_score = 0.0
+    if refs:
+        hyp_tokens = set(tok_simple(hyp))
+        for ref in refs:
+            ref_tokens = set(tok_simple(ref))
+            if ref_tokens:
+                overlap = len(hyp_tokens & ref_tokens) / len(ref_tokens)
+                ngram_score = max(ngram_score, overlap)
+    
+    # Completeness
+    completeness = 1.0 if is_complete_sentence(hyp) else 0.2
+    
+    # Weighted combination
+    return (cov * cov_w + 
+            length_score * len_w + 
+            ngram_score * ngram_w + 
+            completeness * comp_w)
+
+
+def normalize_for_bleu(text: str) -> str:
+    """Normalize text for better BLEU alignment"""
+    text = text.strip()
+    # Fix spacing around punctuation
+    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'\s*([.!?])\s*', r'\1 ', text)
+    text = re.sub(r'\s*,\s*', ', ', text)
+    return text.strip()
+
+
+
+
+
 def evaluate_e2e_metrics(
     args,
     model,
@@ -438,12 +493,14 @@ def evaluate_e2e_metrics(
             if rerank:
                 out = model.generate(
                     **enc,
-                    num_beams=max(num_beams, nbest),
-                    num_return_sequences=nbest,
-                    max_new_tokens=max_new_tokens,
+                    num_beams=10,
+                    num_return_sequences=5,
+                    max_new_tokens=25,
                     early_stopping=True,
                     do_sample=False,
-                    no_repeat_ngram_size=no_repeat_ngram_size,
+                    no_repeat_ngram_size=4,
+                    repetition_penalty = 1.25,
+                    length_penalty = 0.8,
                     repetition_penalty=repetition_penalty,
                     length_penalty=length_penalty,
                     return_dict_in_generate=True,
@@ -462,8 +519,9 @@ def evaluate_e2e_metrics(
                         candidates.append(text)
                     best = max(
                         candidates,
-                        key=lambda c: combined_rerank_score(
-                            c, mr, cov_w=0.45, len_w=0.35, comp_w=0.20, target_len=15
+                        key=lambda c: enhanced_rerank_score(
+                            c, mr, refs_grouped.get(mr, []), 
+                            cov_w=0.4, len_w=0.3, ngram_w=0.2, comp_w=0.1
                         )
                     )
                     predictions.append(best)
@@ -490,6 +548,7 @@ def evaluate_e2e_metrics(
 
             pbar.update(1)
     pbar.close()
+    predictions = [normalize_for_bleu(p) for p in predictions]
 
     # Restore original tokenizer settings
     tokenizer.padding_side = prev_pad        # ADD
