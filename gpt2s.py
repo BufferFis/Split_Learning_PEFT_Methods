@@ -964,7 +964,7 @@ def main():
     with open(gens_fp, "w", encoding="utf-8") as f:
         for mr, h in zip(test_mrs, hyps):
             f.write(json.dumps({"mr": mr, "hyp": h}, ensure_ascii=False) + "\n")
-    with open(os.path.join(args.output_dir, "test_scores.json"), "w", encoding="utf-8") as f):
+    with open(os.path.join(args.output_dir, "test_scores.json"), "w", encoding="utf-8") as f:
         json.dump(scores, f, indent=2, ensure_ascii=False)
     print(f"[done] wrote {gens_fp} and test_scores.json")
 
