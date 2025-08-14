@@ -287,28 +287,52 @@ def compute_rouge_l_multi(hyps: List[str], refs_list: List[List[str]]) -> float:
 # Generation and PPL eval (simple path)
 # -------------------------
 
-def generate_for_mrs(model, tokenizer, mrs: List[str], device, num_beams=10, max_new_tokens=120, delimiter=" =>", no_repeat_ngram_size=3) -> List[str]:
+def generate_for_mrs(
+    model,
+    tokenizer,
+    mrs: List[str],
+    device,
+    num_beams=10,
+    max_new_tokens=120,
+    delimiter=" =>",
+    no_repeat_ngram_size=3,
+    repetition_penalty: float = 1.0,
+    length_penalty: float = 1.0,
+    min_new_tokens: int = 1,
+    num_beam_groups: Optional[int] = None,
+    diversity_penalty: Optional[float] = None,
+) -> List[str]:
     model.eval()
     outs = []
     with torch.no_grad():
         for mr in mrs:
             prompt = f"{mr}{delimiter}"
             enc = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(device)
-            out = model.generate(
+            gen_kwargs = dict(
                 **enc,
                 num_beams=num_beams,
                 max_new_tokens=max_new_tokens,
                 early_stopping=True,
                 do_sample=False,
                 no_repeat_ngram_size=no_repeat_ngram_size,
+                repetition_penalty=repetition_penalty,
+                length_penalty=length_penalty,
+                min_new_tokens=min_new_tokens,
                 eos_token_id=tokenizer.eos_token_id,
                 pad_token_id=tokenizer.pad_token_id,
             )
+            if num_beam_groups and num_beam_groups > 1:
+                gen_kwargs["num_beam_groups"] = num_beam_groups
+                gen_kwargs["diversity_penalty"] = diversity_penalty or 0.0
+
+            out = model.generate(**gen_kwargs)
+            # remove prompt tokens
             gen_ids = out[0, enc["input_ids"].shape[1]:]
             text = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
             outs.append(normalize_ws(text))
     model.train()
     return outs
+
 
 def eval_perplexity(model: nn.Module, loader: DataLoader, device) -> float:
     model.eval()
@@ -424,9 +448,6 @@ def normalize_for_bleu(text: str) -> str:
     return text.strip()
 
 
-
-
-
 def evaluate_e2e_metrics(
     args,
     model,
@@ -448,18 +469,22 @@ def evaluate_e2e_metrics(
     E2E Python evaluation using external e2e-metrics (BLEU+NIST) + METEOR.
     Generation is batched with a progress bar. Optional n-best reranking by slot coverage.
     """
-    import sys
+    import sys, math
     sys.path.append("./e2e-metrics")
     try:
         from metrics.pymteval import BLEUScore, NISTScore
     except Exception as e:
         print(f"[e2e] Could not import E2E metrics (BLEU/NIST). Make sure e2e-metrics repo is cloned. Error: {e}")
         print("[e2e] Falling back to simple metrics.")
-        # Fallback: simple evaluation path
+        # Fallback: simple evaluation path (now uses full decode knobs)
         hyps = generate_for_mrs(
             model, tokenizer, mrs, device,
-            num_beams=num_beams, max_new_tokens=max_new_tokens,
-            delimiter=delimiter, no_repeat_ngram_size=no_repeat_ngram_size
+            num_beams=num_beams,
+            max_new_tokens=max_new_tokens,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            repetition_penalty=repetition_penalty,
+            length_penalty=length_penalty,
+            min_new_tokens=getattr(args, "min_new_tokens", 1),
         )
         refs_list = [refs_grouped.get(mr, [""]) for mr in mrs]
         bleu = compute_bleu_multi(hyps, refs_list)
@@ -469,17 +494,22 @@ def evaluate_e2e_metrics(
         print(json.dumps(scores, indent=2))
         return scores
 
-    # Generate predictions (batched) with optional reranking
+    # Prepare batched generation
     predictions: List[str] = []
     refs_list: List[List[str]] = []
     batches = list(range(0, len(mrs), batch_size))
     pbar = tqdm(total=len(batches), desc="E2E Generate", unit="batch", leave=False)
 
-    # Force left padding for decoder-only batched generation (and restore later)
+    # Ensure left padding/truncation for decoder-only batched generation; restore after
     prev_pad = getattr(tokenizer, "padding_side", "right")
     prev_trunc = getattr(tokenizer, "truncation_side", "right")
-    tokenizer.padding_side = "left"         # ADD
-    tokenizer.truncation_side = "left"      # ADD
+    tokenizer.padding_side = "left"
+    tokenizer.truncation_side = "left"
+
+    # Optional diversity knobs (CLI may or may not define them)
+    beam_groups = getattr(args, "e2e_beam_groups", 1)
+    diversity_penalty = getattr(args, "e2e_diversity_penalty", 0.0)
+    min_new_tokens = getattr(args, "min_new_tokens", 1)
 
     model.eval()
     with torch.no_grad():
@@ -491,22 +521,36 @@ def evaluate_e2e_metrics(
             enc = {k: v.to(device) for k, v in enc.items()}
 
             if rerank:
-                out = model.generate(
+                # Make sure beams support n-best
+                beams = max(num_beams, nbest)
+                if beam_groups and beam_groups > 1:
+                    # Make beams a multiple of groups to satisfy HF split logic
+                    if beams % beam_groups != 0:
+                        beams = beam_groups * math.ceil(beams / beam_groups)
+
+                gen_args = dict(
                     **enc,
-                    num_beams=10,
-                    num_return_sequences=5,
-                    max_new_tokens=25,
+                    num_beams=beams,
+                    num_return_sequences=nbest,
+                    max_new_tokens=max_new_tokens,
+                    min_new_tokens=min_new_tokens,
                     early_stopping=True,
                     do_sample=False,
-                    no_repeat_ngram_size=4,
-                    repetition_penalty = 1.25,
-                    length_penalty = 0.8,
+                    no_repeat_ngram_size=no_repeat_ngram_size,
+                    repetition_penalty=repetition_penalty,
+                    length_penalty=length_penalty,
                     return_dict_in_generate=True,
                     output_scores=False,
                     eos_token_id=tokenizer.eos_token_id,
                     pad_token_id=tokenizer.pad_token_id,
                 )
+                if beam_groups and beam_groups > 1:
+                    gen_args["num_beam_groups"] = beam_groups
+                    gen_args["diversity_penalty"] = diversity_penalty
+
+                out = model.generate(**gen_args)
                 seqs = out.sequences  # (batch*nbest, seq_len)
+
                 for bi, mr in enumerate(chunk):
                     start_i = bi * nbest
                     end_i = start_i + nbest
@@ -515,10 +559,12 @@ def evaluate_e2e_metrics(
                         gen_ids = seqs[j, input_lengths[bi]:]
                         text = normalize_ws(tokenizer.decode(gen_ids, skip_special_tokens=True).strip())
                         candidates.append(text)
+
+                    # Rerank with your enhanced scorer (uses refs for length/ngram guidance)
                     best = max(
                         candidates,
                         key=lambda c: enhanced_rerank_score(
-                            c, mr, refs_grouped.get(mr, []), 
+                            c, mr, refs_grouped.get(mr, []),
                             cov_w=0.4, len_w=0.3, ngram_w=0.2, comp_w=0.1
                         )
                     )
@@ -528,6 +574,7 @@ def evaluate_e2e_metrics(
                     **enc,
                     num_beams=num_beams,
                     max_new_tokens=max_new_tokens,
+                    min_new_tokens=min_new_tokens,
                     early_stopping=True,
                     do_sample=False,
                     no_repeat_ngram_size=no_repeat_ngram_size,
@@ -546,15 +593,15 @@ def evaluate_e2e_metrics(
 
             pbar.update(1)
     pbar.close()
+
     predictions = [normalize_for_bleu(p) for p in predictions]
 
-    # Restore original tokenizer settings
-    tokenizer.padding_side = prev_pad        # ADD
-    tokenizer.truncation_side = prev_trunc   # ADD
-
+    # Restore tokenizer config
+    tokenizer.padding_side = prev_pad
+    tokenizer.truncation_side = prev_trunc
     model.train()
 
-    # Compute BLEU & NIST via E2E Python metrics
+    # E2E BLEU & NIST
     bleu_scorer = BLEUScore()
     nist_scorer = NISTScore()
     for pred, refs in zip(predictions, refs_list):
@@ -563,7 +610,7 @@ def evaluate_e2e_metrics(
     e2e_bleu = float(bleu_scorer.score())
     e2e_nist = float(nist_scorer.score())
 
-    # METEOR: best-of-refs per MR
+    # METEOR (best-of-refs)
     if hf_evaluate is not None:
         meteor_metric = hf_evaluate.load("meteor")
         meteor_vals = []
@@ -600,6 +647,7 @@ def evaluate_e2e_metrics(
     print("=" * 60)
     print(json.dumps(results, indent=2))
     return results
+
 
 
 # -------------------------
