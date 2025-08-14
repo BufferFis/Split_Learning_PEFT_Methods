@@ -9,7 +9,10 @@ Stable GPT-2 fine-tuning on the E2E NLG dataset using Hugging Face datasets:
 - Per-step JSON logging of loss and perplexity (metrics.jsonl)
 - Periodic sanity generation on a random MR
 - Validation perplexity during training
-- Final beam-search decoding on test and multi-reference BLEU/METEOR/ROUGE-L
+- Final evaluation options:
+  - Simple metrics (BLEU/METEOR/ROUGE-L) [default]
+  - E2E Python metrics (BLEU, NIST, METEOR) with optional beam reranking (progress bars)
+
 - Checkpointing to fully resume: adapters + tokenizer + optimizer + scheduler + GradScaler (fp16) + RNG state
 - Progress bar with ETA per epoch (tqdm)
 
@@ -63,6 +66,12 @@ from tqdm.auto import tqdm
 import nltk
 from nltk.translate import bleu_score
 from nltk.translate.meteor_score import meteor_score
+
+# Optional: Hugging Face evaluate for METEOR in E2E evaluation
+try:
+    import evaluate as hf_evaluate
+except Exception:
+    hf_evaluate = None
 
 
 # -------------------------
@@ -275,7 +284,7 @@ def compute_rouge_l_multi(hyps: List[str], refs_list: List[List[str]]) -> float:
 
 
 # -------------------------
-# Generation and PPL eval
+# Generation and PPL eval (simple path)
 # -------------------------
 
 def generate_for_mrs(model, tokenizer, mrs: List[str], device, num_beams=10, max_new_tokens=120, delimiter=" =>", no_repeat_ngram_size=3) -> List[str]:
@@ -314,6 +323,207 @@ def eval_perplexity(model: nn.Module, loader: DataLoader, device) -> float:
     model.train()
     mean_loss = float(np.mean(losses)) if losses else float("inf")
     return math.exp(min(20.0, mean_loss))
+
+
+# -------------------------
+# E2E evaluation (external metrics) with optional reranking + progress bars
+# -------------------------
+
+# Slot parsing and rerank helpers (ref-free; inspired by your nosplitgpt2.py)
+_SLOT_RE = re.compile(r"\s*([a-zA-Z_]+)\s*\[(.*?)\]\s*")
+
+def parse_mr(mr: str) -> Dict[str, str]:
+    slots = {}
+    for part in mr.split(","):
+        m = _SLOT_RE.match(part.strip())
+        if m:
+            slots[m.group(1).lower()] = m.group(2)
+    return slots
+
+def is_complete_sentence(text: str) -> bool:
+    text = text.strip()
+    return len(text) > 0 and text[-1] in ".?!"
+
+def length_score(text: str, target_len: int = 15) -> float:
+    n = max(1, len(tok_simple(text)))
+    return 1.0 if n <= target_len else (target_len / n)
+
+def slot_coverage_score_with_slotname(hyp: str, mr: str) -> float:
+    slots = parse_mr(mr)
+    if not slots:
+        return 0.0
+    hyp_l = hyp.lower()
+    score = 0.0
+    total = 0
+    for name, val in slots.items():
+        val_l = val.lower().strip()
+        if not val_l:
+            continue
+        total += 1
+        if val_l in hyp_l:
+            score += 1.0
+        elif name.lower() in hyp_l:
+            score += 0.5
+    return score / total if total else 0.0
+
+def combined_rerank_score(hyp: str, mr: str, cov_w: float = 0.45, len_w: float = 0.35, comp_w: float = 0.20, target_len: int = 15) -> float:
+    cov = slot_coverage_score_with_slotname(hyp, mr)
+    ls  = length_score(hyp, target_len=target_len)
+    cs  = 1.0 if is_complete_sentence(hyp) else 0.1
+    return cov_w * cov + len_w * ls + comp_w * cs
+
+def evaluate_e2e_metrics(
+    args,
+    model,
+    tokenizer,
+    mrs: List[str],
+    refs_grouped: Dict[str, List[str]],
+    device,
+    batch_size: int,
+    num_beams: int,
+    nbest: int,
+    max_new_tokens: int,
+    no_repeat_ngram_size: int,
+    repetition_penalty: float,
+    length_penalty: float,
+    delimiter: str = " =>",
+    rerank: bool = True,
+) -> Dict[str, float]:
+    """
+    E2E Python evaluation using external e2e-metrics (BLEU+NIST) + METEOR.
+    Generation is batched with a progress bar. Optional n-best reranking by slot coverage.
+    """
+    import sys
+    sys.path.append("./e2e-metrics")
+    try:
+        from metrics.pymteval import BLEUScore, NISTScore
+    except Exception as e:
+        print(f"[e2e] Could not import E2E metrics (BLEU/NIST). Make sure e2e-metrics repo is cloned. Error: {e}")
+        print("[e2e] Falling back to simple metrics.")
+        # Fallback: simple evaluation path
+        hyps = generate_for_mrs(model, tokenizer, mrs, device, num_beams=num_beams, max_new_tokens=max_new_tokens, delimiter=delimiter, no_repeat_ngram_size=no_repeat_ngram_size)
+        refs_list = [refs_grouped.get(mr, [""]) for mr in mrs]
+        bleu = compute_bleu_multi(hyps, refs_list)
+        meteor = compute_meteor_multi(hyps, refs_list)
+        rouge_l = compute_rouge_l_multi(hyps, refs_list)
+        scores = {"BLEU": bleu, "METEOR": meteor, "ROUGE_L": rouge_l, "num_predictions": len(hyps)}
+        print(json.dumps(scores, indent=2))
+        return scores
+
+    # Generate predictions (batched) with optional reranking
+    predictions: List[str] = []
+    refs_list: List[List[str]] = []
+    batches = list(range(0, len(mrs), batch_size))
+    pbar = tqdm(total=len(batches), desc="E2E Generate", unit="batch", leave=False)
+
+    model.eval()
+    with torch.no_grad():
+        for start in batches:
+            chunk = mrs[start:start + batch_size]
+            prompts = [f"{mr}{delimiter}" for mr in chunk]
+            enc = tokenizer(prompts, return_tensors="pt", add_special_tokens=False, padding=True)
+            input_lengths = [int(l) for l in enc["attention_mask"].sum(-1).tolist()]
+            enc = {k: v.to(device) for k, v in enc.items()}
+
+            if rerank:
+                out = model.generate(
+                    **enc,
+                    num_beams=max(num_beams, nbest),
+                    num_return_sequences=nbest,
+                    max_new_tokens=max_new_tokens,
+                    early_stopping=True,
+                    do_sample=False,
+                    no_repeat_ngram_size=no_repeat_ngram_size,
+                    repetition_penalty=repetition_penalty,
+                    length_penalty=length_penalty,
+                    return_dict_in_generate=True,
+                    output_scores=False,
+                    eos_token_id=tokenizer.eos_token_id,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+                seqs = out.sequences  # (batch*nbest, seq_len)
+                for bi, mr in enumerate(chunk):
+                    start_i = bi * nbest
+                    end_i = start_i + nbest
+                    candidates: List[str] = []
+                    for j in range(start_i, end_i):
+                        gen_ids = seqs[j, input_lengths[bi]:]
+                        text = normalize_ws(tokenizer.decode(gen_ids, skip_special_tokens=True).strip())
+                        candidates.append(text)
+                    best = max(candidates, key=lambda c: combined_rerank_score(c, mr, cov_w=0.45, len_w=0.35, comp_w=0.20, target_len=15))
+                    predictions.append(best)
+            else:
+                out = model.generate(
+                    **enc,
+                    num_beams=num_beams,
+                    max_new_tokens=max_new_tokens,
+                    early_stopping=True,
+                    do_sample=False,
+                    no_repeat_ngram_size=no_repeat_ngram_size,
+                    repetition_penalty=repetition_penalty,
+                    length_penalty=length_penalty,
+                    eos_token_id=tokenizer.eos_token_id,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+                for bi in range(out.size(0)):
+                    gen_ids = out[bi, input_lengths[bi]:]
+                    text = normalize_ws(tokenizer.decode(gen_ids, skip_special_tokens=True).strip())
+                    predictions.append(text)
+
+            for mr in chunk:
+                refs_list.append(refs_grouped.get(mr, [""]))
+
+            pbar.update(1)
+    pbar.close()
+    model.train()
+
+    # Compute BLEU & NIST via E2E Python metrics
+    bleu_scorer = BLEUScore()
+    nist_scorer = NISTScore()
+    for pred, refs in zip(predictions, refs_list):
+        bleu_scorer.append(pred, refs)
+        nist_scorer.append(pred, refs)
+    e2e_bleu = float(bleu_scorer.score())
+    e2e_nist = float(nist_scorer.score())
+
+    # METEOR: best-of-refs per MR (as in your nosplit script)
+    if hf_evaluate is not None:
+        meteor_metric = hf_evaluate.load("meteor")
+        meteor_vals = []
+        for pred, refs in zip(predictions, refs_list):
+            best = 0.0
+            for ref in refs:
+                try:
+                    best = max(best, float(meteor_metric.compute(predictions=[pred], references=[ref])["meteor"]))
+                except Exception:
+                    pass
+            meteor_vals.append(best)
+        e2e_meteor = float(np.mean(meteor_vals)) if meteor_vals else 0.0
+    else:
+        # fallback with nltk
+        ensure_nltk()
+        meteor_vals = []
+        for pred, refs in zip(predictions, refs_list):
+            best = 0.0
+            for ref in refs:
+                try:
+                    best = max(best, float(meteor_score([ref], pred)))
+                except Exception:
+                    pass
+            meteor_vals.append(best)
+        e2e_meteor = float(np.mean(meteor_vals)) if meteor_vals else 0.0
+
+    results = {
+        "E2E_BLEU": e2e_bleu,
+        "E2E_NIST": e2e_nist,
+        "METEOR": e2e_meteor,
+        "num_predictions": len(predictions),
+    }
+    print("=" * 60)
+    print("E2E PYTHON EVALUATION RESULTS")
+    print("=" * 60)
+    print(json.dumps(results, indent=2))
+    return results
 
 
 # -------------------------
@@ -356,7 +566,7 @@ def save_checkpoint(model: PeftModel,
     print(f"[checkpoint] saved: {ckpt}")
     return ckpt
 
-# Add this helper near your imports or above load_checkpoint
+# Compat loader for PyTorch 2.6+ default weights_only=True
 def torch_load_compat(path, map_location="cpu"):
     """
     Compat loader for PyTorch 2.6+ where torch.load defaults to weights_only=True.
@@ -364,28 +574,22 @@ def torch_load_compat(path, map_location="cpu"):
     Falls back cleanly for older torch versions that don't accept the kwarg.
     """
     try:
-        # PyTorch 2.6+ path (explicitly disable weights_only)
         return torch.load(path, map_location=map_location, weights_only=False)
     except TypeError:
-        # Older PyTorch that doesn't support weights_only
         return torch.load(path, map_location=map_location)
 
-# Replace your existing load_checkpoint with this version
 def load_checkpoint(resume_dir: str, device):
     state_fp = os.path.join(resume_dir, "training_state.pt")
     if not os.path.exists(state_fp):
         raise FileNotFoundError(f"training_state.pt not found in {resume_dir}")
 
-    # Use the compat loader to avoid _pickle.UnpicklingError on torch 2.6+
     state = torch_load_compat(state_fp, map_location="cpu")
     base_model_name = state["base_model_name"]
 
-    # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(resume_dir, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Base model + adapters
     base_cfg = AutoConfig.from_pretrained(base_model_name)
     base = AutoModelForCausalLM.from_pretrained(base_model_name, config=base_cfg)
     base.resize_token_embeddings(len(tokenizer))
@@ -430,6 +634,8 @@ def main():
     ap.add_argument("--num_beams", type=int, default=10)
     ap.add_argument("--gen_max_new_tokens", type=int, default=100)
     ap.add_argument("--no_repeat_ngram_size", type=int, default=3)
+    ap.add_argument("--repetition_penalty", type=float, default=1.0)
+    ap.add_argument("--length_penalty", type=float, default=1.0)
     ap.add_argument("--sample_every_steps", type=int, default=100)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--fp16", action="store_true")
@@ -439,6 +645,13 @@ def main():
     ap.add_argument("--resume_from", type=str, default="", help="Path to a previous ckpt_step_xxxxxxxx directory to resume from.")
     ap.add_argument("--num_workers", type=int, default=0, help="DataLoader workers. 0 avoids forking (safer on clusters).")
     ap.add_argument("--max_grad_norm", type=float, default=0.5)   # stricter clipping
+
+    # E2E evaluation controls
+    ap.add_argument("--e2e_eval", action="store_true", help="Use E2E Python metrics (BLEU+NIST) with batched generation.")
+    ap.add_argument("--e2e_eval_split", type=str, default="test", choices=["val", "test"], help="Split to evaluate with E2E metrics.")
+    ap.add_argument("--e2e_eval_batch_size", type=int, default=8, help="Batch size for E2E evaluation.")
+    ap.add_argument("--e2e_rerank", action="store_true", help="Enable n-best reranking by MR slot coverage during E2E eval.")
+    ap.add_argument("--e2e_nbest", type=int, default=5, help="N-best candidates for E2E reranking.")
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -551,7 +764,6 @@ def main():
 
                 # Skip this micro-batch if loss is non-finite (don't call backward)
                 if not torch.isfinite(loss.detach()):
-                    # clear grads from any previous micro-batches (will handle at boundary)
                     pass
                 else:
                     if scaler.is_enabled():
@@ -648,8 +860,51 @@ def main():
             pass
 
     # -------------------------
-    # Final eval on test set
+    # Final eval
     # -------------------------
+    if args.e2e_eval:
+        print("[eval] E2E Python metrics (batched generation)...")
+        # Unique MRs preserving order for selected split
+        split_name = args.e2e_eval_split
+        split_ds = val_split if split_name == "val" else test_split
+        refs_grouped = val_refs if split_name == "val" else test_refs_grouped
+
+        seen = set()
+        eval_mrs = []
+        for ex in split_ds:
+            mr, _ = get_mr_and_refs(ex)
+            if mr not in seen:
+                seen.add(mr)
+                eval_mrs.append(mr)
+
+        results = evaluate_e2e_metrics(
+            args=args,
+            model=model,
+            tokenizer=tokenizer,
+            mrs=eval_mrs,
+            refs_grouped=refs_grouped,
+            device=device,
+            batch_size=args.e2e_eval_batch_size,
+            num_beams=args.num_beams,
+            nbest=args.e2e_nbest,
+            max_new_tokens=args.gen_max_new_tokens,
+            no_repeat_ngram_size=args.no_repeat_ngram_size,
+            repetition_penalty=args.repetition_penalty,
+            length_penalty=args.length_penalty,
+            delimiter=" =>",
+            rerank=args.e2e_rerank,
+        )
+        # Save
+        out_prefix = f"{split_name}_e2e"
+        with open(os.path.join(args.output_dir, f"{out_prefix}_scores.json"), "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+        gens_fp = os.path.join(args.output_dir, f"{out_prefix}_generations.jsonl")
+        # Note: predictions already consumed inside evaluate_e2e_metrics; if you need per-MR outputs saved,
+        # you can extend evaluate_e2e_metrics to return them as well.
+        print(f"[done] wrote {out_prefix}_scores.json")
+        return
+
+    # Default simple metrics on test set
     print("[eval] decoding test...")
     seen = set()
     test_mrs = []
@@ -670,6 +925,7 @@ def main():
     scores = {"BLEU": bleu, "METEOR": meteor, "ROUGE_L": rouge_l}
     print(json.dumps(scores, indent=2))
 
+    # Save generations and scores
     gens_fp = os.path.join(args.output_dir, "test_generations.jsonl")
     with open(gens_fp, "w", encoding="utf-8") as f:
         for mr, h in zip(test_mrs, hyps):
