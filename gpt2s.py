@@ -772,6 +772,12 @@ def main():
     ap.add_argument("--e2e_eval_batch_size", type=int, default=8, help="Batch size for E2E evaluation.")
     ap.add_argument("--e2e_rerank", action="store_true", help="Enable n-best reranking by MR slot coverage during E2E eval.")
     ap.add_argument("--e2e_nbest", type=int, default=5, help="N-best candidates for E2E reranking.")
+    ap.add_argument("--min_new_tokens", type=int, default=6)  # enforce a non-trivial output
+    ap.add_argument("--lora_r", type=int, default=16)
+    ap.add_argument("--lora_alpha", type=int, default=32)
+    ap.add_argument("--lora_dropout", type=float, default=0.1)
+    ap.add_argument("--e2e_beam_groups", type=int, default=1, help="Diverse beam groups for E2E eval.")
+    ap.add_argument("--e2e_diversity_penalty", type=float, default=0.0, help="Diversity penalty for E2E eval.")
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
