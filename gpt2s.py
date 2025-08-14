@@ -486,6 +486,272 @@ def atomic_write_json(path: str, data: dict):
         json.dump(data, f, indent=2, ensure_ascii=False)
     os.replace(tmp, path)
 
+
+def evaluate_e2e_metrics(
+    args,
+    model,
+    tokenizer,
+    mrs: List[str],
+    refs_grouped: Dict[str, List[str]],
+    device,
+    batch_size: int,
+    num_beams: int,
+    nbest: int,
+    max_new_tokens: int,
+    no_repeat_ngram_size: int,
+    repetition_penalty: float,
+    length_penalty: float,
+    delimiter: str = " =>",
+    rerank: bool = True,
+) -> Dict[str, float]:
+    import sys, math, re
+    from collections import Counter
+    sys.path.append("./e2e-metrics")
+    try:
+        from metrics.pymteval import BLEUScore, NISTScore
+        have_e2e = True
+    except Exception as e:
+        print(f"[e2e] Could not import E2E metrics (BLEU/NIST). Using Python fallback. Error: {e}")
+        have_e2e = False
+
+    def _tok_simple(s: str):
+        return re.sub(r"[^a-z0-9\s]", " ", s.lower()).split()
+
+    # Batched generation with optional reranking (uses your existing helpers/weights from args)
+    predictions: List[str] = []
+    refs_list: List[List[str]] = []
+    batches = list(range(0, len(mrs), batch_size))
+    pbar = tqdm(total=len(batches), desc="E2E Generate", unit="batch", leave=False)
+
+    prev_pad = getattr(tokenizer, "padding_side", "right")
+    prev_trunc = getattr(tokenizer, "truncation_side", "right")
+    tokenizer.padding_side = "left"
+    tokenizer.truncation_side = "left"
+
+    beam_groups = getattr(args, "e2e_beam_groups", 1)
+    diversity_penalty = getattr(args, "e2e_diversity_penalty", 0.0)
+    min_new_tokens = getattr(args, "min_new_tokens", 1)
+
+    model.eval()
+    with torch.no_grad():
+        for start in batches:
+            chunk = mrs[start:start + batch_size]
+            prompts = [f"{mr}{delimiter}" for mr in chunk]
+            enc = tokenizer(prompts, return_tensors="pt", add_special_tokens=False, padding=True)
+            max_input_len = int(enc["input_ids"].shape[1])
+            enc = {k: v.to(device) for k, v in enc.items()}
+
+            if rerank:
+                beams = max(num_beams, nbest)
+                if beam_groups and beam_groups > 1 and beams % beam_groups != 0:
+                    beams = beam_groups * math.ceil(beams / beam_groups)
+                gen_args = dict(
+                    **enc,
+                    num_beams=beams,
+                    num_return_sequences=nbest,
+                    max_new_tokens=max_new_tokens,
+                    min_new_tokens=min_new_tokens,
+                    early_stopping=True,
+                    do_sample=False,
+                    no_repeat_ngram_size=no_repeat_ngram_size,
+                    repetition_penalty=repetition_penalty,
+                    length_penalty=length_penalty,
+                    return_dict_in_generate=True,
+                    output_scores=False,
+                    eos_token_id=tokenizer.eos_token_id,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+                if beam_groups and beam_groups > 1:
+                    gen_args["num_beam_groups"] = beam_groups
+                    gen_args["diversity_penalty"] = diversity_penalty
+                out = model.generate(**gen_args)
+                seqs = out.sequences
+
+                for bi, mr in enumerate(chunk):
+                    start_i = bi * nbest
+                    end_i = start_i + nbest
+                    candidates: List[str] = []
+                    for j in range(start_i, end_i):
+                        gen_ids = seqs[j, max_input_len:]
+                        text = normalize_ws(tokenizer.decode(gen_ids, skip_special_tokens=True).strip())
+                        candidates.append(text)
+                    # Second-pass union if enabled
+                    if getattr(args, "e2e_second_pass", False):
+                        beams2 = getattr(args, "e2e_alt_num_beams", 8)
+                        nbest2 = getattr(args, "e2e_alt_nbest", 10)
+                        beam_groups2 = getattr(args, "e2e_alt_beam_groups", 1)
+                        diversity2 = getattr(args, "e2e_alt_diversity_penalty", 0.0)
+                        enc2 = tokenizer([f"{mr}{delimiter}"], return_tensors="pt", add_special_tokens=False, padding=True)
+                        max_input_len2 = int(enc2["input_ids"].shape[1])
+                        enc2 = {k: v.to(device) for k, v in enc2.items()}
+                        gen_args2 = dict(
+                            **enc2,
+                            num_beams=beams2,
+                            num_return_sequences=min(nbest2, beams2),
+                            max_new_tokens=max_new_tokens,
+                            min_new_tokens=min_new_tokens,
+                            early_stopping=True,
+                            do_sample=False,
+                            no_repeat_ngram_size=getattr(args, "e2e_alt_no_repeat_ngram_size", 4),
+                            repetition_penalty=getattr(args, "e2e_alt_repetition_penalty", 1.03),
+                            length_penalty=getattr(args, "e2e_alt_length_penalty", 1.1),
+                            return_dict_in_generate=True,
+                            output_scores=False,
+                            eos_token_id=tokenizer.eos_token_id,
+                            pad_token_id=tokenizer.pad_token_id,
+                        )
+                        if beam_groups2 and beam_groups2 > 1:
+                            gen_args2["num_beam_groups"] = beam_groups2
+                            gen_args2["diversity_penalty"] = diversity2
+                        out2 = model.generate(**gen_args2)
+                        seqs2 = out2.sequences
+                        for j in range(seqs2.size(0)):
+                            gen_ids2 = seqs2[j, max_input_len2:]
+                            text2 = normalize_ws(tokenizer.decode(gen_ids2, skip_special_tokens=True).strip())
+                            candidates.append(text2)
+
+                    best = max(
+                        candidates,
+                        key=lambda c: enhanced_rerank_score(
+                            c, mr, refs_grouped.get(mr, []),
+                            cov_w=getattr(args, "rerank_cov_w", 0.4),
+                            len_w=getattr(args, "rerank_len_w", 0.3),
+                            ngram_w=getattr(args, "rerank_ngram_w", 0.2),
+                            comp_w=getattr(args, "rerank_comp_w", 0.1),
+                        )
+                    )
+                    predictions.append(best)
+            else:
+                out = model.generate(
+                    **enc,
+                    num_beams=num_beams,
+                    max_new_tokens=max_new_tokens,
+                    min_new_tokens=min_new_tokens,
+                    early_stopping=True,
+                    do_sample=False,
+                    no_repeat_ngram_size=no_repeat_ngram_size,
+                    repetition_penalty=repetition_penalty,
+                    length_penalty=length_penalty,
+                    eos_token_id=tokenizer.eos_token_id,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+                for bi in range(out.size(0)):
+                    gen_ids = out[bi, max_input_len:]
+                    text = normalize_ws(tokenizer.decode(gen_ids, skip_special_tokens=True).strip())
+                    predictions.append(text)
+
+            for mr in chunk:
+                refs_list.append(refs_grouped.get(mr, [""]))
+            pbar.update(1)
+    pbar.close()
+
+    assert len(predictions) == len(mrs)
+    predictions = [normalize_for_bleu(p) for p in predictions]
+    tokenizer.padding_side = prev_pad
+    tokenizer.truncation_side = prev_trunc
+    model.train()
+
+    results: Dict[str, float] = {}
+
+    # BLEU/NIST
+    if have_e2e:
+        bleu_scorer = BLEUScore()
+        nist_scorer = NISTScore()
+        for pred, refs in zip(predictions, refs_list):
+            bleu_scorer.append(pred, refs)
+            nist_scorer.append(pred, refs)
+        results["E2E_BLEU"] = float(bleu_scorer.score())
+        results["E2E_NIST"] = float(nist_scorer.score())
+    else:
+        from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
+        refs_tok = [[_tok_simple(r) for r in refs] for refs in refs_list]
+        hyps_tok = [_tok_simple(h) for h in predictions]
+        smoothie = SmoothingFunction().method1
+        results["E2E_BLEU"] = float(corpus_bleu(refs_tok, hyps_tok, smoothing_function=smoothie) * 100.0)
+        try:
+            from nltk.translate.nist_score import corpus_nist
+            results["E2E_NIST"] = float(corpus_nist(refs_tok, hyps_tok, n=5))
+        except Exception:
+            results["E2E_NIST"] = 0.0
+
+    # METEOR (multi-ref average)
+    try:
+        if hf_evaluate is not None:
+            meteor_metric = hf_evaluate.load("meteor")
+            vals = []
+            for pred, refs in zip(predictions, refs_list):
+                vals.append(float(meteor_metric.compute(predictions=[pred], references=[refs])["meteor"]))
+            results["METEOR"] = float(sum(vals) / len(vals)) if vals else 0.0
+        else:
+            ensure_nltk()
+            from nltk.translate.meteor_score import meteor_score as nltk_meteor
+            vals = []
+            for pred, refs in zip(predictions, refs_list):
+                try:
+                    vals.append(float(nltk_meteor(refs, pred)))
+                except Exception:
+                    vals.append(0.0)
+            results["METEOR"] = float(sum(vals) / len(vals)) if vals else 0.0
+    except Exception as e:
+        print(f"[e2e] METEOR failed: {e}")
+        results["METEOR"] = 0.0
+
+    # ROUGE-L (best-over-ref average)
+    results["ROUGE_L"] = compute_rouge_l_multi(predictions, refs_list)
+
+    # CIDEr (pycocoevalcap if available; else TF-IDF cosine fallback)
+    def _cider_fallback(preds: List[str], refs_list: List[List[str]], max_n=4, scale=10.0) -> float:
+        def ngrams(toks, n): return [tuple(toks[i:i+n]) for i in range(max(0, len(toks)-n+1))]
+        def count_ngrams(toks, max_n):
+            c = Counter()
+            for n in range(1, max_n+1): c.update(ngrams(toks, n))
+            return c
+        refs_tok = [[_tok_simple(r) for r in refs] for refs in refs_list]
+        preds_tok = [_tok_simple(p) for p in preds]
+        M = max(1, len(preds_tok))
+        df = Counter()
+        for refs in refs_tok:
+            seen = set()
+            for r in refs:
+                seen.update(count_ngrams(r, max_n=max_n).keys())
+            for ng in seen: df[ng] += 1
+        import math
+        idf = {ng: math.log((M + 1.0) / (v + 1.0)) for ng, v in df.items()}
+        sims = []
+        for p_tok, r_toks in zip(preds_tok, refs_tok):
+            p_counts = count_ngrams(p_tok, max_n=max_n)
+            p_vec = {ng: (c / max(1, len(p_tok))) * idf.get(ng, 0.0) for ng, c in p_counts.items()}
+            ref_sims = []
+            for r_tok in r_toks:
+                r_counts = count_ngrams(r_tok, max_n=max_n)
+                r_vec = {ng: (c / max(1, len(r_tok))) * idf.get(ng, 0.0) for ng, c in r_counts.items()}
+                dot = sum(v * r_vec.get(ng, 0.0) for ng, v in p_vec.items())
+                p_norm = math.sqrt(sum(v*v for v in p_vec.values()))
+                r_norm = math.sqrt(sum(v*v for v in r_vec.values()))
+                ref_sims.append((dot / (p_norm * r_norm)) if (p_norm > 0 and r_norm > 0) else 0.0)
+            sims.append(sum(ref_sims)/len(ref_sims) if ref_sims else 0.0)
+        return float((sum(sims)/len(sims) if sims else 0.0) * scale)
+    try:
+        from pycocoevalcap.cider.cider import Cider
+        gts, res = {}, {}
+        for i, (pred, refs) in enumerate(zip(predictions, refs_list)):
+            gts[i] = refs if refs else [""]
+            res[i] = [pred]
+        cider_scorer = Cider()
+        score, _ = cider_scorer.compute_score(gts, res)
+        results["CIDEr"] = float(score)
+    except Exception as e:
+        print(f"[e2e] CIDEr unavailable, using fallback: {e}")
+        results["CIDEr"] = _cider_fallback(predictions, refs_list)
+
+    results["num_predictions"] = len(predictions)
+    print("=" * 60)
+    print("E2E PYTHON EVALUATION RESULTS")
+    print("=" * 60)
+    print(json.dumps(results, indent=2))
+    return results
+
+
 # --- REPLACE your evaluate_model with this version (returns all 5 scores: BLEU, NIST, METEOR, ROUGE_L, CIDEr) ---
 def evaluate_model(args, model, tokenizer, eval_dataloader, eval_dataset):
     """Evaluate using E2E Python implementation with beam reranking and compute 5 metrics."""
