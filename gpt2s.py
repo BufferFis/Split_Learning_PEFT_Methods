@@ -548,6 +548,7 @@ def save_checkpoint(model: PeftModel,
     tokenizer.save_pretrained(ckpt)
     state = {
         "global_step": int(global_step),
+        # IMPORTANT: store count of completed epochs
         "epoch": int(epoch),
         "base_model_name": base_model_name,
         "optimizer": optimizer.state_dict(),
@@ -670,14 +671,16 @@ def main():
 
     # Tokenizer/model (load or build)
     global_step = 0
+    # start_epoch stores "completed epochs" count
     start_epoch = 0
 
     if args.resume_from:
         model, tokenizer, state = load_checkpoint(args.resume_from, device)
         base_model_name = state.get("base_model_name", args.model_name)
         global_step = int(state.get("global_step", 0))
+        # state["epoch"] is stored as "completed epochs"
         start_epoch = int(state.get("epoch", 0))
-        print(f"[resume] from {args.resume_from} (step={global_step}, epoch={start_epoch})")
+        print(f"[resume] from {args.resume_from} (global_step={global_step}, completed_epochs={start_epoch})")
     else:
         base_model_name = args.model_name
         tokenizer = AutoTokenizer.from_pretrained(base_model_name, use_fast=True)
@@ -698,6 +701,77 @@ def main():
     val_ds   = E2ETrainDataset(val_pairs, tokenizer, max_source_len=128, max_target_len=128)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collator, num_workers=args.num_workers, pin_memory=True)
     val_loader   = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collator, num_workers=args.num_workers, pin_memory=True)
+
+    # EARLY EVAL-ONLY PATH: if user asked for E2E evaluation, skip training entirely
+    if args.e2e_eval:
+        print("[eval-only] E2E Python metrics (batched generation)...")
+        split_name = args.e2e_eval_split
+        split_ds = val_split if split_name == "val" else test_split
+        refs_grouped = val_refs if split_name == "val" else test_refs_grouped
+
+        seen = set()
+        eval_mrs = []
+        for ex in split_ds:
+            mr, _ = get_mr_and_refs(ex)
+            if mr not in seen:
+                seen.add(mr)
+                eval_mrs.append(mr)
+
+        results = evaluate_e2e_metrics(
+            args=args,
+            model=model,
+            tokenizer=tokenizer,
+            mrs=eval_mrs,
+            refs_grouped=refs_grouped,
+            device=device,
+            batch_size=args.e2e_eval_batch_size,
+            num_beams=args.num_beams,
+            nbest=args.e2e_nbest,
+            max_new_tokens=args.gen_max_new_tokens,
+            no_repeat_ngram_size=args.no_repeat_ngram_size,
+            repetition_penalty=args.repetition_penalty,
+            length_penalty=args.length_penalty,
+            delimiter=" =>",
+            rerank=args.e2e_rerank,
+        )
+        out_prefix = f"{split_name}_e2e"
+        with open(os.path.join(args.output_dir, f"{out_prefix}_scores.json"), "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+        print(f"[done] wrote {out_prefix}_scores.json")
+        return
+
+    # If resuming and all epochs already completed, skip training and run default eval
+    if start_epoch >= args.num_epochs:
+        print(f"[resume] Completed epochs ({start_epoch}) >= num_epochs ({args.num_epochs}). Skipping training.")
+        # Default simple metrics on test set
+        print("[eval] decoding test...")
+        seen = set()
+        test_mrs = []
+        for ex in test_split:
+            mr, _ = get_mr_and_refs(ex)
+            if mr not in seen:
+                seen.add(mr)
+                test_mrs.append(mr)
+
+        hyps = generate_for_mrs(model, tokenizer, test_mrs, device, num_beams=args.num_beams, max_new_tokens=args.gen_max_new_tokens, no_repeat_ngram_size=args.no_repeat_ngram_size)
+        refs_grouped = test_refs_grouped
+        refs_list = [refs_grouped.get(mr, [""]) for mr in test_mrs]
+
+        print("[eval] computing BLEU/METEOR/ROUGE-L ...")
+        bleu = compute_bleu_multi(hyps, refs_list)
+        meteor = compute_meteor_multi(hyps, refs_list)
+        rouge_l = compute_rouge_l_multi(hyps, refs_list)
+        scores = {"BLEU": bleu, "METEOR": meteor, "ROUGE_L": rouge_l}
+        print(json.dumps(scores, indent=2))
+
+        gens_fp = os.path.join(args.output_dir, "test_generations.jsonl")
+        with open(gens_fp, "w", encoding="utf-8") as f:
+            for mr, h in zip(test_mrs, hyps):
+                f.write(json.dumps({"mr": mr, "hyp": h}, ensure_ascii=False) + "\n")
+        with open(os.path.join(args.output_dir, "test_scores.json"), "w", encoding="utf-8") as f:
+            json.dump(scores, f, indent=2, ensure_ascii=False)
+        print(f"[done] wrote {gens_fp} and test_scores.json")
+        return
 
     # Optimizer/scheduler/scaler
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay, eps=args.adam_eps)
@@ -745,6 +819,7 @@ def main():
     running_sum = 0.0     # sum of finite losses in last window
     running_count = 0     # number of finite steps in last window
     try:
+        # epoch index loops from completed_epochs to num_epochs-1
         for epoch in range(start_epoch, args.num_epochs):
             steps_this_epoch = len(train_loader) // max(1, args.gradient_accumulation_steps)
             pbar = tqdm(total=steps_this_epoch, desc=f"Epoch {epoch+1}/{args.num_epochs}", unit="step", leave=False)
@@ -837,6 +912,7 @@ def main():
                             log_jsonl({"phase": "val", "epoch": epoch+1, "step": global_step, "loss": float(val_loss), "ppl": float(val_ppl)})
 
                         if args.save_steps > 0 and global_step % args.save_steps == 0:
+                            # mid-epoch: save current completed epochs count (= epoch)
                             save_checkpoint(model, tokenizer, optimizer, scheduler, scaler, args.output_dir, global_step, epoch, base_model_name)
                     else:
                         # No finite backward accumulated in this window; just clear grads without stepping/scheduler
@@ -850,7 +926,8 @@ def main():
                 pbar.close()
             except Exception:
                 pass
-            save_checkpoint(model, tokenizer, optimizer, scheduler, scaler, args.output_dir, global_step, epoch, base_model_name)
+            # end-of-epoch: save completed epochs count (= epoch + 1)
+            save_checkpoint(model, tokenizer, optimizer, scheduler, scaler, args.output_dir, global_step, epoch+1, base_model_name)
             log_jsonl({"phase": "epoch_end", "epoch": epoch+1, "step": global_step})
 
     finally:
@@ -860,51 +937,8 @@ def main():
             pass
 
     # -------------------------
-    # Final eval
+    # Final eval (simple metrics on test)
     # -------------------------
-    if args.e2e_eval:
-        print("[eval] E2E Python metrics (batched generation)...")
-        # Unique MRs preserving order for selected split
-        split_name = args.e2e_eval_split
-        split_ds = val_split if split_name == "val" else test_split
-        refs_grouped = val_refs if split_name == "val" else test_refs_grouped
-
-        seen = set()
-        eval_mrs = []
-        for ex in split_ds:
-            mr, _ = get_mr_and_refs(ex)
-            if mr not in seen:
-                seen.add(mr)
-                eval_mrs.append(mr)
-
-        results = evaluate_e2e_metrics(
-            args=args,
-            model=model,
-            tokenizer=tokenizer,
-            mrs=eval_mrs,
-            refs_grouped=refs_grouped,
-            device=device,
-            batch_size=args.e2e_eval_batch_size,
-            num_beams=args.num_beams,
-            nbest=args.e2e_nbest,
-            max_new_tokens=args.gen_max_new_tokens,
-            no_repeat_ngram_size=args.no_repeat_ngram_size,
-            repetition_penalty=args.repetition_penalty,
-            length_penalty=args.length_penalty,
-            delimiter=" =>",
-            rerank=args.e2e_rerank,
-        )
-        # Save
-        out_prefix = f"{split_name}_e2e"
-        with open(os.path.join(args.output_dir, f"{out_prefix}_scores.json"), "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
-        gens_fp = os.path.join(args.output_dir, f"{out_prefix}_generations.jsonl")
-        # Note: predictions already consumed inside evaluate_e2e_metrics; if you need per-MR outputs saved,
-        # you can extend evaluate_e2e_metrics to return them as well.
-        print(f"[done] wrote {out_prefix}_scores.json")
-        return
-
-    # Default simple metrics on test set
     print("[eval] decoding test...")
     seen = set()
     test_mrs = []
@@ -930,7 +964,7 @@ def main():
     with open(gens_fp, "w", encoding="utf-8") as f:
         for mr, h in zip(test_mrs, hyps):
             f.write(json.dumps({"mr": mr, "hyp": h}, ensure_ascii=False) + "\n")
-    with open(os.path.join(args.output_dir, "test_scores.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(args.output_dir, "test_scores.json"), "w", encoding="utf-8") as f):
         json.dump(scores, f, indent=2, ensure_ascii=False)
     print(f"[done] wrote {gens_fp} and test_scores.json")
 
