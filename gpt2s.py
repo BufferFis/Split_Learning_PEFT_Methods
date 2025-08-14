@@ -443,6 +443,42 @@ def normalize_for_bleu(text: str) -> str:
     return text.strip()
 
 
+
+def _norm_for_cov(s: str) -> str:
+    s = s.lower()
+    s = s.replace("-", " ")
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _tokset(s: str):
+    return set(t for t in _norm_for_cov(s).split() if t)
+
+# Replace slot_coverage_score_with_slotname with a token-level match:
+def slot_coverage_score_with_slotname(hyp: str, mr: str) -> float:
+    slots = parse_mr(mr)
+    if not slots:
+        return 0.0
+    hyp_toks = _tokset(hyp)
+    score = 0.0
+    total = 0
+    for name, val in slots.items():
+        val_toks = _tokset(val)
+        if not val_toks:
+            continue
+        total += 1
+        # full token-set inclusion yields 1.0; partial overlap yields 0.5
+        if val_toks.issubset(hyp_toks):
+            score += 1.0
+        else:
+            name_hit = (name.lower() in hyp.lower())
+            overlap = len(val_toks & hyp_toks) / max(1, len(val_toks))
+            if overlap >= 0.5 or name_hit:
+                score += 0.5
+    return score / total if total else 0.0
+
+
+
 def evaluate_e2e_metrics(
     args,
     model,
@@ -550,11 +586,54 @@ def evaluate_e2e_metrics(
                         gen_ids = seqs[j, max_input_len:]
                         text = normalize_ws(tokenizer.decode(gen_ids, skip_special_tokens=True).strip())
                         candidates.append(text)
+                    
+                    # Second pass (optional): union with an alternate decode setting
+                    if getattr(args, "e2e_second_pass", False):
+                        beams2 = getattr(args, "e2e_alt_num_beams", 8)
+                        nbest2 = getattr(args, "e2e_alt_nbest", 10)
+                        beam_groups2 = getattr(args, "e2e_alt_beam_groups", 1)
+                        diversity2 = getattr(args, "e2e_alt_diversity_penalty", 0.0)
+                        # Build one-example inputs to keep memory in check
+                        enc2 = tokenizer([f"{mr}{delimiter}"], return_tensors="pt", add_special_tokens=False, padding=True)
+                        max_input_len2 = int(enc2["input_ids"].shape[1])
+                        enc2 = {k: v.to(device) for k, v in enc2.items()}
+                        gen_args2 = dict(
+                            **enc2,
+                            num_beams=beams2,
+                            num_return_sequences=nbest2,
+                            max_new_tokens=max_new_tokens,
+                            min_new_tokens=min_new_tokens,
+                            early_stopping=True,
+                            do_sample=False,
+                            no_repeat_ngram_size=getattr(args, "e2e_alt_no_repeat_ngram_size", 4),
+                            repetition_penalty=getattr(args, "e2e_alt_repetition_penalty", 1.03),
+                            length_penalty=getattr(args, "e2e_alt_length_penalty", 1.1),
+                            return_dict_in_generate=True,
+                            output_scores=False,
+                            eos_token_id=tokenizer.eos_token_id,
+                            pad_token_id=tokenizer.pad_token_id,
+                        )
+                        if beam_groups2 and beam_groups2 > 1:
+                            gen_args2["num_beam_groups"] = beam_groups2
+                            gen_args2["diversity_penalty"] = diversity2
+                        out2 = model.generate(**gen_args2)
+                        seqs2 = out2.sequences  # (nbest2, seq_len)
+                        for j in range(seqs2.size(0)):
+                            gen_ids2 = seqs2[j, max_input_len2:]
+                            text2 = normalize_ws(tokenizer.decode(gen_ids2, skip_special_tokens=True).strip())
+                            candidates.append(text2)
+                    
+                    
+                    
+                    # Rerank with tunable weights
                     best = max(
                         candidates,
                         key=lambda c: enhanced_rerank_score(
                             c, mr, refs_grouped.get(mr, []),
-                            cov_w=0.4, len_w=0.3, ngram_w=0.2, comp_w=0.1
+                            cov_w=getattr(args, "rerank_cov_w", 0.4),
+                            len_w=getattr(args, "rerank_len_w", 0.3),
+                            ngram_w=getattr(args, "rerank_ngram_w", 0.2),
+                            comp_w=getattr(args, "rerank_comp_w", 0.1),
                         )
                     )
                     predictions.append(best)
@@ -778,6 +857,24 @@ def main():
     ap.add_argument("--lora_dropout", type=float, default=0.1)
     ap.add_argument("--e2e_beam_groups", type=int, default=1, help="Diverse beam groups for E2E eval.")
     ap.add_argument("--e2e_diversity_penalty", type=float, default=0.0, help="Diversity penalty for E2E eval.")
+    
+    # 2) Add CLI for reranker weights + optional second-pass decode (in argparse)
+    ap.add_argument("--rerank_cov_w", type=float, default=0.4)
+    ap.add_argument("--rerank_len_w", type=float, default=0.3)
+    ap.add_argument("--rerank_ngram_w", type=float, default=0.2)
+    ap.add_argument("--rerank_comp_w", type=float, default=0.1)
+
+    # Optional "second-pass" decode to union candidates
+    ap.add_argument("--e2e_second_pass", action="store_true", help="Union candidates from an alternate decode setting.")
+    ap.add_argument("--e2e_alt_num_beams", type=int, default=8)
+    ap.add_argument("--e2e_alt_nbest", type=int, default=10)
+    ap.add_argument("--e2e_alt_no_repeat_ngram_size", type=int, default=4)
+    ap.add_argument("--e2e_alt_length_penalty", type=float, default=1.1)
+    ap.add_argument("--e2e_alt_repetition_penalty", type=float, default=1.03)
+    ap.add_argument("--e2e_alt_beam_groups", type=int, default=4)
+    ap.add_argument("--e2e_alt_diversity_penalty", type=float, default=0.15)
+
+
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
