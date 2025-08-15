@@ -736,22 +736,21 @@ def evaluate_e2e_metrics(
 
     # METEOR (unchanged)
     try:
-        if hf_evaluate is not None:
+        impl = getattr(args, "meteor_impl", "nltk")
+        vals = []
+        if impl == "hf" and hf_evaluate is not None:
             meteor_metric = hf_evaluate.load("meteor")
-            vals = []
             for pred, refs in zip(predictions, refs_list):
                 vals.append(float(meteor_metric.compute(predictions=[pred], references=[refs])["meteor"]))
-            results["METEOR"] = float(sum(vals) / len(vals)) if vals else 0.0
         else:
             ensure_nltk()
             from nltk.translate.meteor_score import meteor_score as nltk_meteor
-            vals = []
             for pred, refs in zip(predictions, refs_list):
                 try:
                     vals.append(float(nltk_meteor(refs, pred)))
                 except Exception:
                     vals.append(0.0)
-            results["METEOR"] = float(sum(vals) / len(vals)) if vals else 0.0
+        results["METEOR"] = float(sum(vals) / len(vals)) if vals else 0.0
     except Exception as e:
         print(f"[e2e] METEOR failed: {e}")
         results["METEOR"] = 0.0
