@@ -1326,6 +1326,31 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collator, num_workers=args.num_workers, pin_memory=True)
     val_loader   = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collator, num_workers=args.num_workers, pin_memory=True)
 
+    if args.ppl:
+        if not args.resume_from:
+            raise ValueError("--ppl requires --resume_from to load a trained model.")
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"[PPL] Loading model from {args.resume_from}...")
+        model, tokenizer, state = load_checkpoint(args.resume_from, device)
+
+        # Load test set
+        _, _, test_split = load_e2e_hf(args.dataset_name)
+        test_pairs = flatten_pairs(test_split)
+        collator = PadCollator(pad_token_id=tokenizer.pad_token_id)
+        test_ds = E2ETrainDataset(test_pairs, tokenizer, max_source_len=128, max_target_len=128)
+
+        # Take subset
+        from torch.utils.data import Subset
+        few_test_ds = Subset(test_ds, list(range(min(args.ppl_subset, len(test_ds)))))
+        few_test_loader = DataLoader(few_test_ds, batch_size=2, shuffle=False, collate_fn=collator)
+
+        # Compute PPL
+        ppl_value = eval_perplexity(model, few_test_loader, device)
+        print(f"[PPL] Perplexity on {len(few_test_ds)} test examples: {ppl_value:.2f}")
+        return
+
+
     # EARLY EVAL-ONLY PATH: if user asked for E2E evaluation, skip training entirely
     if args.e2e_eval:
         print("[eval-only] E2E Python metrics (batched generation)...")
