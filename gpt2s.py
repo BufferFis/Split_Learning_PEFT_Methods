@@ -610,17 +610,29 @@ def evaluate_e2e_metrics(
                             text2 = normalize_ws(tokenizer.decode(gen_ids2, skip_special_tokens=True).strip())
                             candidates.append(text2)
 
-                    best = max(
-                        candidates,
-                        key=lambda c: enhanced_rerank_score(
-                            c, mr, refs_grouped.get(mr, []),
-                            cov_w=getattr(args, "rerank_cov_w", 0.4),
-                            len_w=getattr(args, "rerank_len_w", 0.3),
-                            ngram_w=getattr(args, "rerank_ngram_w", 0.2),
-                            comp_w=getattr(args, "rerank_comp_w", 0.1),
+                    if getattr(args, "rerank_use_refs", False):
+                        best = max(
+                            candidates,
+                            key=lambda c: enhanced_rerank_score(
+                                c, mr, refs_grouped.get(mr, []),
+                                cov_w=getattr(args, "rerank_cov_w", 0.4),
+                                len_w=getattr(args, "rerank_len_w", 0.3),
+                                ngram_w=getattr(args, "rerank_ngram_w", 0.2),
+                                comp_w=getattr(args, "rerank_comp_w", 0.1),
+                            )
                         )
-                    )
-                    predictions.append(best)
+                    # REF-FREE (DEFAULT; no leakage)
+                    else:
+                        best = max(
+                            candidates,
+                            key=lambda c: combined_rerank_score(
+                                c, mr,
+                                cov_w=getattr(args, "rerank_cov_w", 0.4),
+                                len_w=getattr(args, "rerank_len_w", 0.3),
+                                comp_w=getattr(args, "rerank_comp_w", 0.1),
+                                target_len=15,
+                            )
+                        )
             else:
                 out = model.generate(
                     **enc,
@@ -1203,7 +1215,8 @@ def main():
     ap.add_argument("--e2e_alt_repetition_penalty", type=float, default=1.03)
     ap.add_argument("--e2e_alt_beam_groups", type=int, default=4)
     ap.add_argument("--e2e_alt_diversity_penalty", type=float, default=0.15)
-
+    ap.add_argument("--rerank_use_refs", action="store_true",
+                help="If set, reranker may use references (inflates reference-based metrics). Default: ref-free.")
 
     args = ap.parse_args()
 
