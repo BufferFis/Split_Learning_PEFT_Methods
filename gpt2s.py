@@ -1264,6 +1264,10 @@ def main():
     ap.add_argument("--rerank_use_refs", action="store_true",
                 help="If set, reranker may use references (inflates reference-based metrics). Default: ref-free.")
 
+    ap.add_argument("--ppl", action="store_true", help="Run quick perplexity eval on a few test examples and exit.")
+    ap.add_argument("--ppl_subset", type=int, default=10, help="Number of test examples to use for quick PPL.")
+
+
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
