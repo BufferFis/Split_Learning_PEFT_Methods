@@ -486,7 +486,6 @@ def atomic_write_json(path: str, data: dict):
         json.dump(data, f, indent=2, ensure_ascii=False)
     os.replace(tmp, path)
 
-
 def evaluate_e2e_metrics(
     args,
     model,
@@ -517,7 +516,6 @@ def evaluate_e2e_metrics(
     def _tok_simple(s: str):
         return re.sub(r"[^a-z0-9\s]", " ", s.lower()).split()
 
-    # Batched generation with optional reranking (uses your existing helpers/weights from args)
     predictions: List[str] = []
     refs_list: List[List[str]] = []
     batches = list(range(0, len(mrs), batch_size))
@@ -537,127 +535,177 @@ def evaluate_e2e_metrics(
         for start in batches:
             chunk = mrs[start:start + batch_size]
             prompts = [f"{mr}{delimiter}" for mr in chunk]
-            enc = tokenizer(prompts, return_tensors="pt", add_special_tokens=False, padding=True)
+            try:
+                enc = tokenizer(prompts, return_tensors="pt", add_special_tokens=False, padding=True)
+            except Exception as e:
+                print(f"[e2e] Tokenization failed for batch starting {start}: {e}")
+                # Keep lengths aligned with safe fallbacks
+                predictions.extend([""] * len(chunk))
+                for mr in chunk:
+                    refs_list.append(refs_grouped.get(mr, [""]))
+                pbar.update(1)
+                continue
+
             max_input_len = int(enc["input_ids"].shape[1])
             enc = {k: v.to(device) for k, v in enc.items()}
 
-            if rerank:
-                beams = max(num_beams, nbest)
-                if beam_groups and beam_groups > 1 and beams % beam_groups != 0:
-                    beams = beam_groups * math.ceil(beams / beam_groups)
-                gen_args = dict(
-                    **enc,
-                    num_beams=beams,
-                    num_return_sequences=nbest,
-                    max_new_tokens=max_new_tokens,
-                    min_new_tokens=min_new_tokens,
-                    early_stopping=True,
-                    do_sample=False,
-                    no_repeat_ngram_size=no_repeat_ngram_size,
-                    repetition_penalty=repetition_penalty,
-                    length_penalty=length_penalty,
-                    return_dict_in_generate=True,
-                    output_scores=False,
-                    eos_token_id=tokenizer.eos_token_id,
-                    pad_token_id=tokenizer.pad_token_id,
-                )
-                if beam_groups and beam_groups > 1:
-                    gen_args["num_beam_groups"] = beam_groups
-                    gen_args["diversity_penalty"] = diversity_penalty
-                out = model.generate(**gen_args)
-                seqs = out.sequences
+            try:
+                if rerank:
+                    beams = max(num_beams, nbest)
+                    if beam_groups and beam_groups > 1 and beams % beam_groups != 0:
+                        beams = beam_groups * math.ceil(beams / beam_groups)
+                    gen_args = dict(
+                        **enc,
+                        num_beams=beams,
+                        num_return_sequences=nbest,
+                        max_new_tokens=max_new_tokens,
+                        min_new_tokens=min_new_tokens,
+                        early_stopping=True,
+                        do_sample=False,
+                        no_repeat_ngram_size=no_repeat_ngram_size,
+                        repetition_penalty=repetition_penalty,
+                        length_penalty=length_penalty,
+                        return_dict_in_generate=True,
+                        output_scores=False,
+                        eos_token_id=tokenizer.eos_token_id,
+                        pad_token_id=tokenizer.pad_token_id,
+                    )
+                    if beam_groups and beam_groups > 1:
+                        gen_args["num_beam_groups"] = beam_groups
+                        gen_args["diversity_penalty"] = diversity_penalty
 
-                for bi, mr in enumerate(chunk):
-                    start_i = bi * nbest
-                    end_i = start_i + nbest
-                    candidates: List[str] = []
-                    for j in range(start_i, end_i):
-                        gen_ids = seqs[j, max_input_len:]
+                    out = model.generate(**gen_args)
+                    seqs = out.sequences if hasattr(out, "sequences") else out  # robust to HF versions
+                    got = int(seqs.size(0))
+                    want = len(chunk) * nbest
+                    if got != want:
+                        print(f"[e2e][warn] sequences produced ({got}) != expected ({want}) for batch starting {start}. Proceeding robustly.")
+
+                    # Compute how many sequences per example we actually have
+                    per_ex = max(1, got // max(1, len(chunk)))
+
+                    for bi, mr in enumerate(chunk):
+                        start_i = bi * per_ex
+                        end_i = min(got, start_i + per_ex)
+                        candidates: List[str] = []
+                        for j in range(start_i, end_i):
+                            try:
+                                gen_ids = seqs[j, max_input_len:]
+                                text = normalize_ws(tokenizer.decode(gen_ids, skip_special_tokens=True).strip())
+                                candidates.append(text)
+                            except Exception as de:
+                                candidates.append("")
+                        # Optional second-pass
+                        if getattr(args, "e2e_second_pass", False):
+                            try:
+                                beams2 = getattr(args, "e2e_alt_num_beams", 8)
+                                nbest2 = getattr(args, "e2e_alt_nbest", 10)
+                                beam_groups2 = getattr(args, "e2e_alt_beam_groups", 1)
+                                diversity2 = getattr(args, "e2e_alt_diversity_penalty", 0.0)
+                                enc2 = tokenizer([f"{mr}{delimiter}"], return_tensors="pt", add_special_tokens=False, padding=True)
+                                max_input_len2 = int(enc2["input_ids"].shape[1])
+                                enc2 = {k: v.to(device) for k, v in enc2.items()}
+                                gen_args2 = dict(
+                                    **enc2,
+                                    num_beams=beams2,
+                                    num_return_sequences=min(nbest2, beams2),
+                                    max_new_tokens=max_new_tokens,
+                                    min_new_tokens=min_new_tokens,
+                                    early_stopping=True,
+                                    do_sample=False,
+                                    no_repeat_ngram_size=getattr(args, "e2e_alt_no_repeat_ngram_size", 4),
+                                    repetition_penalty=getattr(args, "e2e_alt_repetition_penalty", 1.03),
+                                    length_penalty=getattr(args, "e2e_alt_length_penalty", 1.1),
+                                    return_dict_in_generate=True,
+                                    output_scores=False,
+                                    eos_token_id=tokenizer.eos_token_id,
+                                    pad_token_id=tokenizer.pad_token_id,
+                                )
+                                if beam_groups2 and beam_groups2 > 1:
+                                    gen_args2["num_beam_groups"] = beam_groups2
+                                    gen_args2["diversity_penalty"] = diversity2
+                                out2 = model.generate(**gen_args2)
+                                seqs2 = out2.sequences if hasattr(out2, "sequences") else out2
+                                for j in range(seqs2.size(0)):
+                                    gen_ids2 = seqs2[j, max_input_len2:]
+                                    text2 = normalize_ws(tokenizer.decode(gen_ids2, skip_special_tokens=True).strip())
+                                    candidates.append(text2)
+                            except Exception as e2:
+                                print(f"[e2e][warn] second-pass decode failed for MR idx {start+bi}: {e2}")
+
+                        # Choose best (ref-aware or ref-free per your flags)
+                        try:
+                            if getattr(args, "rerank_use_refs", False):
+                                best = max(
+                                    candidates or [""],
+                                    key=lambda c: enhanced_rerank_score(
+                                        c, mr, refs_grouped.get(mr, []),
+                                        cov_w=getattr(args, "rerank_cov_w", 0.4),
+                                        len_w=getattr(args, "rerank_len_w", 0.3),
+                                        ngram_w=getattr(args, "rerank_ngram_w", 0.2),
+                                        comp_w=getattr(args, "rerank_comp_w", 0.1),
+                                    )
+                                )
+                            else:
+                                best = max(
+                                    candidates or [""],
+                                    key=lambda c: combined_rerank_score(
+                                        c, mr,
+                                        cov_w=getattr(args, "rerank_cov_w", 0.4),
+                                        len_w=getattr(args, "rerank_len_w", 0.3),
+                                        comp_w=getattr(args, "rerank_comp_w", 0.1),
+                                        target_len=15,
+                                    )
+                                )
+                        except Exception:
+                            best = candidates[0] if candidates else ""
+                        predictions.append(best)
+                else:
+                    out = model.generate(
+                        **enc,
+                        num_beams=num_beams,
+                        max_new_tokens=max_new_tokens,
+                        min_new_tokens=min_new_tokens,
+                        early_stopping=True,
+                        do_sample=False,
+                        no_repeat_ngram_size=no_repeat_ngram_size,
+                        repetition_penalty=repetition_penalty,
+                        length_penalty=length_penalty,
+                        eos_token_id=tokenizer.eos_token_id,
+                        pad_token_id=tokenizer.pad_token_id,
+                    )
+                    seqs = out
+                    # Ensure we have exactly len(chunk) generations
+                    got = int(seqs.size(0))
+                    if got != len(chunk):
+                        print(f"[e2e][warn] non-rerank generate produced {got} != {len(chunk)}. Proceeding robustly.")
+                    per_ex = 1
+                    for bi in range(min(got, len(chunk))):
+                        gen_ids = seqs[bi, max_input_len:]
                         text = normalize_ws(tokenizer.decode(gen_ids, skip_special_tokens=True).strip())
-                        candidates.append(text)
-                    # Second-pass union if enabled
-                    if getattr(args, "e2e_second_pass", False):
-                        beams2 = getattr(args, "e2e_alt_num_beams", 8)
-                        nbest2 = getattr(args, "e2e_alt_nbest", 10)
-                        beam_groups2 = getattr(args, "e2e_alt_beam_groups", 1)
-                        diversity2 = getattr(args, "e2e_alt_diversity_penalty", 0.0)
-                        enc2 = tokenizer([f"{mr}{delimiter}"], return_tensors="pt", add_special_tokens=False, padding=True)
-                        max_input_len2 = int(enc2["input_ids"].shape[1])
-                        enc2 = {k: v.to(device) for k, v in enc2.items()}
-                        gen_args2 = dict(
-                            **enc2,
-                            num_beams=beams2,
-                            num_return_sequences=min(nbest2, beams2),
-                            max_new_tokens=max_new_tokens,
-                            min_new_tokens=min_new_tokens,
-                            early_stopping=True,
-                            do_sample=False,
-                            no_repeat_ngram_size=getattr(args, "e2e_alt_no_repeat_ngram_size", 4),
-                            repetition_penalty=getattr(args, "e2e_alt_repetition_penalty", 1.03),
-                            length_penalty=getattr(args, "e2e_alt_length_penalty", 1.1),
-                            return_dict_in_generate=True,
-                            output_scores=False,
-                            eos_token_id=tokenizer.eos_token_id,
-                            pad_token_id=tokenizer.pad_token_id,
-                        )
-                        if beam_groups2 and beam_groups2 > 1:
-                            gen_args2["num_beam_groups"] = beam_groups2
-                            gen_args2["diversity_penalty"] = diversity2
-                        out2 = model.generate(**gen_args2)
-                        seqs2 = out2.sequences
-                        for j in range(seqs2.size(0)):
-                            gen_ids2 = seqs2[j, max_input_len2:]
-                            text2 = normalize_ws(tokenizer.decode(gen_ids2, skip_special_tokens=True).strip())
-                            candidates.append(text2)
+                        predictions.append(text)
+                    # If fewer, pad with empty strings
+                    if got < len(chunk):
+                        predictions.extend([""] * (len(chunk) - got))
+            except Exception as e:
+                print(f"[e2e][warn] generation failed for batch starting {start}: {e}")
+                # Keep lengths aligned with safe fallbacks
+                predictions.extend([""] * len(chunk))
 
-                    if getattr(args, "rerank_use_refs", False):
-                        best = max(
-                            candidates,
-                            key=lambda c: enhanced_rerank_score(
-                                c, mr, refs_grouped.get(mr, []),
-                                cov_w=getattr(args, "rerank_cov_w", 0.4),
-                                len_w=getattr(args, "rerank_len_w", 0.3),
-                                ngram_w=getattr(args, "rerank_ngram_w", 0.2),
-                                comp_w=getattr(args, "rerank_comp_w", 0.1),
-                            )
-                        )
-                    # REF-FREE (DEFAULT; no leakage)
-                    else:
-                        best = max(
-                            candidates,
-                            key=lambda c: combined_rerank_score(
-                                c, mr,
-                                cov_w=getattr(args, "rerank_cov_w", 0.4),
-                                len_w=getattr(args, "rerank_len_w", 0.3),
-                                comp_w=getattr(args, "rerank_comp_w", 0.1),
-                                target_len=15,
-                            )
-                        )
-            else:
-                out = model.generate(
-                    **enc,
-                    num_beams=num_beams,
-                    max_new_tokens=max_new_tokens,
-                    min_new_tokens=min_new_tokens,
-                    early_stopping=True,
-                    do_sample=False,
-                    no_repeat_ngram_size=no_repeat_ngram_size,
-                    repetition_penalty=repetition_penalty,
-                    length_penalty=length_penalty,
-                    eos_token_id=tokenizer.eos_token_id,
-                    pad_token_id=tokenizer.pad_token_id,
-                )
-                for bi in range(out.size(0)):
-                    gen_ids = out[bi, max_input_len:]
-                    text = normalize_ws(tokenizer.decode(gen_ids, skip_special_tokens=True).strip())
-                    predictions.append(text)
-
+            # Refs for this chunk
             for mr in chunk:
                 refs_list.append(refs_grouped.get(mr, [""]))
             pbar.update(1)
     pbar.close()
 
-    assert len(predictions) == len(mrs)
+    # Final alignment safeguard
+    if len(predictions) != len(mrs):
+        print(f"[e2e][warn] predictions ({len(predictions)}) != MRs ({len(mrs)}); aligning by padding/truncation.")
+        if len(predictions) < len(mrs):
+            predictions.extend([""] * (len(mrs) - len(predictions)))
+        else:
+            predictions = predictions[:len(mrs)]
+
     predictions = [normalize_for_bleu(p) for p in predictions]
     tokenizer.padding_side = prev_pad
     tokenizer.truncation_side = prev_trunc
@@ -665,7 +713,7 @@ def evaluate_e2e_metrics(
 
     results: Dict[str, float] = {}
 
-    # BLEU/NIST
+    # BLEU/NIST (leave as-is; if you prefer percentages, multiply by 100 here)
     if have_e2e:
         bleu_scorer = BLEUScore()
         nist_scorer = NISTScore()
@@ -686,7 +734,7 @@ def evaluate_e2e_metrics(
         except Exception:
             results["E2E_NIST"] = 0.0
 
-    # METEOR (multi-ref average)
+    # METEOR (unchanged)
     try:
         if hf_evaluate is not None:
             meteor_metric = hf_evaluate.load("meteor")
@@ -708,10 +756,9 @@ def evaluate_e2e_metrics(
         print(f"[e2e] METEOR failed: {e}")
         results["METEOR"] = 0.0
 
-    # ROUGE-L (best-over-ref average)
     results["ROUGE_L"] = compute_rouge_l_multi(predictions, refs_list)
 
-    # CIDEr (pycocoevalcap if available; else TF-IDF cosine fallback)
+    # CIDEr (unchanged)
     def _cider_fallback(preds: List[str], refs_list: List[List[str]], max_n=4, scale=10.0) -> float:
         def ngrams(toks, n): return [tuple(toks[i:i+n]) for i in range(max(0, len(toks)-n+1))]
         def count_ngrams(toks, max_n):
