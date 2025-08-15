@@ -640,9 +640,9 @@ def evaluate_e2e_metrics(
                                     candidates or [""],
                                     key=lambda c: enhanced_rerank_score(
                                         c, mr, refs_grouped.get(mr, []),
-                                        cov_w=getattr(args, "rerank_cov_w", 0.4),
-                                        len_w=getattr(args, "rerank_len_w", 0.3),
-                                        ngram_w=getattr(args, "rerank_ngram_w", 0.2),
+                                        cov_w=getattr(args, "rerank_cov_w", 0.6),
+                                        len_w=getattr(args, "rerank_len_w", 0.25),
+                                        ngram_w=getattr(args, "rerank_ngram_w", 0.15),
                                         comp_w=getattr(args, "rerank_comp_w", 0.1),
                                     )
                                 )
@@ -651,9 +651,9 @@ def evaluate_e2e_metrics(
                                     candidates or [""],
                                     key=lambda c: combined_rerank_score(
                                         c, mr,
-                                        cov_w=getattr(args, "rerank_cov_w", 0.4),
-                                        len_w=getattr(args, "rerank_len_w", 0.3),
-                                        comp_w=getattr(args, "rerank_comp_w", 0.1),
+                                        cov_w=getattr(args, "rerank_cov_w", 0.6),
+                                        len_w=getattr(args, "rerank_len_w", 0.25),
+                                        comp_w=getattr(args, "rerank_comp_w", 0.15),
                                         target_len=15,
                                     )
                                 )
